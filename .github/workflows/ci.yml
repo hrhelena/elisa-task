@@ -1,4 +1,5 @@
-# CI (ADR 0008): lint, unit tests with -race, integration tests with testcontainers, image build + smoke test.
+# CI (ADR 0008): lint, unit tests with -race, integration tests with testcontainers, image build + smoke test,
+# Kubernetes manifest validation.
 # Every step goes through the Makefile (or, for docker, the script `make docker-smoke` runs), so CI runs what
 # developers run locally; the docker job builds with build-push-action only to use the GHA layer cache.
 # Job names (lint, test, itest) are stable so they can be required status checks.
@@ -153,3 +154,47 @@ jobs:
 
       - name: Smoke test (image and compose stack)
         run: scripts/docker-smoke.sh
+
+  # Kubernetes manifests (#12): render the kustomize base and both overlays, validate them with kubeconform and
+  # assert the ticket's values (scripts/k8s-validate.sh). The kind deployment e2e is #13.
+  # Not named lint/test/itest: those are the required checks.
+  manifests:
+    name: manifests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      # Pinned to the version of the kind node in deploy/kind/cluster.yaml.
+      KUBECTL_VERSION: v1.37.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - name: Cache kubeconform schemas
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .tools/kubeconform-cache
+          # The script pins the schema's Kubernetes version.
+          key: kubeconform-schemas-${{ hashFiles('scripts/k8s-validate.sh') }}
+
+      - name: Render, kubeconform and assert (make k8s-validate)
+        run: make k8s-validate
+
+      # The Gherkin renders with `kubectl kustomize`; it must match the pinned kustomize used above.
+      - name: kubectl kustomize renders the same output
+        run: |
+          for overlay in kind cloud; do
+            CGO_ENABLED=0 go tool kustomize build "deploy/k8s/overlays/$overlay" > "/tmp/$overlay.pinned.yaml"
+            kubectl kustomize "deploy/k8s/overlays/$overlay" > "/tmp/$overlay.kubectl.yaml"
+            diff -u "/tmp/$overlay.pinned.yaml" "/tmp/$overlay.kubectl.yaml"
+            echo "overlays/$overlay: kubectl $(kubectl version --client -o json | jq -r .kustomizeVersion) matches the pinned kustomize"
+          done
