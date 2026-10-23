@@ -33,6 +33,13 @@ pass() { echo "PASS  $*"; }
 fail() { echo "FAIL  $*" >&2; failures=$((failures + 1)); }
 skip() { echo "SKIP  $*"; }
 
+# HTTP helpers. A transport failure (connection refused, timeout) must be a FAIL with the app logs, not an
+# abort under `set -e` with neither: curl still prints "000" as the code, and the `|| true` keeps the script going.
+# http_code ARGS...: prints the HTTP status code (000 when no response was received).
+http_code() { curl -s -o /dev/null -w '%{http_code}' "$@" || true; }
+# http_body_code ARGS...: prints the body, then the status code on its own last line.
+http_body_code() { curl -s -w '\n%{http_code}' "$@" || true; }
+
 cleanup() {
   if [ "$failures" -gt 0 ]; then
     echo "--- app logs ---" >&2
@@ -68,23 +75,25 @@ up_log=$(compose --progress plain up -d --no-build --quiet-pull 2>&1) || { echo 
 echo "$up_log"
 ready=""
 for _ in $(seq 1 60); do
-  if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$BASE/readyz")" = 200 ]; then ready=1; break; fi
+  if [ "$(http_code --max-time 2 "$BASE/readyz")" = 200 ]; then ready=1; break; fi
   sleep 1
 done
 if [ -n "$ready" ]; then pass "GET /readyz returned 200 within 60s"; else fail "GET /readyz not 200 within 60s"; fi
-for path in /healthz /metrics; do
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$BASE$path")
-  if [ "$code" = 200 ]; then pass "GET $path returned 200"; else fail "GET $path returned $code"; fi
+for path in /healthz /metrics /status; do
+  code=$(http_code --max-time 5 "$BASE$path")
+  if [ "$code" = 200 ]; then pass "GET $path returned 200"; else fail "GET $path returned $code (000: no response)"; fi
 done
+start_body=$(http_body_code --max-time 15 -X POST "$BASE/start")
+code=$(echo "$start_body" | tail -n1)
 if [ -d "$DATASET_DIR/maildir" ]; then
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST "$BASE/start")
-  case "$code" in
-    202) pass "POST /start returned 202" ;;
-    404) skip "POST /start returned 404: the endpoint is not merged yet (#8)" ;;
-    *) fail "POST /start returned $code, want 202" ;;
-  esac
+  if [ "$code" = 202 ]; then pass "POST /start returned 202"; else fail "POST /start returned $code, want 202 (000: no response)"; fi
 else
-  skip "POST /start: no maildir in $DATASET_DIR (set DATASET_DIR to a dataset root)"
+  # No dataset mounted (the default): the endpoint must say so instead of starting a run.
+  if [ "$code" = 409 ] && echo "$start_body" | grep -q '"code":"dataset_missing"'; then
+    pass "POST /start without a maildir returned 409 dataset_missing"
+  else
+    fail "POST /start without a maildir returned $code, want 409 dataset_missing (000: no response)"
+  fi
 fi
 
 echo "== Scenario: App waits for Postgres"

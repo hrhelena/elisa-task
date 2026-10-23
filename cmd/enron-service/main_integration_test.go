@@ -203,7 +203,9 @@ func TestBinaryReadinessReflectsDatabase(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = pg.Terminate() })
 
-	b := startBinary(t, "HTTP_ADDR=127.0.0.1:0", "DATABASE_URL="+pg.URL)
+	dataDir := t.TempDir()
+	validMaildir(t, dataDir, 1) // so that POST /start gets past the dataset check
+	b := startBinary(t, "HTTP_ADDR=127.0.0.1:0", "DATABASE_URL="+pg.URL, "DATA_DIR="+dataDir)
 	base := "http://" + b.waitListening(t)
 	client := newClient()
 	if code, body := get(t, client, base+"/readyz"); code != http.StatusOK {
@@ -232,6 +234,17 @@ func TestBinaryReadinessReflectsDatabase(t *testing.T) {
 	code, body = get(t, client, base+"/top-senders")
 	if code != http.StatusServiceUnavailable || !strings.Contains(body, `"code":"unavailable"`) {
 		t.Errorf("GET /top-senders with database stopped = %d %s, want 503 unavailable", code, body)
+	}
+
+	// Scenario: Database down (#8). GET /status and POST /start return 503
+	// with error code "unavailable".
+	code, body = get(t, client, base+"/status")
+	if code != http.StatusServiceUnavailable || !strings.Contains(body, `"code":"unavailable"`) {
+		t.Errorf("GET /status with database stopped = %d %s, want 503 unavailable", code, body)
+	}
+	if code, _, started := postStart(t, client, base); code != http.StatusServiceUnavailable ||
+		started.Error == nil || started.Error.Code != "unavailable" {
+		t.Errorf("POST /start with database stopped = %d %+v, want 503 unavailable", code, started.Error)
 	}
 
 	// Shutdown stays clean with the database gone.
