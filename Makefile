@@ -22,6 +22,8 @@ GO_FILES = $(shell git ls-files --cached --others --exclude-standard '*.go' | wh
 PIP_TOOLS_VERSION := 7.6.2
 LOCK_VENV := .tools/pip-tools
 PIP_FLAGS := --quiet --disable-pip-version-check --no-cache-dir
+# Extra `go test` flags, e.g. `make test TEST_FLAGS=-coverprofile=coverage.out` (CI uses this).
+TEST_FLAGS ?=
 
 ##@ Setup
 
@@ -64,11 +66,11 @@ lint: ## Run golangci-lint and go vet
 
 .PHONY: test
 test: ## Run unit tests with the race detector
-	go test -race -count=1 ./...
+	go test -race -count=1 $(TEST_FLAGS) ./...
 
 .PHONY: itest
 itest: ## Run unit and integration tests (needs Docker for testcontainers)
-	go test -race -count=1 -tags integration ./...
+	go test -race -count=1 -tags integration $(TEST_FLAGS) ./...
 
 .PHONY: build
 build: ## Build a static binary into bin/enron-service

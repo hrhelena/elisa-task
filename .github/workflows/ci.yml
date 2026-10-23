@@ -1,0 +1,124 @@
+# CI (ADR 0008): lint, unit tests with -race, integration tests with testcontainers.
+# Every step goes through the Makefile, so CI runs exactly what developers run locally.
+# Job names (lint, test, itest) are stable so they can be required status checks.
+# Third-party actions are pinned to full commit SHAs; the comment gives the release tag.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Branches and PRs: a new push cancels the ref's older run. main: one group per commit, so no
+# merge commit's run is ever cancelled or replaced and every commit on main gets a full result.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  # The hashed lock requirements-dev.txt was generated on 3.14 and also installs on 3.12+.
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          # A key of its own: the lint job's build cache holds the tool modules and golangci-lint's
+          # build objects, which the test jobs' cache (keyed on go.sum only) does not.
+          cache-dependency-path: |
+            go.sum
+            .golangci.yml
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache golangci-lint analysis
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/golangci-lint
+          # Saved once per dependency/config hash, restored by prefix otherwise. The cache is
+          # content-addressed, so a stale entry only means a miss, never a false pass.
+          key: golangci-lint-${{ runner.os }}-${{ hashFiles('go.sum', '.golangci.yml') }}
+          restore-keys: |
+            golangci-lint-${{ runner.os }}-
+
+      - name: Install project-local tools
+        run: make tools
+
+      # All pre-commit hooks on all files: gofmt -s and goimports (fails listing unformatted files),
+      # go mod tidy -diff (fails printing the go.mod/go.sum diff), whitespace, EOF, YAML, merge-conflict
+      # and large-file checks (the latter uses --enforce-all, since nothing is staged in CI).
+      # golangci-lint and go vet are skipped here because `make lint` runs them in the next step.
+      - name: Pre-commit hooks (format, go mod tidy, file checks)
+        run: make pre-commit
+        env:
+          SKIP: golangci-lint,go-vet
+
+      - name: Show changes made by fixing hooks
+        if: failure()
+        run: git --no-pager diff
+
+      - name: golangci-lint and go vet
+        run: make lint
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Unit tests (-race)
+        run: make test TEST_FLAGS="-coverprofile=coverage.out -covermode=atomic"
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: warn
+          retention-days: 14
+
+  itest:
+    name: itest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # GitHub's Ubuntu runners ship a running Docker daemon, which testcontainers-go uses directly
+      # (Ryuk enabled, so containers are reaped even if a test panics).
+      - name: Docker info
+        run: docker version
+
+      - name: Integration tests (-race, -tags integration)
+        run: make itest

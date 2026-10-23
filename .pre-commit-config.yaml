@@ -71,4 +71,7 @@ repos:
         name: check for added large files
         entry: .venv/bin/check-added-large-files
         language: system
-        args: [--maxkb=1024]
+        # --enforce-all checks every file passed in, not only newly staged ones. On a commit
+        # that is still just the staged files; in CI (`pre-commit run --all-files`, nothing
+        # staged) it is every tracked file.
+        args: [--maxkb=1024, --enforce-all]
