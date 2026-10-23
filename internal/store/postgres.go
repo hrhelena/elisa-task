@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -20,6 +21,11 @@ const checkerName = "postgres"
 // whole startup budget in a single attempt that the caller would retry. A
 // longer connect_timeout in the database URL takes precedence.
 const pingTimeout = 5 * time.Second
+
+// minPoolConns is the smallest accepted pool_max_conns. During a run, batch
+// inserts and the /status and readiness queries need connections at the
+// same time; with a single connection they would queue behind each other.
+const minPoolConns = 2
 
 // messageColumnList is the single source of truth for the columns that
 // InsertMessages writes, in the order of the values built by messageRow.
@@ -50,6 +56,13 @@ GROUP BY from_addr ORDER BY count(*) DESC, from_addr ASC LIMIT $1`
 type Postgres struct {
 	pool   *pgxpool.Pool
 	logger *slog.Logger
+
+	mu     sync.Mutex
+	locks  map[*pgIngestLock]struct{} // outstanding ingest locks, dropped by Close
+	closed bool
+
+	// testHook, set only by tests, is called between LatestRun's queries.
+	testHook func(stage string)
 }
 
 var _ Store = (*Postgres)(nil)
@@ -66,6 +79,9 @@ func Open(ctx context.Context, databaseURL string, logger *slog.Logger) (*Postgr
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parsing database URL: %w", err)
+	}
+	if cfg.MaxConns < minPoolConns {
+		return nil, fmt.Errorf("database URL: pool_max_conns is %d, must be at least %d", cfg.MaxConns, minPoolConns)
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
@@ -85,12 +101,24 @@ func Open(ctx context.Context, databaseURL string, logger *slog.Logger) (*Postgr
 		pool.Close()
 		return nil, err
 	}
-	return &Postgres{pool: pool, logger: logger}, nil
+	return &Postgres{pool: pool, logger: logger, locks: map[*pgIngestLock]struct{}{}}, nil
 }
 
-// Close closes the connection pool. It waits for acquired connections to be
-// released.
-func (p *Postgres) Close() { p.pool.Close() }
+// Close closes the connection pool. Outstanding ingest locks are dropped by
+// closing their connections, which ends their sessions and so releases the
+// locks: a forgotten Release never blocks Close. Close still waits for other
+// acquired pool connections to be released.
+func (p *Postgres) Close() {
+	p.mu.Lock()
+	p.closed = true
+	locks := p.locks
+	p.locks = nil
+	p.mu.Unlock()
+	for l := range locks {
+		l.abort()
+	}
+	p.pool.Close()
+}
 
 // Name returns the readiness check name, "postgres".
 func (*Postgres) Name() string { return checkerName }

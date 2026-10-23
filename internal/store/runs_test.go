@@ -101,7 +101,7 @@ func TestFinishRunRejectsNonFinalState(t *testing.T) {
 	t.Parallel()
 	var p Postgres // validation happens before any database access
 	for _, state := range []RunState{RunRunning, "", "idle", "COMPLETED"} {
-		err := p.FinishRun(t.Context(), 1, state, Counters{}, nil)
+		err := p.FinishRun(t.Context(), nil, 1, state, Counters{}, nil)
 		if !errors.Is(err, ErrInvalidRunState) {
 			t.Errorf("FinishRun(state %q) error = %v, want ErrInvalidRunState", state, err)
 		}

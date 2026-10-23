@@ -24,8 +24,15 @@ CREATE TABLE ingestion_runs (
 
 CREATE UNIQUE INDEX ingestion_runs_one_running ON ingestion_runs ((true)) WHERE state = 'running';
 
+-- The default ON DELETE NO ACTION is kept on purpose: nothing deletes runs, and
+-- deleting a run that messages still reference fails rather than silently
+-- detaching them. A future retention job should choose (for example ON DELETE
+-- SET NULL) in its own migration. The index serves that FK check and per-run
+-- queries; rows inserted outside a run (run_id NULL) are not indexed.
 ALTER TABLE messages ADD CONSTRAINT messages_run_fk FOREIGN KEY (run_id) REFERENCES ingestion_runs (id);
+CREATE INDEX messages_run_id_idx ON messages (run_id) WHERE run_id IS NOT NULL;
 
 -- +goose Down
+DROP INDEX messages_run_id_idx;
 ALTER TABLE messages DROP CONSTRAINT messages_run_fk;
 DROP TABLE ingestion_runs;

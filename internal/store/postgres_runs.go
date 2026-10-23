@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // IngestLockKey is the session advisory lock key that serializes ingestion
@@ -19,8 +19,14 @@ import (
 // objsubid = 1.
 const IngestLockKey int64 = 0x656E726F6E
 
-// discardTimeout bounds closing a connection that is being thrown away.
-const discardTimeout = 5 * time.Second
+// closeTimeout bounds closing a lock connection.
+const closeTimeout = 5 * time.Second
+
+// LatestRun test hook stages.
+const (
+	hookAfterRead      = "after-read"
+	hookAfterLockCheck = "after-lock-check"
+)
 
 const (
 	runColumnList = "id, state, started_at, finished_at, files_seen, messages_processed, messages_inserted, " +
@@ -28,12 +34,13 @@ const (
 
 	tryLockSQL = "SELECT pg_try_advisory_lock($1)"
 	unlockSQL  = "SELECT pg_advisory_unlock($1)"
-	// Advisory locks are per database, so the check is restricted to the
+	// Advisory locks are per database, so the filter is restricted to the
 	// current one (several databases may share a server).
-	lockHeldSQL = `SELECT EXISTS (SELECT 1 FROM pg_locks
-WHERE locktype = 'advisory' AND granted
+	lockFilter = `locktype = 'advisory' AND granted
   AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
-  AND classid::bigint = $1 AND objid::bigint = $2 AND objsubid = 1)`
+  AND classid::bigint = $1 AND objid::bigint = $2 AND objsubid = 1`
+	lockHeldSQL       = "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE " + lockFilter + ")"
+	lockHeldBySelfSQL = "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE " + lockFilter + " AND pid = pg_backend_pid())"
 
 	interruptRunningSQL = `UPDATE ingestion_runs
 SET state = 'failed', error = $1, finished_at = now(), updated_at = now()
@@ -52,132 +59,181 @@ WHERE id = $1 AND state = 'running'`
 	latestRunSQL = "SELECT " + runColumnList + " FROM ingestion_runs ORDER BY id DESC LIMIT 1"
 )
 
-// AcquireIngestLock takes pg_try_advisory_lock(IngestLockKey) on a connection
-// taken from the pool, which stays checked out until release is called. It
-// returns ErrLockHeld if another session holds the lock. If the process dies,
-// Postgres releases the lock when the session ends: that is how a crashed run
-// is detected (ADR 0010).
+// pgIngestLock is a held ingest lock. It owns its connection: the connection
+// is taken from the pool and hijacked, so the pool never waits for it and it
+// is never handed back while it may hold the lock. The run writes go through
+// this connection, so they prove that this session holds the lock, and they
+// keep the connection busy during a run.
+type pgIngestLock struct {
+	p    *Postgres
+	conn *pgx.Conn
+
+	mu       sync.Mutex // serializes use of conn; guards released
+	released bool
+	aborted  atomic.Bool // the store closed the connection
+}
+
+// AcquireIngestLock takes pg_try_advisory_lock(IngestLockKey) on a dedicated
+// connection taken from the pool, or returns ErrLockHeld if another session
+// holds it. The lock is held until Release, until Close (which closes the
+// connection), or until the process dies: Postgres releases it when the
+// session ends, which is how a crashed run is detected (ADR 0010).
 //
-// release unlocks and returns the connection to the pool; it is safe to call
-// more than once. If unlocking fails (for example ctx is already canceled at
-// shutdown), the connection is closed instead, which also releases the lock.
-// release must be called before Close, which waits for checked-out
-// connections. The pool needs at least one connection beyond the lock for the
-// run's own queries.
-func (p *Postgres) AcquireIngestLock(ctx context.Context) (release func(context.Context) error, err error) {
-	conn, err := p.pool.Acquire(ctx)
+// Session advisory locks need a session: DATABASE_URL must point to Postgres
+// or to a session-mode pooler, never to a transaction-mode pooler such as
+// pgbouncer in pool_mode=transaction.
+func (p *Postgres) AcquireIngestLock(ctx context.Context) (IngestLock, error) {
+	pc, err := p.pool.Acquire(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("acquiring connection for ingest lock: %w", err)
 	}
 	var locked bool
-	if err := conn.QueryRow(ctx, tryLockSQL, IngestLockKey).Scan(&locked); err != nil {
+	if err := pc.QueryRow(ctx, tryLockSQL, IngestLockKey).Scan(&locked); err != nil {
 		// The outcome is unknown (the lock may have been granted before the
 		// error), so the session must not go back to the pool.
-		discardConn(ctx, conn)
+		closeConn(ctx, pc.Hijack())
 		return nil, fmt.Errorf("trying ingest lock: %w", err)
 	}
 	if !locked {
-		conn.Release()
+		pc.Release()
 		return nil, ErrLockHeld
 	}
 
-	var (
-		once       sync.Once
-		releaseErr error
-	)
-	return func(ctx context.Context) error {
-		once.Do(func() { releaseErr = p.unlock(ctx, conn) })
-		return releaseErr
-	}, nil
+	l := &pgIngestLock{p: p, conn: pc.Hijack()}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		closeConn(ctx, l.conn)
+		return nil, errors.New("acquiring ingest lock: store is closed")
+	}
+	p.locks[l] = struct{}{}
+	return l, nil
 }
 
-// unlock releases the ingest lock held by conn and returns conn to the pool.
-func (p *Postgres) unlock(ctx context.Context, conn *pgxpool.Conn) error {
+// Release unlocks and closes the lock's connection. Later calls return nil.
+// If unlocking fails (for example ctx is already canceled at shutdown), the
+// connection is closed anyway, which releases the lock too. It returns an
+// error wrapping ErrLockNotHeld only if the session turns out not to have
+// held the lock.
+func (l *pgIngestLock) Release(ctx context.Context) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.released {
+		return nil
+	}
+	l.released = true
+	l.p.forget(l)
+	if l.aborted.Load() {
+		closeConn(ctx, l.conn)
+		return nil
+	}
+
 	var unlocked bool
-	if err := conn.QueryRow(ctx, unlockSQL, IngestLockKey).Scan(&unlocked); err != nil {
-		// Ending the session releases the lock just as well.
-		discardConn(ctx, conn)
-		p.logger.WarnContext(ctx, "ingest lock released by closing its connection", slog.Any("error", err))
+	err := l.conn.QueryRow(ctx, unlockSQL, IngestLockKey).Scan(&unlocked)
+	closeConn(ctx, l.conn)
+	if err != nil {
+		l.p.logger.WarnContext(ctx, "ingest lock released by closing its connection", slog.Any("error", err))
 		return nil
 	}
 	if !unlocked {
-		// The session no longer held the lock: another replica may have run
-		// concurrently. Do not reuse a session in an unexpected state.
-		discardConn(ctx, conn)
 		return fmt.Errorf("releasing ingest lock: %w by this session", ErrLockNotHeld)
 	}
-	conn.Release()
 	return nil
 }
 
-// discardConn removes conn from the pool and closes it.
-func discardConn(ctx context.Context, conn *pgxpool.Conn) {
-	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), discardTimeout)
+// abort closes the lock's network connection without waiting for an
+// in-flight query, which ends the session and releases the lock. Used by
+// Close; a later Release only cleans up.
+func (l *pgIngestLock) abort() {
+	l.aborted.Store(true)
+	_ = l.conn.PgConn().Conn().Close() // net.Conn.Close is safe during a read
+}
+
+func (p *Postgres) forget(l *pgIngestLock) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.locks, l) // no-op once Close has taken the set
+}
+
+// closeConn closes conn, bounded by closeTimeout even if ctx is canceled.
+func closeConn(ctx context.Context, conn *pgx.Conn) {
+	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
 	defer cancel()
-	_ = conn.Hijack().Close(closeCtx) // the server ends the session either way
+	_ = conn.Close(closeCtx) // the server ends the session either way
+}
+
+// withLock runs fn on the lock's own connection. It returns ErrLockNotHeld
+// if lock is not a held lock of this store, and wraps ErrLockNotHeld into
+// fn's error if the connection, and with it the lock, was lost.
+func (p *Postgres) withLock(lock IngestLock, fn func(*pgx.Conn) error) error {
+	l, ok := lock.(*pgIngestLock)
+	if !ok || l == nil || l.p != p {
+		return fmt.Errorf("%w: not an ingest lock of this store", ErrLockNotHeld)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.released || l.aborted.Load() {
+		return fmt.Errorf("%w: released", ErrLockNotHeld)
+	}
+	err := fn(l.conn)
+	if err != nil && (l.aborted.Load() || l.conn.IsClosed()) {
+		return fmt.Errorf("%w: lock connection lost: %w", ErrLockNotHeld, err)
+	}
+	return err
 }
 
 // IngestLockHeld reports whether any session holds the ingest lock, by reading
 // pg_locks. It does not take the lock.
 func (p *Postgres) IngestLockHeld(ctx context.Context) (bool, error) {
-	held, err := queryLockHeld(ctx, p.pool)
-	if err != nil {
-		return false, err
-	}
-	return held, nil
+	return queryLock(ctx, p.pool, lockHeldSQL)
 }
 
 type rowQuerier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-func queryLockHeld(ctx context.Context, q rowQuerier) (bool, error) {
+func queryLock(ctx context.Context, q rowQuerier, sql string) (bool, error) {
 	var held bool
-	if err := q.QueryRow(ctx, lockHeldSQL, IngestLockKey>>32, IngestLockKey&0xffffffff).Scan(&held); err != nil {
+	if err := q.QueryRow(ctx, sql, IngestLockKey>>32, IngestLockKey&0xffffffff).Scan(&held); err != nil {
 		return false, fmt.Errorf("checking ingest lock: %w", err)
 	}
 	return held, nil
 }
 
-// BeginRun must be called while holding the ingest lock; it returns
-// ErrLockNotHeld if no session holds it. In one transaction it marks every
-// run still 'running' as failed with error "interrupted" (their owner died,
-// since the lock was free), then inserts and returns a new running run with
-// all counters zero.
-func (p *Postgres) BeginRun(ctx context.Context) (run Run, err error) {
-	tx, err := p.pool.Begin(ctx)
-	if err != nil {
-		return Run{}, fmt.Errorf("beginning run transaction: %w", err)
-	}
-	defer func() {
-		if rbErr := tx.Rollback(context.WithoutCancel(ctx)); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
-			err = errors.Join(err, fmt.Errorf("rolling back run transaction: %w", rbErr))
-		}
-	}()
-
-	held, err := queryLockHeld(ctx, tx)
+// BeginRun starts a run under lock. In one transaction on the lock's own
+// connection it checks that this session holds the lock (else
+// ErrLockNotHeld), marks every run still 'running' as failed with error
+// "interrupted" (their owner died, since the lock was free), and inserts and
+// returns a new running run with all counters zero.
+func (p *Postgres) BeginRun(ctx context.Context, lock IngestLock) (Run, error) {
+	var (
+		run         Run
+		interrupted []int64
+	)
+	err := p.withLock(lock, func(conn *pgx.Conn) error {
+		return pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+			held, err := queryLock(ctx, tx, lockHeldBySelfSQL)
+			if err != nil {
+				return err
+			}
+			if !held {
+				return fmt.Errorf("beginning run: %w by this session", ErrLockNotHeld)
+			}
+			rows, err := tx.Query(ctx, interruptRunningSQL, ErrorInterrupted)
+			if err != nil {
+				return fmt.Errorf("marking interrupted runs: %w", err)
+			}
+			if interrupted, err = pgx.CollectRows(rows, pgx.RowTo[int64]); err != nil {
+				return fmt.Errorf("marking interrupted runs: %w", err)
+			}
+			if run, err = scanRun(tx.QueryRow(ctx, insertRunSQL)); err != nil {
+				return fmt.Errorf("inserting run: %w", err)
+			}
+			return nil
+		})
+	})
 	if err != nil {
 		return Run{}, err
-	}
-	if !held {
-		return Run{}, fmt.Errorf("beginning run: %w", ErrLockNotHeld)
-	}
-
-	rows, err := tx.Query(ctx, interruptRunningSQL, ErrorInterrupted)
-	if err != nil {
-		return Run{}, fmt.Errorf("marking interrupted runs: %w", err)
-	}
-	interrupted, err := pgx.CollectRows(rows, pgx.RowTo[int64])
-	if err != nil {
-		return Run{}, fmt.Errorf("marking interrupted runs: %w", err)
-	}
-
-	run, err = scanRun(tx.QueryRow(ctx, insertRunSQL))
-	if err != nil {
-		return Run{}, fmt.Errorf("inserting run: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return Run{}, fmt.Errorf("committing run start: %w", err)
 	}
 	for _, id := range interrupted {
 		p.logger.WarnContext(ctx, "ingestion run was interrupted by a crash, marked failed",
@@ -186,28 +242,34 @@ func (p *Postgres) BeginRun(ctx context.Context) (run Run, err error) {
 	return run, nil
 }
 
-// UpdateRunProgress stores the current counters of a running run. It returns
-// ErrRunNotRunning if run id does not exist or is no longer running.
-func (p *Postgres) UpdateRunProgress(ctx context.Context, id int64, c Counters) error {
+// UpdateRunProgress stores the current counters of a running run, through
+// the lock's connection. It returns ErrRunNotRunning if run id does not exist
+// or is no longer running, and ErrLockNotHeld if the lock is not held.
+func (p *Postgres) UpdateRunProgress(ctx context.Context, lock IngestLock, id int64, c Counters) error {
 	args, err := counterArgs(id, c)
 	if err != nil {
 		return err
 	}
-	tag, err := p.pool.Exec(ctx, updateRunSQL, args...)
-	if err != nil {
-		return fmt.Errorf("updating run %d progress: %w", id, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("updating run %d progress: %w", id, ErrRunNotRunning)
-	}
-	return nil
+	return p.withLock(lock, func(conn *pgx.Conn) error {
+		tag, err := conn.Exec(ctx, updateRunSQL, args...)
+		if err != nil {
+			return fmt.Errorf("updating run %d progress: %w", id, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("updating run %d progress: %w", id, ErrRunNotRunning)
+		}
+		return nil
+	})
 }
 
 // FinishRun stores the final counters and state (completed or failed, else
-// ErrInvalidRunState) of a running run, with an optional error message. A run
-// can be finished only once: if it is not running, or does not exist, it
-// returns ErrRunNotRunning.
-func (p *Postgres) FinishRun(ctx context.Context, id int64, state RunState, c Counters, errMsg *string) error {
+// ErrInvalidRunState) of a running run, with an optional error message,
+// through the lock's connection. A run can be finished only once: if it is
+// not running, or does not exist, it returns ErrRunNotRunning. It returns
+// ErrLockNotHeld if the lock is not held.
+func (p *Postgres) FinishRun(ctx context.Context, lock IngestLock, id int64, state RunState, c Counters,
+	errMsg *string,
+) error {
 	if state != RunCompleted && state != RunFailed {
 		return fmt.Errorf("finishing run %d as %q: %w", id, state, ErrInvalidRunState)
 	}
@@ -216,31 +278,53 @@ func (p *Postgres) FinishRun(ctx context.Context, id int64, state RunState, c Co
 		return err
 	}
 	args = append(args, string(state), sanitizeOptional(errMsg))
-	tag, err := p.pool.Exec(ctx, finishRunSQL, args...)
-	if err != nil {
-		return fmt.Errorf("finishing run %d: %w", id, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("finishing run %d: %w", id, ErrRunNotRunning)
-	}
-	return nil
+	return p.withLock(lock, func(conn *pgx.Conn) error {
+		tag, err := conn.Exec(ctx, finishRunSQL, args...)
+		if err != nil {
+			return fmt.Errorf("finishing run %d: %w", id, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("finishing run %d: %w", id, ErrRunNotRunning)
+		}
+		return nil
+	})
 }
 
 // LatestRun returns the run with the highest id, or (nil, nil) if there has
 // never been one.
 //
 // A run stored as running while nobody holds the ingest lock has lost its
-// owner (crash, ADR 0010). It is reported as failed with error
-// "interrupted" and a nil FinishedAt, without changing the stored row; the
-// next BeginRun records that. The lock is checked before and after reading
-// the row, so a run that is just starting or just finishing is never
-// misreported: the lock is taken before a run is inserted and released only
-// after it is finished.
+// owner (crash, ADR 0010). It is reported as failed with error "interrupted"
+// and a nil FinishedAt, without changing the stored row; the next BeginRun
+// records that. The check is: read run R as running, find the lock free,
+// then read the latest run again and find the same R still running. A live
+// owner holds the lock from before R is inserted until after R is finished,
+// so it would have been seen holding the lock. In any other outcome the
+// fresh read is returned as stored.
 func (p *Postgres) LatestRun(ctx context.Context) (*Run, error) {
-	heldBefore, err := p.IngestLockHeld(ctx)
+	first, err := p.readLatestRun(ctx)
+	if first == nil || err != nil || first.State != RunRunning {
+		return first, err
+	}
+	p.hook(hookAfterRead)
+	held, err := p.IngestLockHeld(ctx)
 	if err != nil {
 		return nil, err
 	}
+	p.hook(hookAfterLockCheck)
+	again, err := p.readLatestRun(ctx)
+	if again == nil || err != nil {
+		return again, err
+	}
+	if !held && again.ID == first.ID && again.State == RunRunning {
+		again.State = RunFailed
+		msg := ErrorInterrupted
+		again.Error = &msg
+	}
+	return again, nil
+}
+
+func (p *Postgres) readLatestRun(ctx context.Context) (*Run, error) {
 	run, err := scanRun(p.pool.QueryRow(ctx, latestRunSQL))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil // no run yet (idle) is not an error
@@ -248,19 +332,13 @@ func (p *Postgres) LatestRun(ctx context.Context) (*Run, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading latest run: %w", err)
 	}
-	if run.State != RunRunning || heldBefore {
-		return &run, nil
-	}
-	heldAfter, err := p.IngestLockHeld(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if !heldAfter {
-		run.State = RunFailed
-		msg := ErrorInterrupted
-		run.Error = &msg
-	}
 	return &run, nil
+}
+
+func (p *Postgres) hook(stage string) {
+	if p.testHook != nil {
+		p.testHook(stage)
+	}
 }
 
 // counterArgs returns the query arguments $1..$7 of updateRunSQL and

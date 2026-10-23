@@ -25,8 +25,9 @@ var (
 	// ErrLockHeld is returned by AcquireIngestLock when another session holds
 	// the ingest lock, that is, a run is in progress somewhere in the cluster.
 	ErrLockHeld = errors.New("ingestion lock held by another session")
-	// ErrLockNotHeld is returned by BeginRun when no session holds the ingest
-	// lock: runs may only be started under the lock.
+	// ErrLockNotHeld is returned by the RunWriter methods when the given lock
+	// is not held: it was released, the store was closed, its connection was
+	// lost, or it belongs to another store.
 	ErrLockNotHeld = errors.New("ingestion lock not held")
 	// ErrRunNotRunning is returned when updating or finishing a run that does
 	// not exist or is no longer running.
@@ -64,25 +65,36 @@ type Run struct {
 // not finished its job (ADR 0011).
 func (r *Run) Finished() bool { return r.State == RunCompleted }
 
+// IngestLock is a held ingest lock. It is obtained from
+// IngestLocker.AcquireIngestLock and passed to the RunWriter methods, which
+// only act while it is held by its own session.
+type IngestLock interface {
+	// Release releases the lock. It is safe to call more than once and after
+	// the store is closed.
+	Release(ctx context.Context) error
+}
+
 // IngestLocker is the cluster-wide single-flight lock for ingestion (ADR 0010).
 type IngestLocker interface {
 	// AcquireIngestLock takes the lock or returns ErrLockHeld. The lock is
-	// held until release is called, or until the process dies.
-	AcquireIngestLock(ctx context.Context) (release func(context.Context) error, err error)
+	// held until it is released, the store is closed, or the process dies.
+	AcquireIngestLock(ctx context.Context) (IngestLock, error)
 	// IngestLockHeld reports whether any session holds the lock, without
 	// taking it.
 	IngestLockHeld(ctx context.Context) (bool, error)
 }
 
-// RunWriter records the lifecycle and progress of ingestion runs.
+// RunWriter records the lifecycle and progress of ingestion runs. Every
+// method needs the held ingest lock; it returns an error wrapping
+// ErrLockNotHeld when the lock is not (or no longer) held, for example after
+// its connection was lost. The caller should then stop the run.
 type RunWriter interface {
-	// BeginRun must be called while holding the ingest lock. It marks runs
-	// left running by a dead owner as failed ("interrupted") and starts a new
-	// running run.
-	BeginRun(ctx context.Context) (Run, error)
-	UpdateRunProgress(ctx context.Context, id int64, c Counters) error
+	// BeginRun marks runs left running by a dead owner as failed
+	// ("interrupted") and starts a new running run.
+	BeginRun(ctx context.Context, lock IngestLock) (Run, error)
+	UpdateRunProgress(ctx context.Context, lock IngestLock, id int64, c Counters) error
 	// FinishRun sets the final state (completed or failed) and counters.
-	FinishRun(ctx context.Context, id int64, state RunState, c Counters, errMsg *string) error
+	FinishRun(ctx context.Context, lock IngestLock, id int64, state RunState, c Counters, errMsg *string) error
 }
 
 // RunReader reads ingestion run state for GET /status.
