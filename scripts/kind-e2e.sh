@@ -231,7 +231,9 @@ else
 fi
 
 log "deploying $IMAGE (scripts/kind-deploy.sh)"
-IMAGE="$IMAGE" KIND_CLUSTER="$KIND_CLUSTER" ROLLOUT_TIMEOUT="$ROLLOUT_TIMEOUT" scripts/kind-deploy.sh
+# LOCAL_DATASET is cleared: the e2e needs the default overlay (an empty PVC that POST /fetch fills), never the #40
+# read-only local Dataset/ variant, even if the caller's environment sets it.
+IMAGE="$IMAGE" KIND_CLUSTER="$KIND_CLUSTER" ROLLOUT_TIMEOUT="$ROLLOUT_TIMEOUT" LOCAL_DATASET= scripts/kind-deploy.sh
 
 log "serving the fixture in-cluster at $FIXTURE_URL"
 kc -n "$NAMESPACE" create configmap e2e-fixture --from-file="$FIXTURE_NAME=$work/$FIXTURE_NAME" \
