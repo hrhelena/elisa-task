@@ -81,10 +81,11 @@ your kubeconfig and makes it current. `make kind-up` then switches back to the c
 leaves none current if there was none), and `make kind-down` removes the context again.
 
 `make deploy` loads the image under a tag derived from its image ID (`enron-service:dev-<id>`), so a rebuilt image
-rolls out even though the pod uses `imagePullPolicy: IfNotPresent`. The image's timestamps come from the commit
-(`SOURCE_DATE_EPOCH` and the `created` label), so running `make deploy` again for the same commit yields the same image
-ID and leaves the running pod (and an in-flight `/fetch`) alone. A dirty tree changes `VERSION` and therefore the
-image. The credentials in `overlays/kind` (`enron`/`enron`) are for the throwaway local cluster only.
+rolls out even though the pod uses `imagePullPolicy: IfNotPresent`. `make docker` takes the image's timestamps from
+the commit (`SOURCE_DATE_EPOCH` and the `created` label) and disables the BuildKit provenance attestation, which
+records per-build data. As a result, running `make deploy` again for the same commit (with the build cache warm)
+yields the same image ID and leaves the running pod, and any in-flight `/fetch`, alone. A dirty tree changes `VERSION`
+and therefore the image, and so does a build from an empty cache (layer file timestamps differ). The credentials in `overlays/kind` (`enron`/`enron`) are for the throwaway local cluster only.
 
 To get the dataset into the cluster, call `POST /fetch` through the port-forward. It downloads into the
 `enron-data` volume, which kind's local-path provisioner backs with a directory inside the node container, so the

@@ -30,7 +30,8 @@ VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev
 REVISION ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 # Image timestamps come from the commit, not the wall clock, so rebuilding the same commit yields the same image ID.
 # A wall-clock "created" label made every `make deploy` roll the pod (and kill an in-flight /fetch).
-# SOURCE_DATE_EPOCH is also passed to BuildKit, which uses it for the image config's own timestamps.
+# SOURCE_DATE_EPOCH is also passed to BuildKit (image config timestamps), and --provenance=false drops the
+# provenance attestation, whose per-build data would otherwise change the image ID (containerd image store).
 SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct 2>/dev/null || echo 0)
 CREATED  ?= $(shell TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd 2>/dev/null || echo unknown)
 COMPOSE  ?= docker compose
@@ -111,6 +112,7 @@ docker: ## Build the container image $(IMAGE) (IMAGE and VERSION overridable)
 		--build-arg REVISION=$(REVISION) \
 		--build-arg CREATED=$(CREATED) \
 		--build-arg SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) \
+		--provenance=false \
 		-t $(IMAGE) .
 
 .PHONY: docker-smoke
