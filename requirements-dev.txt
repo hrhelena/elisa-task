@@ -1,0 +1,6 @@
+# Python dev tools, installed into the project-local .venv by `make tools`.
+# Pinned exactly so every worktree, the developer machine and CI run the same versions (ADR 0008).
+pre-commit==4.7.0
+# Provides the trailing-whitespace, end-of-file, check-yaml, ... hooks as local executables in .venv/bin,
+# so pre-commit never clones hook repositories into ~/.cache/pre-commit.
+pre-commit-hooks==6.0.0

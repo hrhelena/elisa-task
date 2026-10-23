@@ -1,0 +1,74 @@
+# Installed by `make tools` (pre-commit is pinned in requirements-dev.txt and lives in .venv).
+# Every hook is local: Go tools are pinned in go.mod and run via `go tool`, and the generic
+# file checks come from the pre-commit-hooks package pinned in requirements-dev.txt.
+# Nothing is cloned into ~/.cache/pre-commit.
+# User-authored source documents are kept verbatim.
+exclude: ^(prompt\.md|Docs/task-description\.txt)$
+
+repos:
+  - repo: local
+    hooks:
+      - id: gofmt
+        name: gofmt -s
+        entry: scripts/check-go-format.sh gofmt
+        language: system
+        types: [go]
+
+      - id: goimports
+        name: goimports
+        entry: scripts/check-go-format.sh goimports
+        language: system
+        types: [go]
+
+      - id: go-vet
+        name: go vet
+        entry: go vet -tags integration ./...
+        language: system
+        types: [go]
+        pass_filenames: false
+
+      - id: golangci-lint
+        name: golangci-lint
+        entry: env CGO_ENABLED=0 go tool golangci-lint run ./...
+        language: system
+        types: [go]
+        pass_filenames: false
+
+      - id: go-mod-tidy
+        name: go mod tidy (check)
+        entry: go mod tidy -diff
+        language: system
+        files: (\.go|(^|/)go\.(mod|sum))$
+        pass_filenames: false
+
+      - id: trailing-whitespace
+        name: trim trailing whitespace
+        entry: .venv/bin/trailing-whitespace-fixer
+        language: system
+        types: [text]
+        args: [--markdown-linebreak-ext=md]
+
+      - id: end-of-file-fixer
+        name: fix end of files
+        entry: .venv/bin/end-of-file-fixer
+        language: system
+        types: [text]
+
+      - id: check-yaml
+        name: check yaml
+        entry: .venv/bin/check-yaml
+        language: system
+        types: [yaml]
+        args: [--allow-multiple-documents]
+
+      - id: check-merge-conflict
+        name: check for merge conflicts
+        entry: .venv/bin/check-merge-conflict
+        language: system
+        types: [text]
+
+      - id: check-added-large-files
+        name: check for added large files
+        entry: .venv/bin/check-added-large-files
+        language: system
+        args: [--maxkb=1024]
