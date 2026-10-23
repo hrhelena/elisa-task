@@ -1,0 +1,22 @@
+# Cloud overlay for EKS / GKE (ADR 0006, ADR 0014, ADR 0015). No database resources: Postgres is managed
+# (RDS, Cloud SQL), and DATABASE_URL comes from the Secret enron-db, which is created out of band and is
+# deliberately not defined here, e.g.
+#   kubectl -n enron create secret generic enron-db \
+#     --from-literal=DATABASE_URL='postgres://USER:PASSWORD@HOST:5432/enron?sslmode=require'
+# Set the registry image before applying (run in this directory):
+#   kustomize edit set image enron-service=REGISTRY/enron-service:VERSION
+# The StorageClass is the cluster default (gp3 on EKS, standard-rwo on GKE) and enron-data keeps the base 10Gi.
+# To resize it, add a patch here; on ext4 keep at least 10Gi (530,000 free inodes and 4 GiB free are required),
+# smaller only with a StorageClass whose filesystem allocates inodes dynamically (e.g. XFS). See the README.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: enron
+
+resources:
+  - ../../base
+
+images:
+  - name: enron-service
+    newName: REGISTRY/enron-service
+    newTag: VERSION

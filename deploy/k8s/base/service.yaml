@@ -1,0 +1,17 @@
+# ClusterIP only: the API has no authentication (ADR 0005), so it is not exposed outside the cluster.
+# Reach it with `kubectl -n enron port-forward svc/enron-service 8080:80`.
+apiVersion: v1
+kind: Service
+metadata:
+  name: enron-service
+  labels:
+    app.kubernetes.io/name: enron-service
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: enron-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

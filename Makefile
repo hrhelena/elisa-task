@@ -32,6 +32,10 @@ COMPOSE  ?= docker compose
 # Host directory compose mounts at /data. compose-up creates it as the invoking user first: if compose's
 # create_host_path made it, a rootful Linux daemon would create it root-owned and the app could not write to it.
 DATASET_DIR ?= ./Dataset
+# kind (#12): a dedicated cluster name, and its context passed explicitly to every kubectl call, so other local
+# clusters and the current kube context are never touched. kind and kubectl are host prerequisites.
+KIND_CLUSTER ?= elisa-enron
+KIND_CONTEXT := kind-$(KIND_CLUSTER)
 
 ##@ Setup
 
@@ -94,11 +98,6 @@ clean: ## Remove build outputs
 
 ##@ Containers and deployment
 
-define not_implemented
-	@echo "make $@: not implemented yet, see #$(1) (https://github.com/hrhelena/elisa-task/issues/$(1))" >&2
-	@exit 1
-endef
-
 .PHONY: docker
 docker: ## Build the container image $(IMAGE) (IMAGE and VERSION overridable)
 	docker build \
@@ -125,17 +124,34 @@ compose-down: ## Stop the docker compose stack (keeps the database volume)
 compose-clean: ## Stop the docker compose stack and delete the database volume
 	$(COMPOSE) down -v
 
+.PHONY: k8s-validate
+k8s-validate: ## Render the kustomize base and overlays, kubeconform them and assert the ticket's values
+	scripts/k8s-validate.sh
+
 .PHONY: kind-up
-kind-up: ## Create the local kind cluster (#12)
-	$(call not_implemented,12)
+kind-up: ## Create the kind cluster $(KIND_CLUSTER) (no-op if it exists; needs kind and Docker)
+	@if kind get clusters 2>/dev/null | grep -qx "$(KIND_CLUSTER)"; then \
+		echo "kind cluster $(KIND_CLUSTER) already exists"; \
+	else \
+		kind create cluster --name "$(KIND_CLUSTER)" --config deploy/kind/cluster.yaml --wait 120s; \
+	fi
 
 .PHONY: kind-down
-kind-down: ## Delete the local kind cluster (#12)
-	$(call not_implemented,12)
+kind-down: ## Delete the kind cluster $(KIND_CLUSTER) (no-op if it does not exist)
+	@if kind get clusters 2>/dev/null | grep -qx "$(KIND_CLUSTER)"; then \
+		kind delete cluster --name "$(KIND_CLUSTER)"; \
+	else \
+		echo "kind cluster $(KIND_CLUSTER) does not exist"; \
+	fi
 
 .PHONY: deploy
-deploy: ## Deploy to the current kube context with kustomize (#12)
-	$(call not_implemented,12)
+deploy: docker ## Build the image, load it into kind $(KIND_CLUSTER) and apply the kind overlay
+	IMAGE=$(IMAGE) KIND_CLUSTER=$(KIND_CLUSTER) scripts/kind-deploy.sh
+
+.PHONY: undeploy
+undeploy: ## Delete the kind overlay's resources from $(KIND_CLUSTER), including the namespace and its volumes
+	$(GO_TOOL) kustomize build deploy/k8s/overlays/kind | \
+		kubectl --context "$(KIND_CONTEXT)" delete --ignore-not-found --wait=true -f -
 
 ##@ Help
 

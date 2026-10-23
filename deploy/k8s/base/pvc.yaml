@@ -1,0 +1,15 @@
+# Dataset volume (ADR 0014, sized by ADR 0015). ReadWriteOnce, so the Deployment runs one replica with the
+# Recreate strategy. 10Gi is for inodes, not bytes: the extracted maildir is about 2.5 GB but about 521k files and
+# directories, and ext4 (the EKS gp3 / GKE standard-rwo default) gets about one inode per 16 KiB, so 5Gi has about
+# 327k inodes and 10Gi about 655k. POST /fetch refuses to start below 530,000 free inodes or 4 GiB free space.
+# No storageClassName: the cluster default is used (local-path in kind, gp3 on EKS, standard-rwo on GKE).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: enron-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi

@@ -1,0 +1,20 @@
+# Base manifests for enron-service (ADR 0006, ADR 0014, ADR 0015, ticket #12).
+# Platform-neutral: no database and no image tag. Overlays add those:
+#   overlays/kind   in-cluster Postgres StatefulSet, locally built image loaded with `kind load`
+#   overlays/cloud  managed Postgres through an externally created Secret, registry image
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: enron
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: enron
+    includeSelectors: false
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
