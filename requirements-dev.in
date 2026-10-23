@@ -1,0 +1,6 @@
+# Top-level Python dev tools. Edit this file, then run `make py-lock` to regenerate the fully pinned,
+# hashed requirements-dev.txt that `make tools` installs (with --require-hashes) into .venv (ADR 0008).
+pre-commit==4.7.0
+# Provides the trailing-whitespace, end-of-file, check-yaml, ... hooks as local executables in .venv/bin,
+# so pre-commit never clones hook repositories into ~/.cache/pre-commit.
+pre-commit-hooks==6.0.0

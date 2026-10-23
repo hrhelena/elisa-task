@@ -1,0 +1,38 @@
+# golangci-lint v2 configuration. The binary is pinned in go.mod (`go tool golangci-lint`).
+version: "2"
+
+run:
+  timeout: 5m
+  # Lint integration tests too (they live behind the `integration` build tag).
+  build-tags:
+    - integration
+
+linters:
+  # standard = errcheck, govet, ineffassign, staticcheck, unused
+  default: standard
+  enable:
+    - bodyclose
+    - contextcheck
+    - errorlint
+    - gocritic
+    - gosec
+    - misspell
+    - noctx
+    - revive
+  settings:
+    misspell:
+      locale: US
+  exclusions:
+    presets:
+      - std-error-handling
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/hrhelena/elisa-task

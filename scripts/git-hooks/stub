@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# elisa-task git hook stub, installed by `make tools` into the (shared) git hooks directory.
+#
+# Git worktrees share one hooks directory, so the installed copy contains no logic of its own:
+# it runs scripts/git-hooks/<hook name> from the worktree being committed to. Each branch
+# therefore uses its own version of the hook and its own .venv.
+set -euo pipefail
+
+root=$(git rev-parse --show-toplevel)
+hook="$root/scripts/git-hooks/$(basename "$0")"
+
+if [ ! -x "$hook" ]; then
+  echo "git hook: $hook not found on this branch, skipping" >&2
+  exit 0
+fi
+
+exec "$hook" "$@"
