@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"debug/elf"
@@ -882,9 +883,9 @@ func TestBinaryInvalidConfigurationExitsWithStatus1(t *testing.T) {
 
 // TestBinaryReportsLinkerVersion: the version injected at link time with
 // -ldflags "-X main.version=..." (as the Dockerfile does, #11) appears in the
-// "starting" log line. It needs no database: "starting" is logged before the
-// store is opened, so an unreachable DATABASE_URL makes the binary log it and
-// exit 1 quickly.
+// "starting" log line. "starting" is logged before the database is opened, so
+// the test reads the log only up to that line and then kills the process: it
+// never depends on how long the binary keeps trying an unreachable database.
 func TestBinaryReportsLinkerVersion(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds the binary; skipped in -short mode")
@@ -896,14 +897,51 @@ func TestBinaryReportsLinkerVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.CommandContext(t.Context(), bin) //nolint:gosec // bin is built by this test.
-	cmd.Env = []string{
+
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin) //nolint:gosec // bin is built by this test.
+	cmd.WaitDelay = 5 * time.Second
+	cmd.Env = []string{ // Minimal environment, like the other binary tests.
 		"HTTP_ADDR=127.0.0.1:0",
-		"DATABASE_URL=postgres://enron:enron@127.0.0.1:1/enron?sslmode=disable&connect_timeout=2",
+		"DATABASE_URL=postgres://enron:enron@127.0.0.1:1/enron?sslmode=disable&connect_timeout=1",
+		// Bounds startup retries where supported (#27); the test does not rely on it.
+		"DB_STARTUP_TIMEOUT=1s",
 	}
-	out, _ := cmd.Output() // exits 1: the database is unreachable on purpose.
-	rec := findLog(decodeLogLines(t, out), "starting")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting binary: %v", err)
+	}
+
+	var logs bytes.Buffer // written by the scanner, read after <-scanned
+	found := make(chan map[string]any, 1)
+	scanned := make(chan struct{})
+	go func() {
+		defer close(scanned)
+		sc := bufio.NewScanner(stdout)
+		for sc.Scan() {
+			logs.Write(append(sc.Bytes(), '\n'))
+			var rec map[string]any
+			if json.Unmarshal(sc.Bytes(), &rec) == nil && rec["msg"] == "starting" {
+				found <- rec
+				return
+			}
+		}
+	}()
+
+	var rec map[string]any
+	select {
+	case rec = <-found:
+	case <-scanned: // stdout closed without a "starting" line.
+	case <-ctx.Done():
+	}
+	cancel() // Kills the process: nothing after "starting" matters here.
+	_ = cmd.Wait()
+	<-scanned
 	if rec == nil || rec["version"] != want {
-		t.Errorf("starting record = %v, want version %q; logs:\n%s", rec, want, out)
+		t.Errorf("starting record = %v, want version %q; logs:\n%s", rec, want, logs.String())
 	}
 }
