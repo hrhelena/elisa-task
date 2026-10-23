@@ -20,3 +20,4 @@ supersedes it (see `.claude/skills/adr/SKILL.md`).
 | [0013](0013-goose-for-database-migrations.md) | Use goose v3 for database migrations | Accepted | 2026-10-23 |
 | [0014](0014-kubernetes-deployment-topology.md) | Kubernetes deployment topology: one replica, RWO dataset volume, Postgres StatefulSet in kind | Accepted (amended by [0015](0015-dataset-volume-sized-for-inodes.md)) | 2026-10-23 |
 | [0015](0015-dataset-volume-sized-for-inodes.md) | Size the dataset volume at 10Gi for inode capacity | Accepted | 2026-10-23 |
+| [0016](0016-openapi-spec-from-code-and-embedded-swagger-ui.md) | OpenAPI 3.1 spec generated from code, with an embedded Swagger UI | Accepted | 2026-10-23 |
