@@ -18,15 +18,30 @@ import (
 //
 // Unlike pgconn.CancelRequestContextWatcherHandler, the canceled call does
 // not return until the server has acknowledged the cancel request by closing
-// the cancel connection, which Postgres does after signaling the backend
-// (libpq's PQcancel waits for the same thing). The pgx handler stops waiting
-// as soon as the canceled query ends, and then only sleeps 100ms: if the
-// query had completed on its own and the server processes the cancel request
-// later than that, the request cancels the next query on the connection,
-// such as the final "interrupted: shutdown" write (#51). Since every lock
-// query goes through one connection, one at a time, waiting here protects
-// all of them. A cancel request that arrives while the backend is idle is
-// ignored by Postgres.
+// the cancel connection (libpq's PQcancel waits for the same thing). The pgx
+// handler stops waiting as soon as the canceled query ends, and then only
+// sleeps 100ms: if the query had completed on its own and the server
+// processes the cancel request later than that, the request cancels the
+// next query on the connection, such as the final "interrupted: shutdown"
+// write (#51). Since every lock query goes through one connection, one at a
+// time, waiting here protects all of them.
+//
+// Why the acknowledgment is enough, on the Postgres side:
+//   - The process that receives the cancel request sends SIGINT to the
+//     target backend before it exits, closing the cancel connection: when
+//     the client sees the close, the signal is already pending.
+//   - The backend handles a pending signal before it reads the next query:
+//     the handler runs as soon as the process is scheduled, and reading the
+//     next command checks for interrupts.
+//   - Postgres ignores a cancel handled while the backend reads client input
+//     (DoingCommandRead in postgres.c), so it cannot cancel the next query.
+//
+// pgx's comment on its 100ms sleep (pgconn.go, lines 3123-3127 in v5.11)
+// says the signal may not be delivered yet after the acknowledgment. That
+// does not apply to a direct Postgres connection, for the reasons above, so
+// do not add such a sleep here. It can apply behind a pooler that closes the
+// cancel connection before the server has signaled the backend; the README
+// asks for a direct connection for this guarantee.
 //
 // The wait is bounded by the same deadline, and is cut short when the store
 // closes the lock's socket (closing), so Close and Release never wait for it.
@@ -58,8 +73,16 @@ func (h *serverCancelHandler) HandleCancel(canceled context.Context) {
 			case <-ctx.Done():
 			}
 		}()
-		if err := h.conn.CancelRequest(ctx); err != nil && !isClosed(h.closing) {
-			h.logger.Warn("ingest lock connection: cancel request not acknowledged", slog.Any("error", err))
+		// CancelRequest returns nil when ctx cuts short its wait for the
+		// acknowledgment, so ctx is checked too. When the store closes the
+		// socket the session ends anyway: no warning.
+		err := h.conn.CancelRequest(ctx)
+		if err == nil {
+			err = ctx.Err()
+		}
+		if err != nil && !isClosed(h.closing) {
+			h.logger.Warn("ingest lock connection: cancel request not acknowledged; "+
+				"it may still cancel the next query on this connection", slog.Any("error", err))
 		}
 	}()
 }

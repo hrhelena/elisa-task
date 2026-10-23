@@ -71,9 +71,9 @@ WHERE id = $1 AND state = 'running'`
 // pgIngestLock is a held ingest lock. It owns a dedicated connection, dialed
 // with the pool's settings but outside the pool, so the pool never waits for
 // it and it is never handed back while it may hold the lock. Only this
-// connection cancels a canceled query on the server rather than closing (see
-// withServerCancel), so a canceled run write keeps the lock. The run writes go through
-// this connection, so they prove that this session holds the lock, and they
+// connection cancels a canceled query on the server rather than closing
+// (see withServerCancel), so a canceled run write keeps the lock. The run
+// writes go through this connection, so they prove that this session holds the lock, and they
 // keep the connection busy during a run. A watcher goroutine checks the
 // connection every p.lockCheckInterval while no write is in flight.
 type pgIngestLock struct {
@@ -334,7 +334,7 @@ func closeConn(ctx context.Context, conn *pgx.Conn) {
 // lost. Waiting for the connection (behind another write or a liveness
 // check) is bounded by ctx. A done ctx is returned as is, without touching
 // the connection; cancellation during fn cancels the query on the server and
-// keeps the session (see Open).
+// keeps the session (see withServerCancel).
 func (p *Postgres) withLock(ctx context.Context, lock IngestLock, fn func(*pgx.Conn) error) error {
 	l, ok := lock.(*pgIngestLock)
 	if !ok || l == nil || l.p != p {

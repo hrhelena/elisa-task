@@ -367,6 +367,10 @@ comes from the Secret `enron-db`, and `INGEST_PROGRESS_INTERVAL`, which keeps it
   `max_connections` for `pool_max_conns + 1` per replica.
 - `DATABASE_URL` must point to Postgres directly or to a session-mode pooler. Transaction-mode pgbouncer
   (`pool_mode=transaction`) is not supported, because session advisory locks need a session.
+- When a write on the ingest lock connection is canceled, the service waits until the server acknowledges the
+  cancel request, so the request cannot cancel the next write (for example the final `interrupted: shutdown`, #51).
+  This guarantee needs a direct Postgres connection: a session-mode pooler may close the cancel connection before
+  the server has signaled the backend, and behind one a late cancel can still fail the next write.
 - The lock is held only while its connection lives. Idle-connection killers (`idle_session_timeout` on the server,
   idle timeouts on a proxy or load balancer) silently drop the lock, and the run's next progress write on that
   connection then fails with `lock_lost`. Set them well above `INGEST_PROGRESS_INTERVAL`.
