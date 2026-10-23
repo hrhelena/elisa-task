@@ -151,6 +151,20 @@ func TestStartHandler(t *testing.T) {
 			wantBody:   `{"error":{"code":"unavailable","message":"the service is shutting down"}}`,
 		},
 		{
+			// Scenario: Running out of file descriptors is transient (#49):
+			// 503, not 409 dataset_missing.
+			name:       "dataset check fails with EMFILE",
+			err:        fmt.Errorf("%w: open /data/maildir: too many open files", ErrDatasetUnavailable),
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   `{"error":{"code":"unavailable","message":"` + transientMessage + `"}}`,
+		},
+		{
+			name:       "shutting down joined with a transient dataset error",
+			err:        errors.Join(ErrDatasetUnavailable, ErrIngesterClosed),
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   `{"error":{"code":"unavailable","message":"the service is shutting down"}}`,
+		},
+		{
 			// DB unavailable: taking the lock or beginning the run failed.
 			name:       "database unavailable",
 			err:        errors.New("acquiring ingest lock: dial tcp: connection refused"),

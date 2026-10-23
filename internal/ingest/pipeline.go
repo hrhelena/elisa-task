@@ -124,8 +124,17 @@ func (p *pipeline) parseLoop(ctx context.Context, jobs <-chan job, msgs chan<- s
 
 // process opens and parses one entry. It returns false if the entry is
 // skipped; the skip is counted and logged. It never fails (ADR 0007).
+//
+// An entry whose open fails after the run's context is done is dropped
+// without being counted, like any entry still in flight at a stop: the
+// source closes its directory descriptors when the context ends, so the
+// failure says nothing about the file (#49 review). files_seen stays equal
+// to processed + skipped, and the next run sees the entry again.
 func (p *pipeline) process(ctx context.Context, j job) (store.Message, bool) {
 	rc, err := j.open()
+	if err != nil && ctx.Err() != nil {
+		return store.Message{}, false
+	}
 	if err != nil {
 		reason := string(mailparse.SkipReadError)
 		if errors.Is(err, ErrNotRegularFile) {

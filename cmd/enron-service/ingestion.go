@@ -100,6 +100,10 @@ func mapStartErr(err error, maildir string) error {
 	switch {
 	case errors.Is(err, ingest.ErrClosed):
 		return fmt.Errorf("%w: %w", httpapi.ErrIngesterClosed, err)
+	case errors.Is(err, ingest.ErrTransient):
+		// Out of file descriptors or memory while checking the maildir: a
+		// 503 to retry, not a 409 about the dataset (#49).
+		return fmt.Errorf("%w: %w", httpapi.ErrDatasetUnavailable, err)
 	case errors.Is(err, ingest.ErrAlreadyRunning):
 		return fmt.Errorf("%w: %w", httpapi.ErrIngestionRunning, err)
 	case errors.Is(err, ingest.ErrDatasetMissing):

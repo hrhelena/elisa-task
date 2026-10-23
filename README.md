@@ -204,7 +204,9 @@ Conventions for every endpoint:
   `Allow` header.
 - Every response carries `X-Request-ID`. A well-formed incoming one (1 to 64 characters from `A-Z a-z 0-9 -`) is
   reused, and anything else is replaced. The access log line of the request carries the same ID.
-- `unavailable` (`503`) means the database failed or timed out, or the service is shutting down. Retry later.
+- `unavailable` (`503`) means the database failed or timed out, the dataset could not be checked because of a
+  temporary system error (out of file descriptors or memory, `EMFILE`, `ENFILE`, `ENOMEM`, `EAGAIN`, `EINTR`), or the
+  service is shutting down. Retry later.
 
 | Endpoint | Success | Errors |
 |---|---|---|
@@ -229,6 +231,7 @@ Downloads `DATASET_URL` and extracts it to `$DATA_DIR/maildir` in the background
 | `$DATA_DIR/maildir` is a directory the service cannot read (for example permissions, or a volume without a matching `fsGroup`) | `409 maildir_unreadable`; nothing is downloaded |
 | `DATA_DIR` is not writable | `500 data_dir_not_writable` |
 | Any other error while starting the fetch | `500 internal` |
+| Checking `$DATA_DIR/maildir` fails with a temporary system error (for example too many open files) | `503 unavailable`; nothing is downloaded, and the `dataset` state is left as it was |
 | The service is shutting down | `503 unavailable` |
 
 The body (the same object as `dataset` in `GET /status`):
@@ -258,6 +261,7 @@ Starts an ingestion of `$DATA_DIR/maildir` in the background
 | A run is in progress on any replica | `409 ingestion_running` |
 | `$DATA_DIR/maildir` is missing | `409 dataset_missing`, with the message `maildir not found at <path>; call POST /fetch first` |
 | `$DATA_DIR/maildir` exists but cannot be used (a symlink, a file, unreadable) | `409 dataset_missing`, with the message `the maildir at <path> cannot be used: <problem>`, for example `it is a symlink, which is not followed; replace it with the directory itself` (`POST /fetch` refuses it too) |
+| Checking `$DATA_DIR/maildir` fails with a temporary system error (for example too many open files) | `503 unavailable`, with the message `the dataset cannot be checked right now (...); retry later` |
 | The database fails or the 10 s budget runs out | `503 unavailable` |
 | The service is shutting down | `503 unavailable` |
 
@@ -350,7 +354,7 @@ bad variable and exit with status 1.
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` (case-insensitive) |
 | `SHUTDOWN_TIMEOUT` | `20s` | Upper bound for draining in-flight requests (positive duration). Resources are then closed within a separate fixed 5 s budget. |
 | `SHUTDOWN_DRAIN_DELAY` | `0s` | After `SIGTERM`, keep serving for this long while `/readyz` reports `503`, before the listener closes. Set a few seconds behind a load balancer. |
-| `INGEST_WORKERS` | number of CPUs, at most 256 | Parallel parsing workers (1 to 256) |
+| `INGEST_WORKERS` | number of CPUs, at most 256 | Parallel parsing workers (1 to 256). File descriptor use scales with workers × open directories (each queued file pins its directory's descriptor): up to about 5 per worker. A very high value under a low hard `nofile` limit can make subdirectories fail to open with `EMFILE`; each then becomes one `read_error` skip and its files are not ingested. Keep the default, or raise the limit (`ulimit -n`) along with this value. |
 | `INGEST_BATCH_SIZE` | `2000` | Rows per insert batch (1 to 50,000) |
 | `INGEST_PROGRESS_INTERVAL` | `5s` | How often a run's counters are written to Postgres (positive duration) |
 
@@ -441,8 +445,8 @@ run: the first 100, then one in 1,000. They are also counted in the metrics `enr
 and `enron_ingest_field_errors_total{field}`.
 
 A run fails only for infrastructure reasons: the process shuts down (`interrupted: shutdown`), the ingest lock is
-lost (`lock_lost`, for example when its database session is killed), the dataset root disappears or is not a
-directory, or a batch insert still fails after 3 retries with backoff (each attempt times out after 30 s). A run
+lost (`lock_lost`, for example when its database session is killed), the dataset root disappears, is not a
+directory or is replaced (detected when an error below the root makes the walk check it again), or a batch insert still fails after 3 retries with backoff (each attempt times out after 30 s). A run
 whose process died (still `running` in the table, but nobody holds the lock) is reported by `/status` as `failed`
 with `interrupted`. The next `POST /start` records that in the table before it starts a new run.
 
@@ -506,6 +510,12 @@ are written to the run row every `INGEST_PROGRESS_INTERVAL` and at the end. At m
 (a Postgres session advisory lock on a dedicated connection). The dataset root must be a directory, not a symlink.
 `POST /fetch` applies the same rule. To use a dataset stored elsewhere, mount it, or point `DATA_DIR` at the
 directory that contains the real `maildir` directory.
+
+The walk resolves `$DATA_DIR/maildir` once: it checks the path, opens the directory, and verifies that it opened the
+directory it checked. After that, every directory and file is opened relative to its parent directory's descriptor
+(Go's `os.Root`), never through the path again. If the root is replaced while a run is walking it, for example by a
+symlink to another directory, the run keeps reading the directory it opened and never reads a file of the new
+target. A root replaced between the check and the open fails the run (`it changed while it was being opened`).
 
 ### Startup
 

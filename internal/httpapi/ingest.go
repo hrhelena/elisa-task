@@ -35,6 +35,10 @@ var (
 	// ErrIngesterClosed: the service is shutting down (503). It takes
 	// precedence over every other error it is joined with.
 	ErrIngesterClosed = errors.New("ingestion service is shutting down")
+	// ErrDatasetUnavailable: the dataset could not be checked because of a
+	// transient system error, such as running out of file descriptors (503,
+	// #49). It says nothing about the dataset; the caller should retry.
+	ErrDatasetUnavailable = errors.New("the dataset cannot be checked right now")
 )
 
 // DatasetMissingError is returned by Ingester.Start when the maildir is
@@ -94,7 +98,8 @@ type IngestionStatus struct {
 type Ingester interface {
 	// Start starts a run unless one is in progress anywhere in the cluster.
 	// It returns ErrIngestionRunning, a *DatasetMissingError,
-	// ErrIngesterClosed, or another error when the database fails.
+	// ErrDatasetUnavailable, ErrIngesterClosed, or another error when the
+	// database fails.
 	Start(ctx context.Context) (IngestionRun, error)
 	// Status returns the state of the current or last run.
 	Status(ctx context.Context) (IngestionStatus, error)
@@ -115,6 +120,10 @@ const (
 
 const unavailableMessage = "the database is unavailable, retry later"
 
+// transientMessage is the 503 message when the dataset could not be checked
+// because of a transient system error (#49).
+const transientMessage = "the dataset cannot be checked right now (a temporary system error such as too many open files); retry later"
+
 type startResponse struct {
 	RunID     int64     `json:"run_id"`
 	State     string    `json:"state"`
@@ -134,6 +143,11 @@ func startHandler(ing Ingester, logger *slog.Logger) http.Handler {
 			// First: a Start canceled by shutdown may join ErrIngesterClosed
 			// with the error it was failing with; shutdown always wins.
 			writeError(w, http.StatusServiceUnavailable, CodeUnavailable, "the service is shutting down")
+			return
+		case errors.Is(err, ErrDatasetUnavailable):
+			logger.WarnContext(ctx, "checking the dataset failed temporarily",
+				slog.Any("err", err), slog.String("request_id", RequestIDFromContext(ctx)))
+			writeError(w, http.StatusServiceUnavailable, CodeUnavailable, transientMessage)
 			return
 		case errors.Is(err, ErrIngestionRunning):
 			writeError(w, http.StatusConflict, CodeIngestionRunning, "an ingestion is already running")
