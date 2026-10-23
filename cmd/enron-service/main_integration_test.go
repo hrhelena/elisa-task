@@ -316,8 +316,12 @@ func TestBinaryTopSenders(t *testing.T) {
 	// Messages without a valid sender are stored with a NULL sender (ADR 0012).
 	msgs = append(msgs, senderMessages("invalid", "inbox", nil, 4)...)
 	msgs = append(msgs, senderMessages("invalid", "empty", ptr(""), 1)...)
-	for i := range 7 {
-		msgs = append(msgs, senderMessages(fmt.Sprintf("single-%d", i), "inbox", ptr(fmt.Sprintf("single%d@enron.com", i)), 1)...)
+	// Seven senders with one message each, whose order differs between byte
+	// order and the database's ICU collation (storetest.CreateDatabase): the
+	// ranking must not depend on the server locale (ADR 0011, 0012).
+	singles := []string{"ab@enron.com", "a_z@enron.com", ".ward@enron.com", "a.b@enron.com", "c@enron.com", "single1@enron.com", "single0@enron.com"}
+	for i, addr := range singles {
+		msgs = append(msgs, senderMessages(fmt.Sprintf("single-%d", i), "inbox", ptr(addr), 1)...)
 	}
 	if _, err := st.InsertMessages(t.Context(), msgs); err != nil {
 		t.Fatalf("seeding messages: %v", err)
@@ -330,8 +334,9 @@ func TestBinaryTopSenders(t *testing.T) {
 		{Email: "jeff.dasovich@enron.com", Count: 2},
 		{Email: "phillip.allen@enron.com", Count: 2},
 	}
-	for i := range 7 {
-		ranking = append(ranking, store.SenderCount{Email: fmt.Sprintf("single%d@enron.com", i), Count: 1})
+	slices.Sort(singles) // byte order: ".ward@" < "a.b@" < "a_z@" < "ab@" < "c@" < "single0@" < "single1@"
+	for _, addr := range singles {
+		ranking = append(ranking, store.SenderCount{Email: addr, Count: 1})
 	}
 
 	// Scenario: Top 10 by default (12 distinct senders, kay.mann has 5).

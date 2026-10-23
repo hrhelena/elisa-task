@@ -13,7 +13,6 @@ import (
 const (
 	CodeDataDirNotWritable  = "data_dir_not_writable"
 	CodeMaildirNotDirectory = "maildir_not_directory"
-	CodeUnavailable         = "unavailable"
 )
 
 // Fetcher starts the dataset download (ADR 0004). Start must not block on the

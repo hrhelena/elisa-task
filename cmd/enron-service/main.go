@@ -64,7 +64,7 @@ func main() {
 // using the store.
 type dbStore interface {
 	httpapi.Checker
-	httpapi.SenderStats
+	senderRanker
 	Close()
 }
 
@@ -163,7 +163,9 @@ func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, openStore
 	cl.add("fetch", fetcher.Close)
 
 	readiness := httpapi.NewReadiness(st)
-	handler := httpapi.New(httpapi.Deps{Registry: reg, Readiness: readiness, Fetcher: fetcher, Senders: st}, logger)
+	handler := httpapi.New(httpapi.Deps{
+		Registry: reg, Readiness: readiness, Fetcher: fetcher, Senders: senderStats{st},
+	}, logger)
 	srv := newServer(handler, logger)
 
 	var lc net.ListenConfig

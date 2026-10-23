@@ -4,16 +4,15 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
-
-	"github.com/hrhelena/elisa-task/internal/store"
 )
 
-// Error codes of GET /top-senders (ADR 0011).
-const (
-	CodeInvalidLimit = "invalid_limit"
-)
+// CodeInvalidLimit is the error code of GET /top-senders for a bad limit
+// (ADR 0011).
+const CodeInvalidLimit = "invalid_limit"
 
 // Limits of GET /top-senders?limit=N (ADR 0011).
 const (
@@ -26,20 +25,22 @@ const topSendersTimeout = 5 * time.Second
 
 const invalidLimitMessage = "limit must be an integer between 1 and 100"
 
-// SenderStats ranks senders by message count. It is implemented by the store
-// (#4): count descending, then email ascending, excluding messages without a
-// valid sender (ADR 0003, 0012).
+// SenderCount is one entry of the top-senders ranking.
+type SenderCount struct {
+	Email string `json:"email"`
+	Count int64  `json:"count"`
+}
+
+// SenderStats ranks senders by message count: count descending, then email
+// ascending, excluding messages without a valid sender (ADR 0003, 0012). The
+// store (#4) backs it through an adapter in main, so this package does not
+// depend on the storage packages (ADR 0009).
 type SenderStats interface {
-	TopSenders(ctx context.Context, limit int) ([]store.SenderCount, error)
+	TopSenders(ctx context.Context, limit int) ([]SenderCount, error)
 }
 
 type topSendersResponse struct {
-	Senders []senderJSON `json:"senders"`
-}
-
-type senderJSON struct {
-	Email string `json:"email"`
-	Count int64  `json:"count"`
+	Senders []SenderCount `json:"senders"`
 }
 
 // topSendersHandler serves GET /top-senders[?limit=N].
@@ -54,7 +55,15 @@ func topSendersHandler(stats SenderStats, logger *slog.Logger) http.Handler {
 		defer cancel()
 		senders, err := stats.TopSenders(ctx, limit)
 		if err != nil {
-			logger.LogAttrs(ctx, slog.LevelError, "top senders query failed",
+			level, msg := slog.LevelError, "top senders query failed"
+			if r.Context().Err() != nil {
+				// The client went away (or the server is closing the
+				// connection): not a database failure, and nobody reads
+				// the response. The 5s query timeout is not covered here,
+				// since it cancels ctx, not r.Context().
+				level, msg = slog.LevelDebug, "top senders query canceled by the client"
+			}
+			logger.LogAttrs(ctx, level, msg,
 				slog.Int("limit", limit),
 				slog.Any("err", err),
 				slog.String("request_id", RequestIDFromContext(ctx)),
@@ -62,20 +71,22 @@ func topSendersHandler(stats SenderStats, logger *slog.Logger) http.Handler {
 			writeError(w, http.StatusServiceUnavailable, CodeUnavailable, "the database is unavailable, retry later")
 			return
 		}
-		resp := topSendersResponse{Senders: make([]senderJSON, len(senders))} // never null
-		for i, s := range senders {
-			resp.Senders[i] = senderJSON{Email: s.Email, Count: s.Count}
+		if senders == nil {
+			senders = []SenderCount{} // never null
 		}
-		writeJSON(w, http.StatusOK, resp)
+		writeJSON(w, http.StatusOK, topSendersResponse{Senders: senders})
 	})
 }
 
 // parseLimit returns the limit query parameter, DefaultTopSendersLimit when
-// it is absent, and ok == false when it is repeated, empty, not a decimal
-// integer, or outside 1..MaxTopSendersLimit.
+// it is absent, and ok == false when it is malformed, repeated, empty, not a
+// decimal integer, or outside 1..MaxTopSendersLimit.
 func parseLimit(r *http.Request) (limit int, ok bool) {
-	values, present := r.URL.Query()["limit"]
-	if !present {
+	values, malformed := limitValues(r.URL.RawQuery)
+	if malformed {
+		return 0, false
+	}
+	if len(values) == 0 {
 		return DefaultTopSendersLimit, true
 	}
 	if len(values) != 1 || !isDigits(values[0]) {
@@ -86,6 +97,45 @@ func parseLimit(r *http.Request) (limit int, ok bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+// limitValues returns the decoded values of every "limit" pair in rawQuery.
+// It does not use r.URL.Query(), which silently drops the pairs it cannot
+// parse (a bad percent escape, or a ";" since Go 1.17), so "?limit=abc;"
+// would look like no limit at all. A limit pair that cannot be decoded, or
+// a "&"-separated segment with a ";" in which any part has the key "limit",
+// makes the whole parameter malformed. Broken pairs with other keys are
+// ignored, as Query does.
+func limitValues(rawQuery string) (values []string, malformed bool) {
+	for segment := range strings.SplitSeq(rawQuery, "&") {
+		if !hasLimitKey(segment) {
+			continue
+		}
+		if strings.Contains(segment, ";") {
+			malformed = true
+			continue
+		}
+		_, raw, _ := strings.Cut(segment, "=")
+		v, err := url.QueryUnescape(raw)
+		if err != nil {
+			malformed = true
+			continue
+		}
+		values = append(values, v)
+	}
+	return values, malformed
+}
+
+// hasLimitKey reports whether any ";"-separated part of a query segment has
+// the (decoded) key "limit".
+func hasLimitKey(segment string) bool {
+	for part := range strings.SplitSeq(segment, ";") {
+		rawKey, _, _ := strings.Cut(part, "=")
+		if key, err := url.QueryUnescape(rawKey); err == nil && key == "limit" {
+			return true
+		}
+	}
+	return false
 }
 
 // isDigits reports whether s is a non-empty run of ASCII digits, rejecting the

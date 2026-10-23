@@ -73,6 +73,12 @@ func (p *Postgres) Stop(ctx context.Context) error {
 // container and returns its connection string, so that a test can have data
 // of its own on a shared container. The database lives as long as the
 // container.
+//
+// Like the store's own test databases (#4), it uses the ICU en-US
+// collation, not the image's default: the alpine image (musl) sorts text in
+// byte order, which would hide any query whose result depends on the
+// database collation, while glibc and ICU servers sort punctuation by
+// locale rules.
 func (p *Postgres) CreateDatabase(ctx context.Context) (string, error) {
 	name := fmt.Sprintf("test_%d", p.dbSeq.Add(1))
 	conn, err := pgx.Connect(ctx, p.URL)
@@ -80,7 +86,8 @@ func (p *Postgres) CreateDatabase(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("connecting to postgres: %w", err)
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
-	if _, err := conn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
+	if _, err := conn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()+
+		" TEMPLATE template0 ENCODING 'UTF8' LOCALE_PROVIDER icu ICU_LOCALE 'en-US' LOCALE 'C'"); err != nil {
 		return "", fmt.Errorf("creating database %s: %w", name, err)
 	}
 	u, err := url.Parse(p.URL)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
@@ -14,14 +15,12 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-
-	"github.com/hrhelena/elisa-task/internal/store"
 )
 
 // fakeSenderStats is a SenderStats that returns a fixed result and records
 // its calls.
 type fakeSenderStats struct {
-	senders []store.SenderCount
+	senders []SenderCount
 	err     error
 
 	mu       sync.Mutex
@@ -29,7 +28,7 @@ type fakeSenderStats struct {
 	deadline time.Duration // time left on the context of the last call; 0 if none
 }
 
-func (f *fakeSenderStats) TopSenders(ctx context.Context, limit int) ([]store.SenderCount, error) {
+func (f *fakeSenderStats) TopSenders(ctx context.Context, limit int) ([]SenderCount, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.limits = append(f.limits, limit)
@@ -66,7 +65,7 @@ type topSendersBody struct {
 	} `json:"senders"`
 }
 
-func decodeSenders(t *testing.T, body string) []store.SenderCount {
+func decodeSenders(t *testing.T, body string) []SenderCount {
 	t.Helper()
 	var resp topSendersBody
 	dec := json.NewDecoder(strings.NewReader(body))
@@ -77,19 +76,19 @@ func decodeSenders(t *testing.T, body string) []store.SenderCount {
 	if resp.Senders == nil {
 		t.Fatalf("senders is null or missing in %q", body)
 	}
-	out := make([]store.SenderCount, len(resp.Senders))
+	out := make([]SenderCount, len(resp.Senders))
 	for i, s := range resp.Senders {
-		out[i] = store.SenderCount{Email: s.Email, Count: s.Count}
+		out[i] = SenderCount{Email: s.Email, Count: s.Count}
 	}
 	return out
 }
 
 // rankedSenders returns n senders in store order, the first with count
 // first and each following one with one message fewer (at least 1).
-func rankedSenders(n int, first int64) []store.SenderCount {
-	out := make([]store.SenderCount, n)
+func rankedSenders(n int, first int64) []SenderCount {
+	out := make([]SenderCount, n)
 	for i := range out {
-		out[i] = store.SenderCount{Email: fmt.Sprintf("sender%02d@enron.com", i), Count: max(first-int64(i), 1)}
+		out[i] = SenderCount{Email: fmt.Sprintf("sender%02d@enron.com", i), Count: max(first-int64(i), 1)}
 	}
 	return out
 }
@@ -113,7 +112,7 @@ func TestTopSendersDefaultsToTen(t *testing.T) {
 	if !slices.Equal(got, all[:10]) {
 		t.Errorf("senders = %v, want %v", got, all[:10])
 	}
-	if got[0] != (store.SenderCount{Email: "kay.mann@enron.com", Count: 5}) {
+	if got[0] != (SenderCount{Email: "kay.mann@enron.com", Count: 5}) {
 		t.Errorf("first entry = %v, want kay.mann@enron.com with 5", got[0])
 	}
 	if calls := stats.calls(); !slices.Equal(calls, []int{10}) {
@@ -124,7 +123,7 @@ func TestTopSendersDefaultsToTen(t *testing.T) {
 // The exact wire format of ADR 0011.
 func TestTopSendersResponseShape(t *testing.T) {
 	t.Parallel()
-	stats := &fakeSenderStats{senders: []store.SenderCount{
+	stats := &fakeSenderStats{senders: []SenderCount{
 		{Email: "kay.mann@enron.com", Count: 16735},
 		{Email: "vince.kaminski@enron.com", Count: 14368},
 	}}
@@ -147,6 +146,10 @@ func TestTopSendersValidLimitsArePassedToTheStore(t *testing.T) {
 		{"?limit=100", 100},
 		{"?limit=007", 7},
 		{"?other=x&limit=3", 3},
+		{"?lim%69t=4", 4},        // encoded key, as url.ParseQuery decodes it
+		{"?foo=%zz&limit=5", 5},  // a broken unrelated pair is ignored
+		{"?foo=a;b&limit=6", 6},  // so is one with a ";"
+		{"?limitx=1&limit=7", 7}, // only the exact key counts
 	} {
 		t.Run(tc.query, func(t *testing.T) {
 			t.Parallel()
@@ -185,6 +188,14 @@ func TestTopSendersInvalidLimit(t *testing.T) {
 		"limit=99999999999999999999",
 		"limit=5&limit=6",
 		"limit=5&limit=5",
+		// Pairs r.URL.Query() would silently drop, turning them into "no limit".
+		"limit=abc;",
+		"limit=%ZZ",
+		"limit=%",
+		"limit=5;x",
+		"limit=1;limit=500",
+		"foo=1;limit=5",
+		"limit=5&limit=%ZZ",
 	} {
 		t.Run(query, func(t *testing.T) {
 			t.Parallel()
@@ -211,7 +222,7 @@ func TestTopSendersInvalidLimit(t *testing.T) {
 // rendered as an empty array, never null.
 func TestTopSendersEmptyDatabase(t *testing.T) {
 	t.Parallel()
-	for name, senders := range map[string][]store.SenderCount{"empty": {}, "nil": nil} {
+	for name, senders := range map[string][]SenderCount{"empty": {}, "nil": nil} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			rec := newSendersAPI(t, &fakeSenderStats{senders: senders}).do(t, http.MethodGet, "/top-senders", nil)
@@ -252,10 +263,29 @@ func TestTopSendersDatabaseUnavailable(t *testing.T) {
 	}
 }
 
+// A client that disconnects mid-query is not a database failure: it is
+// logged at DEBUG, not ERROR.
+func TestTopSendersClientCancelIsNotAnError(t *testing.T) {
+	t.Parallel()
+	api := newSendersAPI(t, &fakeSenderStats{err: fmt.Errorf("querying top senders: %w", context.Canceled)})
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/top-senders", nil)
+	api.handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if failed := api.logs.find(t, "top senders query failed"); len(failed) != 0 {
+		t.Errorf("client cancel logged as a query failure: %v", failed)
+	}
+	logged := api.logs.find(t, "top senders query canceled by the client")
+	if len(logged) != 1 || logged[0]["level"] != "DEBUG" {
+		t.Errorf("want one DEBUG cancel log line, got %v", logged)
+	}
+}
+
 // The query runs under a 5s timeout derived from the request context.
 func TestTopSendersQueryTimeout(t *testing.T) {
 	t.Parallel()
-	stats := &fakeSenderStats{senders: []store.SenderCount{}}
+	stats := &fakeSenderStats{senders: []SenderCount{}}
 	newSendersAPI(t, stats).do(t, http.MethodGet, "/top-senders", nil)
 	stats.mu.Lock()
 	defer stats.mu.Unlock()
@@ -285,7 +315,7 @@ func TestTopSendersRouting(t *testing.T) {
 
 	t.Run("metrics use the route pattern", func(t *testing.T) {
 		t.Parallel()
-		api := newSendersAPI(t, &fakeSenderStats{senders: []store.SenderCount{}})
+		api := newSendersAPI(t, &fakeSenderStats{senders: []SenderCount{}})
 		api.do(t, http.MethodGet, "/top-senders?limit=5", nil)
 		api.do(t, http.MethodGet, "/top-senders?limit=0", nil)
 		body := api.do(t, http.MethodGet, "/metrics", nil).Body.String()
