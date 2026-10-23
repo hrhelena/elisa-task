@@ -176,7 +176,8 @@ make compose-clean   # stop and delete the database volume
 ```
 
 `make docker-smoke` builds the image and checks it and the compose stack, as its own compose project on ports
-18080 and 15432, so it does not touch a running `make compose-up` stack.
+18080 and 15432, so it does not touch a running `make compose-up` stack. If those ports are taken, override them
+the same way: `APP_PORT=18094 POSTGRES_PORT=15494 make docker-smoke`.
 
 ### Running without containers
 
@@ -481,7 +482,9 @@ Safety checks:
   filesystems that report them. The dataset has about 521k files and directories, more than a small ext4 volume
   holds (see [Dataset volume and inodes](#dataset-volume-and-inodes)).
 - It fails if no data arrives for 60 s, or if the archive extracts to more than 8 GiB.
-- On failure or shutdown, the temporary directory is removed. Leftovers from a crash are removed at the next startup.
+- On failure or shutdown, the temporary directory is removed. A partial tree with many files can take longer than
+  the 5 s close budget (for example about 140k files through a Docker Desktop bind mount), and the process then
+  exits first. Such leftovers, like those from a crash, are removed at the next startup.
 
 The fetch state is held in memory in the pod that runs it. After a restart, a completed dataset is found on disk
 again, and an interrupted fetch must be started again with `POST /fetch`.
@@ -531,7 +534,7 @@ On `SIGINT` or `SIGTERM` the service:
    at once, the run is recorded as `failed` with `interrupted: shutdown`, and it releases its lock. A slow database
    can extend this by up to 5 s. In that case, the final write is cut off, and the run is reported as `interrupted`
    by the crashed-owner path ([ADR 0010](Docs/ADR/0010-ingestion-state-in-postgres-with-advisory-lock.md)). A
-   running fetch is cancelled and its temporary directory removed.
+   running fetch is cancelled and its temporary directory removed (or, if that takes too long, at the next startup).
 4. Exits with status 0, or 1 if draining exceeded `SHUTDOWN_TIMEOUT`. A second signal exits at once.
 
 The worst case is `SHUTDOWN_DRAIN_DELAY + SHUTDOWN_TIMEOUT + 5s`, which must fit in the orchestrator's grace period:
