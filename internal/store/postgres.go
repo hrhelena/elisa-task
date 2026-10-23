@@ -87,7 +87,8 @@ var _ Store = (*Postgres)(nil)
 //
 // A transient connection failure (see isTransientConnectError) wraps
 // ErrUnreachable and may be retried; any other error, including a rejected
-// password, a missing database or a TLS failure, is permanent. ctx bounds
+// password, a missing database, a missing CONNECT privilege (42501) or a TLS
+// failure, is permanent. ctx bounds
 // the whole call, including the wait for the migration lock (see migrate).
 func Open(ctx context.Context, databaseURL string, logger *slog.Logger) (*Postgres, error) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)
