@@ -257,3 +257,4 @@ jobs:
         env:
           KIND_CLUSTER: elisa-enron-e2e
           IMAGE: enron-service:dev
+          ROLLOUT_TIMEOUT: 3s
