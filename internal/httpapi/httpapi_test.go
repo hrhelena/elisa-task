@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -363,25 +364,91 @@ func TestPanicInHandler(t *testing.T) {
 	}
 }
 
-func TestPanicAfterHeadersAbortsConnection(t *testing.T) {
+// TestPanicAfterResponseCommittedAbortsConnection: once the status line is
+// committed (by Write, WriteHeader or a flush), a panic aborts the connection
+// instead of appending an error body, and logs and metrics record the status
+// the client actually received, marked as aborted.
+func TestPanicAfterResponseCommittedAbortsConnection(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		commit func(w http.ResponseWriter)
+		status int
+	}{
+		{"write", func(w http.ResponseWriter) { _, _ = w.Write([]byte("partial")) }, http.StatusOK},
+		{"write header", func(w http.ResponseWriter) { w.WriteHeader(http.StatusAccepted) }, http.StatusAccepted},
+		{"flush", func(w http.ResponseWriter) { _ = http.NewResponseController(w).Flush() }, http.StatusOK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			api := newTestAPI(t, nil, func(rt *router) {
+				rt.read("GET /half", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					tt.commit(w)
+					panic("late")
+				}))
+			})
+			rec := httptest.NewRecorder()
+			func() {
+				defer func() {
+					if p := recover(); p != http.ErrAbortHandler { //nolint:errorlint // identity check, as net/http does.
+						t.Errorf("recovered %v, want http.ErrAbortHandler", p)
+					}
+				}()
+				api.handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/half", nil))
+				t.Error("expected the handler chain to abort")
+			}()
+
+			if rec.Code != tt.status || strings.Contains(rec.Body.String(), CodeInternal) {
+				t.Errorf("client got %d %q, want %d without an error body", rec.Code, rec.Body.String(), tt.status)
+			}
+			if n := len(api.logs.find(t, "panic in handler")); n != 1 {
+				t.Errorf("got %d panic log lines, want 1", n)
+			}
+			access := api.logs.find(t, "http request")
+			if len(access) != 1 || access[0]["status"] != float64(tt.status) || access[0]["aborted"] != true {
+				t.Errorf("access log = %v, want status %d and aborted=true", access, tt.status)
+			}
+			metrics := scrape(t, api)
+			want := `enron_http_requests_total{code="` + strconv.Itoa(tt.status) + `",method="GET",route="GET /half"} 1`
+			for _, w := range []string{want, "enron_http_panics_total 1"} {
+				if !strings.Contains(metrics, w) {
+					t.Errorf("metrics do not contain %q", w)
+				}
+			}
+		})
+	}
+}
+
+// TestPanicDropsHandlerHeaders: headers the handler set before panicking
+// describe a response that never happened and must not reach the 500.
+func TestPanicDropsHandlerHeaders(t *testing.T) {
 	t.Parallel()
 
 	api := newTestAPI(t, nil, func(rt *router) {
-		rt.read("GET /half", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			_, _ = w.Write([]byte("partial"))
-			panic("late")
+		rt.read("GET /boom", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			h := w.Header()
+			h.Set("Content-Encoding", "gzip")
+			h.Set("Location", "/elsewhere")
+			h.Set("Cache-Control", "max-age=3600")
+			h.Set("Content-Length", "12345")
+			panic("kaboom")
 		}))
 	})
-	defer func() {
-		if p := recover(); p != http.ErrAbortHandler { //nolint:errorlint // identity check, as net/http does.
-			t.Errorf("recovered %v, want http.ErrAbortHandler", p)
+	rec := api.do(t, http.MethodGet, "/boom", http.Header{"X-Request-Id": {"hdr-1"}})
+	if rec.Code != http.StatusInternalServerError || errorCode(t, rec) != CodeInternal {
+		t.Fatalf("got %d %s, want 500 internal", rec.Code, rec.Body.String())
+	}
+	for _, k := range []string{"Content-Encoding", "Location", "Cache-Control", "Content-Length"} {
+		if v := rec.Header().Get(k); v != "" {
+			t.Errorf("handler header %s=%q leaked into the 500", k, v)
 		}
-		if n := len(api.logs.find(t, "panic in handler")); n != 1 {
-			t.Errorf("got %d panic log lines, want 1", n)
-		}
-	}()
-	api.do(t, http.MethodGet, "/half", nil)
-	t.Error("expected the handler chain to abort")
+	}
+	if got := rec.Header().Get(HeaderRequestID); got != "hdr-1" {
+		t.Errorf("X-Request-ID = %q, want it kept", got)
+	}
 }
 
 func TestAbortHandlerPanicPassesThrough(t *testing.T) {
@@ -625,6 +692,52 @@ func TestMutatingRoutesGetExtraMiddleware(t *testing.T) {
 	metrics := scrape(t, api)
 	for _, want := range []string{
 		`enron_http_requests_total{code="403",method="POST",route="POST /start"} 1`,
+		`enron_http_requests_total{code="202",method="POST",route="POST /start"} 1`,
+	} {
+		if !strings.Contains(metrics, want) {
+			t.Errorf("metrics do not contain %q", want)
+		}
+	}
+}
+
+// TestGlobalMiddlewareSeesResolvedRoute covers the ADR 0005 slot for a
+// global Authenticate middleware: requests it rejects are logged and counted
+// under their route, and it may replace the request without losing it.
+func TestGlobalMiddlewareSeesResolvedRoute(t *testing.T) {
+	t.Parallel()
+
+	type ctxKey struct{}
+	authenticate := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") == "" && !isQuietPath(r.URL.Path) { // probes stay open
+				writeError(w, http.StatusUnauthorized, "unauthenticated", "missing credentials")
+				return
+			}
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, "alice")))
+		})
+	}
+	api := newTestAPI(t, nil, func(rt *router) {
+		rt.global = append(rt.global, authenticate)
+		rt.mutate("POST /start", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusAccepted, map[string]any{"who": r.Context().Value(ctxKey{})})
+		}))
+	})
+
+	if rec := api.do(t, http.MethodPost, "/start", nil); rec.Code != http.StatusUnauthorized {
+		t.Errorf("unauthenticated POST /start: status = %d, want 401", rec.Code)
+	}
+	if rec := api.do(t, http.MethodPost, "/start", http.Header{"Authorization": {"x"}}); rec.Code != http.StatusAccepted ||
+		!strings.Contains(rec.Body.String(), "alice") {
+		t.Errorf("authenticated POST /start: %d %s, want 202 with identity", rec.Code, rec.Body.String())
+	}
+
+	access := api.logs.find(t, "http request")
+	if len(access) != 2 || access[0]["route"] != "POST /start" || access[0]["status"] != float64(401) {
+		t.Errorf("rejected request not logged under its route: %v", access)
+	}
+	metrics := scrape(t, api)
+	for _, want := range []string{
+		`enron_http_requests_total{code="401",method="POST",route="POST /start"} 1`,
 		`enron_http_requests_total{code="202",method="POST",route="POST /start"} 1`,
 	} {
 		if !strings.Contains(metrics, want) {

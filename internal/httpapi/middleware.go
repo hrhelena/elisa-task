@@ -39,8 +39,8 @@ type requestInfoKey struct{}
 // hiding values from outer ones.
 type requestInfo struct {
 	id string
-	// route is the registered pattern that matched, or "" if none did. Set by
-	// the router just before the mux serves the request.
+	// route is the registered pattern that matches, or "" if none does. Set by
+	// resolveRoute, right after requestID.
 	route string
 }
 
@@ -96,9 +96,18 @@ func recoverer(logger *slog.Logger, panics interface{ Inc() }) Middleware {
 					slog.String("request_id", RequestIDFromContext(ctx)),
 				)
 				if rec.wroteHeader {
-					// Part of a response is already on the wire; the only honest
-					// option left is to abort the connection.
+					// Part of a response (or a flushed header) is already on the
+					// wire; the only honest option left is to abort the connection.
 					panic(http.ErrAbortHandler)
+				}
+				// Drop whatever the handler set (Content-Encoding, Location,
+				// caching headers...): they describe a response that never
+				// happened. Only the request ID survives.
+				h := w.Header()
+				id := h.Get(HeaderRequestID)
+				clear(h)
+				if id != "" {
+					h.Set(HeaderRequestID, id)
 				}
 				writeError(w, http.StatusInternalServerError, CodeInternal, "internal server error")
 			}(r.Context())
@@ -118,8 +127,9 @@ func isQuietPath(path string) bool {
 	}
 }
 
-// accessLog writes one line per request. A request whose handler panics is
-// logged with status 500 (what recoverer sends) while the panic propagates.
+// accessLog writes one line per request. For a request whose handler panics
+// it logs what the client receives (see responseRecorder.outcome) while the
+// panic propagates.
 func accessLog(logger *slog.Logger) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -128,15 +138,12 @@ func accessLog(logger *slog.Logger) Middleware {
 			info := requestInfoFrom(r.Context())
 			completed := false
 			defer func(ctx context.Context) {
-				status := rec.Status()
-				if !completed {
-					status = http.StatusInternalServerError
-				}
+				status, aborted := rec.outcome(completed)
 				level := slog.LevelInfo
 				if isQuietPath(r.URL.Path) {
 					level = slog.LevelDebug
 				}
-				logger.LogAttrs(ctx, level, "http request",
+				attrs := []slog.Attr{
 					slog.String("method", r.Method),
 					slog.String("route", info.route),
 					slog.String("path", r.URL.Path),
@@ -144,7 +151,11 @@ func accessLog(logger *slog.Logger) Middleware {
 					slog.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000),
 					slog.Int64("bytes", rec.bytes),
 					slog.String("request_id", info.id),
-				)
+				}
+				if aborted {
+					attrs = append(attrs, slog.Bool("aborted", true))
+				}
+				logger.LogAttrs(ctx, level, "http request", attrs...)
 			}(r.Context())
 			next.ServeHTTP(rec, r)
 			completed = true
@@ -153,7 +164,8 @@ func accessLog(logger *slog.Logger) Middleware {
 }
 
 // instrument records request count and latency per method, route pattern and
-// status code. Like accessLog, it records a panicking request as a 500.
+// status code. Like accessLog, it records what the client of a panicking
+// request receives (see responseRecorder.outcome).
 func instrument(m *httpMetrics) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -162,10 +174,7 @@ func instrument(m *httpMetrics) Middleware {
 			info := requestInfoFrom(r.Context())
 			completed := false
 			defer func() {
-				status := rec.Status()
-				if !completed {
-					status = http.StatusInternalServerError
-				}
+				status, _ := rec.outcome(completed)
 				m.observe(r.Method, info.route, status, time.Since(start))
 			}()
 			next.ServeHTTP(rec, r)
@@ -215,6 +224,35 @@ func (r *responseRecorder) Status() int {
 		return http.StatusOK
 	}
 	return r.status
+}
+
+// FlushError marks the response as committed (a flush sends the header) and
+// flushes the underlying writer. http.ResponseController finds this method
+// before Unwrap, so recorders further out see the flush too.
+func (r *responseRecorder) FlushError() error {
+	if !r.wroteHeader {
+		r.status = http.StatusOK
+		r.wroteHeader = true
+	}
+	if err := http.NewResponseController(r.ResponseWriter).Flush(); err != nil {
+		return fmt.Errorf("flushing response: %w", err)
+	}
+	return nil
+}
+
+// outcome returns the status the client receives and whether the response
+// was aborted. completed is false when the handler panicked: recoverer then
+// sends a 500 if nothing was committed yet, or aborts the connection after
+// the committed status otherwise.
+func (r *responseRecorder) outcome(completed bool) (status int, aborted bool) {
+	switch {
+	case completed:
+		return r.Status(), false
+	case r.wroteHeader:
+		return r.status, true
+	default:
+		return http.StatusInternalServerError, false
+	}
 }
 
 func (r *responseRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }

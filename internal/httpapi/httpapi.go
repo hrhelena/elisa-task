@@ -39,6 +39,11 @@ type router struct {
 	// patterns are the registered route patterns, the only values allowed in
 	// the route log field and metric label.
 	patterns map[string]bool
+	// global is applied to every route, inside request ID, route
+	// resolution, recovery, access log and metrics. ADR 0005: a global
+	// Authenticate middleware (which puts the caller identity in the request
+	// context) is appended here when auth is introduced.
+	global []Middleware
 	// mutating is applied to routes that trigger work or change state
 	// (POST /fetch, POST /start). ADR 0005: an Authorize middleware (for
 	// example admin-only) is appended here when auth is introduced.
@@ -95,28 +100,41 @@ func (rt *router) handle(pattern string, h http.Handler) {
 }
 
 // handler wraps the mux in the global middleware chain, outermost first.
+// The route is resolved right after the request ID, before anything that may
+// reject a request, so every log line and metric carries it.
 func (rt *router) handler() http.Handler {
-	return chain(rt.serveMux(),
+	mws := []Middleware{
 		requestID(),
+		rt.resolveRoute(),
 		recoverer(rt.logger, rt.metrics.panics),
 		accessLog(rt.logger),
 		instrument(rt.metrics),
-		// ADR 0005: a global Authenticate middleware goes here. It runs after
-		// request ID, logging and metrics, so rejected requests are still
-		// logged and counted, and it puts the caller identity in the request
-		// context for handlers (and per-route authorization in rt.mutating).
-	)
+	}
+	// rt.global runs after logging and metrics, so requests it rejects are
+	// still logged and counted under their route.
+	mws = append(mws, rt.global...)
+	return chain(rt.serveMux(), mws...)
 }
 
-// serveMux serves the mux. It first resolves the matched pattern and records
-// it for accessLog and instrument (unmatched requests keep route ""), and it
-// turns the mux's plain-text 404 and 405 responses into the JSON envelope.
+// resolveRoute records the registered pattern that matches the request for
+// accessLog, instrument and serveMux. Unmatched requests keep route "".
+// mux.Handler only looks the pattern up; it has no side effects.
+func (rt *router) resolveRoute() Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if _, pattern := rt.mux.Handler(r); rt.patterns[pattern] {
+				requestInfoFrom(r.Context()).route = pattern
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// serveMux serves the mux, turning its plain-text 404 and 405 responses into
+// the JSON envelope.
 func (rt *router) serveMux() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, pattern := rt.mux.Handler(r)
-		if rt.patterns[pattern] {
-			requestInfoFrom(r.Context()).route = pattern
-		} else {
+		if requestInfoFrom(r.Context()).route == "" {
 			w = &fallbackWriter{ResponseWriter: w}
 		}
 		rt.mux.ServeHTTP(w, r)
