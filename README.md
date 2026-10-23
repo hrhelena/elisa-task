@@ -775,8 +775,9 @@ on a throwaway cluster `elisa-enron-e2e` (`E2E_KIND_CLUSTER`), separate from the
    - `POST /fetch` returns 202, and `dataset.state` reaches `ready` with 58 files;
    - `POST /start` returns 202, and `/status` reaches `finished: true` with exactly 56 processed, 2 skipped
      (`empty_file`, `not_an_email`), 58 files seen and 2 field errors (`missing_sender`, `invalid_sender`);
-   - `/top-senders` returns the expected order. Ties break by address in byte order: `mark.taylor@` comes before
-     `mark_taylor@`, which a linguistic collation would reverse;
+   - `/top-senders` returns the expected order, with ties broken by address in byte order (the ordering contract):
+     `mark.taylor@` comes before `mark_taylor@`. kind's Postgres already sorts in byte order, so this does not detect
+     a dropped `COLLATE "C"`; the store integration tests on ICU en-US databases cover that;
    - after the `enron-service` pod is deleted and its replacement is ready, `/status` reports the same completed run
      and `/top-senders` is unchanged;
    - a second `POST /start` completes with the same totals and ranking (idempotent re-ingestion).

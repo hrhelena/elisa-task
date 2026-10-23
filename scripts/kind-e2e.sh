@@ -128,9 +128,10 @@ trap 'exit 143' TERM
 # Senders in the expected /top-senders order: count descending, then address ascending in byte order (ADR 0011;
 # from_addr is COLLATE "C"). Every message from a sender goes into that sender's mailbox; some From headers use a
 # display name and an upper-case address, which the lenient normalization (ADR 0012) lowercases into the same sender.
-# The tie mark.taylor@ / mark_taylor@ only byte order resolves this way ('.' 0x2E < '_' 0x5F); a linguistic
-# collation sorts it the other way (checked in postgres:16: COLLATE "en-US-x-icu" puts mark_taylor@ first), so a
-# collation regression fails the order check. Every other tie differs in a letter and sorts the same either way.
+# The tie mark.taylor@ / mark_taylor@ checks the ordering contract end to end: byte order puts '.' (0x2E) before
+# '_' (0x5F), while a linguistic collation such as ICU en-US puts mark_taylor@ first. This is not a collation
+# regression detector here: kind's postgres:16-alpine database already sorts in byte order, so dropping COLLATE "C"
+# would still pass in kind. That case is covered by the store integration tests on ICU en-US databases (#4).
 EXPECTED_SENDERS=(
 	"jeff.dasovich@enron.com 9 dasovich-j"
 	"phillip.allen@enron.com 7 allen-p"
@@ -510,3 +511,14 @@ jq . "$work/status-run2.json"
 assert_completed_run "$work/status-run2.json"
 check_top_senders run2
 assert_same "GET /top-senders is unchanged by the re-ingestion" "$work/top-run1-all.json" "$work/top-run2-all.json"
+
+# --- No crashes ----------------------------------------------------------------------------------------------------
+# The deliberate delete above replaced the pod; the replacement must still be the only app pod, and its container must
+# never have restarted (a crash or a failed liveness probe during fetch, ingestion or re-ingestion would show here).
+log "the enron-service container never restarted"
+pods=$(kc -n "$NAMESPACE" get pods -l "$APP_SELECTOR" -o name)
+[ "$pods" = "$new_pod" ] || fail "expected only $new_pod after the restart, found: $(echo "$pods" | tr '\n' ' ')"
+restarts=$(kc -n "$NAMESPACE" get "$new_pod" \
+	-o jsonpath='{.status.containerStatuses[?(@.name=="enron-service")].restartCount}')
+[ "$restarts" = 0 ] || fail "${new_pod#pod/}: container enron-service restartCount is '$restarts', expected 0"
+echo "assert: ${new_pod#pod/}: container enron-service restartCount 0"
