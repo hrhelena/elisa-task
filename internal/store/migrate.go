@@ -26,10 +26,15 @@ const (
 	migrationLockDefaultRetryAttempts = 300
 )
 
-// lockAttempts returns how many times to try the migration lock, one
-// migrationLockRetryPeriod apart, so that the wait ends with the caller's
-// deadline (the startup budget, DB_STARTUP_TIMEOUT) rather than being
-// configured for longer than the caller allows.
+// lockAttempts returns goose's lock retry count: after the first try, it
+// retries every migrationLockRetryPeriod that many times, so the configured
+// wait (attempts seconds) is the caller's remaining budget (the startup
+// budget, DB_STARTUP_TIMEOUT) rounded down. With at least 1s left the wait
+// therefore ends inside the budget with goose's "failed to acquire lock"
+// error. goose requires at least one retry, so with under 1s left the wait
+// would be longer than the budget; it never outlasts it, though, because
+// the retry loop checks ctx: the deadline ends it and the error wraps
+// context.DeadlineExceeded instead. Either way it is permanent (exit 1).
 func lockAttempts(ctx context.Context, now time.Time) uint64 {
 	deadline, ok := ctx.Deadline()
 	if !ok {
@@ -45,6 +50,13 @@ func lockAttempts(ctx context.Context, now time.Time) uint64 {
 // migrate applies all pending embedded migrations (ADR 0013). A Postgres
 // session-level advisory lock serializes concurrent callers, so replicas
 // starting together apply each migration exactly once.
+//
+// ctx carries the startup deadline and can expire while a migration runs.
+// goose runs each migration and its version row in one transaction, so a
+// canceled migration rolls back completely and is retried on the next
+// start. A future "-- +goose NO TRANSACTION" migration (CREATE INDEX
+// CONCURRENTLY, for example) has no such protection: it can be cut off
+// halfway, so it must be safe to run again (IF NOT EXISTS, and so on).
 func migrate(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger) error {
 	migrations, err := fs.Sub(embeddedMigrations, "migrations")
 	if err != nil {

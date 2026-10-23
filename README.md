@@ -94,12 +94,20 @@ curl -s 'localhost:8080/top-senders?limit=3'
 The service connects to Postgres and applies the embedded migrations before it listens. `DB_STARTUP_TIMEOUT`
 (default `60s`) bounds all of it:
 
-- While the database is unreachable (connection refused, or no answer within 5s), the service retries with capped
-  exponential backoff and jitter (250ms, 500ms, 1s, ... up to 5s), logging each retry at `WARN` as
-  `database not ready, retrying` with the attempt number and the error. The password is never logged.
+- While the database is not reachable yet (connection refused, DNS failure, no answer within 5s or within a longer
+  `connect_timeout` from `DATABASE_URL`, or the server reports that it is starting up, shutting down or out of
+  connections), the service retries with capped exponential backoff and jitter (250ms, 500ms, 1s, ... up to 5s),
+  logging each retry at `WARN` as `database not ready, retrying` with the attempt number and the error. The password
+  is never logged.
+- A server that answers but rejects the configuration is not retried: a wrong password or other authorization
+  failure (SQLSTATE class `28`), a missing database (`3D000`), or a TLS failure (for example `sslmode=require`
+  against a server without TLS, or a certificate that does not verify).
 - Waiting for the migration lock held by another replica polls every second until the same budget ends.
-- When the budget runs out, or on a permanent error (a malformed `DATABASE_URL`, a failed migration), it logs
-  `opening database failed` and exits with status 1; the orchestrator then restarts it.
+- Migrations run inside the budget too. Each one runs in a transaction, so a migration cut off by the deadline or a
+  signal rolls back completely. A future `-- +goose NO TRANSACTION` migration (such as `CREATE INDEX CONCURRENTLY`)
+  could be cut off halfway, so it must be written to be safe to run again.
+- When the budget runs out, or on a permanent error (a malformed `DATABASE_URL`, one of the rejections above, a
+  failed migration), it logs `opening database failed` and exits with status 1; the orchestrator then restarts it.
 - `SIGINT`/`SIGTERM` during startup stops the retries and exits with status 0.
 
 ## Operational endpoints

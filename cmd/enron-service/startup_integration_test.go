@@ -4,7 +4,9 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -12,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/hrhelena/elisa-task/internal/store/storetest"
 )
@@ -152,5 +155,55 @@ func TestBinaryDatabaseComesUpLate(t *testing.T) {
 	}
 	if findLog(lines, "opening database failed") != nil {
 		t.Errorf("startup logged a failure:\n%s", b.logs.String())
+	}
+}
+
+// A wrong password in DATABASE_URL (a Secret typo) is a permanent error
+// (PR #31 review): the real store is opened exactly once, startup exits 1
+// at once with the authentication error, nothing is logged as a retry, and
+// the password stays out of the logs.
+func TestRunWrongPasswordFailsWithoutRetrying(t *testing.T) {
+	t.Parallel()
+	u, err := url.Parse(sharedDB.URL)
+	if err != nil {
+		t.Fatalf("parsing container URL: %v", err)
+	}
+	u.User = url.UserPassword("enron", "s3cret-typo")
+
+	var attempts atomic.Int32
+	counting := func(ctx context.Context, databaseURL string, logger *slog.Logger) (dbStore, error) {
+		attempts.Add(1)
+		return openPostgres(ctx, databaseURL, logger)
+	}
+	var out syncBuffer
+	listened := false
+	start := time.Now()
+	code := run(t.Context(), envLookup(map[string]string{
+		"HTTP_ADDR": "127.0.0.1:0", "DATABASE_URL": u.String(), "DB_STARTUP_TIMEOUT": "60s",
+	}), &out, counting, func(net.Addr) { listened = true })
+	elapsed := time.Since(start)
+
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if listened {
+		t.Error("service listened with a rejected password")
+	}
+	if n := attempts.Load(); n != 1 {
+		t.Errorf("store opened %d times, want exactly 1", n)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("startup took %v, want an immediate failure", elapsed)
+	}
+	lines := decodeLogLines(t, []byte(out.String()))
+	if got := retryWarnings(t, lines); len(got) != 0 {
+		t.Errorf("rejected password was retried (attempts %v):\n%s", got, out.String())
+	}
+	rec := findLog(lines, "opening database failed")
+	if rec == nil || !strings.Contains(fmt.Sprint(rec["err"]), "28P01") {
+		t.Errorf(`want "opening database failed" with SQLSTATE 28P01, got:\n%s`, out.String())
+	}
+	if strings.Contains(out.String(), "s3cret-typo") {
+		t.Errorf("logs leak the database password:\n%s", out.String())
 	}
 }

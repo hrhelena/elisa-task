@@ -17,7 +17,8 @@ const checkerName = "postgres"
 
 // pingTimeout bounds one connection attempt in Open, so a server that drops
 // packets (rather than refusing the connection) cannot use up the caller's
-// whole startup budget in a single attempt that the caller would retry.
+// whole startup budget in a single attempt that the caller would retry. A
+// longer connect_timeout in the database URL takes precedence.
 const pingTimeout = 5 * time.Second
 
 // messageColumnList is the single source of truth for the columns that
@@ -57,9 +58,10 @@ var _ Store = (*Postgres)(nil)
 // returning, so a returned store always has the current schema. Pool
 // settings can be given in the URL (pool_max_conns and so on).
 //
-// A connection failure wraps ErrUnreachable and may be retried; any other
-// error is permanent. ctx bounds the whole call, including the wait for the
-// migration lock (see migrate).
+// A transient connection failure (see isTransientConnectError) wraps
+// ErrUnreachable and may be retried; any other error, including a rejected
+// password, a missing database or a TLS failure, is permanent. ctx bounds
+// the whole call, including the wait for the migration lock (see migrate).
 func Open(ctx context.Context, databaseURL string, logger *slog.Logger) (*Postgres, error) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
@@ -69,12 +71,15 @@ func Open(ctx context.Context, databaseURL string, logger *slog.Logger) (*Postgr
 	if err != nil {
 		return nil, fmt.Errorf("creating connection pool: %w", err)
 	}
-	pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
+	pingCtx, cancel := context.WithTimeout(ctx, max(pingTimeout, cfg.ConnConfig.ConnectTimeout))
 	err = pool.Ping(pingCtx)
 	cancel()
 	if err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("connecting to postgres: %w: %w", ErrUnreachable, err)
+		if isTransientConnectError(err) {
+			return nil, fmt.Errorf("connecting to postgres: %w: %w", ErrUnreachable, err)
+		}
+		return nil, fmt.Errorf("connecting to postgres: %w", err)
 	}
 	if err := migrate(ctx, pool, logger); err != nil {
 		pool.Close()
