@@ -26,4 +26,5 @@ and run `make py-lock`.
 GitHub Actions (`.github/workflows/ci.yml`) runs on every pull request and on pushes to `main`, using the same
 Makefile targets: `lint` (all pre-commit hooks, including the `go mod tidy` and formatting checks, then `make lint`),
 `test` (`make test` with `-race`; `coverage.out` is uploaded as an artifact) and `itest` (`make itest` with
-testcontainers on the runner's Docker). A new push to a branch cancels that branch's older run.
+testcontainers on the runner's Docker). A new push to a branch or PR cancels that ref's older run;
+on `main` every commit gets its own full run, which is never cancelled.

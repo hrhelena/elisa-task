@@ -9,9 +9,11 @@ on:
   push:
     branches: [main]
 
+# Branches and PRs: a new push cancels the ref's older run. main: one group per commit, so no
+# merge commit's run is ever cancelled or replaced and every commit on main gets a full result.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -23,15 +25,22 @@ env:
 jobs:
   lint:
     name: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
+          # A key of its own: the lint job's build cache holds the tool modules and golangci-lint's
+          # build objects, which the test jobs' cache (keyed on go.sum only) does not.
+          cache-dependency-path: |
+            go.sum
+            .golangci.yml
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -41,15 +50,18 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/golangci-lint
-          key: golangci-lint-${{ runner.os }}-${{ hashFiles('go.sum', '.golangci.yml') }}-${{ github.sha }}
+          # Saved once per dependency/config hash, restored by prefix otherwise. The cache is
+          # content-addressed, so a stale entry only means a miss, never a false pass.
+          key: golangci-lint-${{ runner.os }}-${{ hashFiles('go.sum', '.golangci.yml') }}
           restore-keys: |
-            golangci-lint-${{ runner.os }}-${{ hashFiles('go.sum', '.golangci.yml') }}-
+            golangci-lint-${{ runner.os }}-
 
       - name: Install project-local tools
         run: make tools
 
       # All pre-commit hooks on all files: gofmt -s and goimports (fails listing unformatted files),
-      # go mod tidy -diff (fails printing the go.mod/go.sum diff), whitespace, EOF and YAML checks.
+      # go mod tidy -diff (fails printing the go.mod/go.sum diff), whitespace, EOF, YAML, merge-conflict
+      # and large-file checks (the latter uses --enforce-all, since nothing is staged in CI).
       # golangci-lint and go vet are skipped here because `make lint` runs them in the next step.
       - name: Pre-commit hooks (format, go mod tidy, file checks)
         run: make pre-commit
@@ -65,10 +77,12 @@ jobs:
 
   test:
     name: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -89,17 +103,19 @@ jobs:
 
   itest:
     name: itest
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
 
-      # ubuntu-latest ships a running Docker daemon, which testcontainers-go uses directly
+      # GitHub's Ubuntu runners ship a running Docker daemon, which testcontainers-go uses directly
       # (Ryuk enabled, so containers are reaped even if a test panics).
       - name: Docker info
         run: docker version
