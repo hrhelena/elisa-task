@@ -25,6 +25,7 @@ import (
 	"github.com/hrhelena/elisa-task/internal/config"
 	"github.com/hrhelena/elisa-task/internal/fetch"
 	"github.com/hrhelena/elisa-task/internal/httpapi"
+	"github.com/hrhelena/elisa-task/internal/ingest"
 	"github.com/hrhelena/elisa-task/internal/store"
 )
 
@@ -62,11 +63,11 @@ func main() {
 }
 
 // dbStore is what run needs from the store so far: a readiness check, the
-// top-senders ranking (#9) and Close. Later tickets widen it as handlers start
-// using the store.
+// top-senders ranking (#9), the ingestion engine's storage (#7) and Close.
 type dbStore interface {
 	httpapi.Checker
 	senderRanker
+	ingest.Store
 	Close()
 }
 
@@ -161,8 +162,8 @@ func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, openStore
 	}
 
 	// Closers run in reverse registration order after the server has drained:
-	// the DB pool first registered, so closed last; then the fetcher (#10),
-	// closed first; #7 adds the ingestion cancel.
+	// the DB pool first registered, so closed last; then the fetcher (#10)
+	// and the ingestion service (#7), closed first.
 	var cl closers
 	cl.add("postgres", func(ctx context.Context) error { return closeStore(ctx, st) })
 
@@ -172,6 +173,17 @@ func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, openStore
 	// New also removes temporary directories left by an interrupted fetch.
 	fetcher := fetch.New(cfg.DataDir, cfg.DatasetURL, nil, logger, reg)
 	cl.add("fetch", fetcher.Close)
+
+	// The ingestion service owns a run in progress (ADR 0010). Its closer
+	// cancels the run and waits for it to be recorded as failed
+	// ("interrupted: shutdown") and to release the lock, before the pool
+	// closes. POST /start and GET /status are wired to it in #8.
+	ingester := ingest.NewService(ingest.NewMaildirSource(cfg.MaildirPath()), st, ingest.Config{
+		Workers:          cfg.IngestWorkers,
+		BatchSize:        cfg.IngestBatchSize,
+		ProgressInterval: cfg.IngestProgressInterval,
+	}, logger, reg)
+	cl.add("ingest", ingester.Close)
 
 	readiness := httpapi.NewReadiness(st)
 	handler := httpapi.New(httpapi.Deps{
