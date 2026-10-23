@@ -269,6 +269,10 @@ func TestDocsRequestsLoggedAtDebug(t *testing.T) {
 	for _, path := range requests {
 		info.do(t, http.MethodGet, path, nil)
 	}
+	// Rejected methods on the docs paths match no route (405) and stay quiet too.
+	info.do(t, http.MethodPost, "/openapi.json", nil)
+	info.do(t, http.MethodDelete, "/docs/", nil)
+	info.do(t, http.MethodPut, "/docs/init.js", nil)
 	if lines := info.logs.find(t, "http request"); len(lines) != 0 {
 		t.Errorf("at INFO, docs requests wrote access log lines: %v", lines)
 	}

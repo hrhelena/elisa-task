@@ -4,7 +4,9 @@
 #
 # It downloads the package tarball, checks its sha512 against the registry's dist.integrity, and copies only the
 # allowlisted files, then writes VERSION and SHA256SUMS. It never touches our own index.html and init.js. On a bad
-# version, an HTTP error, an integrity mismatch or a missing file it exits non-zero and writes nothing.
+# version, an HTTP error, an integrity mismatch or a missing file it exits non-zero and writes nothing. The new set
+# is assembled in a sibling directory and swapped in with renames, so a failure while copying never leaves a mix
+# of old and new files.
 # Needs only curl, tar, openssl and sha256sum (or shasum); no Node or npm.
 #
 # Environment (for tests):
@@ -27,6 +29,10 @@ files=(swagger-ui-bundle.js swagger-ui.css favicon-32x32.png favicon-16x16.png
 
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || die "usage: $0 <version>, e.g. 5.34.0"
 [ -d "$dest" ] || die "destination $dest does not exist"
+dest=$(cd "$dest" && pwd)
+parent=$(dirname "$dest")
+new="$parent/.$(basename "$dest").new.$$"
+old="$parent/.$(basename "$dest").old.$$"
 
 if command -v sha256sum >/dev/null 2>&1; then
   sha256() { sha256sum "$@"; }
@@ -35,7 +41,7 @@ else
 fi
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+trap 'rm -rf "$tmp" "$new"' EXIT
 
 meta_url="$registry/swagger-ui-dist/$version"
 curl -fsSL -o "$tmp/meta.json" "$meta_url" || die "cannot get $meta_url (unknown version?)"
@@ -57,7 +63,16 @@ done
 printf '%s\n' "$version" >"$stage/VERSION"
 (cd "$stage" && sha256 "${files[@]}") >"$stage/SHA256SUMS"
 
+# Assemble the complete new directory next to the old one (same file system, so the renames are atomic): a
+# copy of the current one, which keeps our index.html and init.js, with the vendored files replaced.
+cp -Rp "$dest" "$new" || die "cannot stage $new"
 for f in "${files[@]}" VERSION SHA256SUMS; do
-  cp "$stage/$f" "$dest/$f"
+  cp "$stage/$f" "$new/$f" || die "cannot stage $f"
 done
+mv "$dest" "$old" || die "cannot move $dest aside"
+if ! mv "$new" "$dest"; then
+  mv "$old" "$dest"
+  die "cannot move the new files into $dest; the old ones were restored"
+fi
+rm -rf "$old"
 echo "update-swagger-ui: vendored swagger-ui-dist $version into $dest"

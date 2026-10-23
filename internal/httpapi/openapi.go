@@ -127,7 +127,9 @@ func startOperation() *operation {
 		id: "startIngestion", tag: tagIngestion,
 		summary: "Start an ingestion run",
 		description: "Starts ingesting the maildir into the database in the background, unless a run is in " +
-			"progress on any replica. A new run replaces the data of the previous one. " +
+			"progress on any replica. After a finished or failed run, it starts a new run that re-walks the " +
+			"dataset; files already stored (same relative path) are not inserted again, so re-running is the " +
+			"idempotent way to resume or redo an ingestion and nothing is double-counted (ADR 0011). " +
 			"Any request body is ignored.",
 		responses: []response{
 			{

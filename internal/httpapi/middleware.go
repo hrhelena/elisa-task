@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"regexp"
 	"runtime/debug"
+	"strings"
 	"time"
 )
 
@@ -118,17 +119,17 @@ func recoverer(logger *slog.Logger, panics interface{ Inc() }) Middleware {
 	}
 }
 
-// isQuietPath reports whether path is a probe or scrape endpoint, whose access
+// isQuietPath reports whether path is a probe, scrape or docs endpoint, whose access
 // log lines are logged at DEBUG so that they do not drown the INFO log, even
 // when the mux rejects the request (wrong method). Matched routes are quiet
 // when their route table entry says so (route.quiet), which also covers the
 // docs routes.
 func isQuietPath(path string) bool {
 	switch path {
-	case "/healthz", "/readyz", "/metrics":
+	case "/healthz", "/readyz", "/metrics", "/openapi.json", "/docs":
 		return true
 	default:
-		return false
+		return strings.HasPrefix(path, "/docs/")
 	}
 }
 

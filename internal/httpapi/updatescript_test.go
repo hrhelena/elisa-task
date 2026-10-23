@@ -217,6 +217,16 @@ func TestUpdateScriptVendorsOnlyAllowlistedFiles(t *testing.T) {
 		}
 		return string(b)
 	}
+	// The staging and backup directories are gone.
+	siblings, err := os.ReadDir(filepath.Dir(dest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range siblings {
+		if strings.Contains(e.Name(), ".new.") || strings.Contains(e.Name(), ".old.") {
+			t.Errorf("leftover directory %s next to the destination", e.Name())
+		}
+	}
 	if read("index.html") != "ours" || read("init.js") != "ours" {
 		t.Error("the script overwrote our index.html or init.js")
 	}
@@ -232,5 +242,39 @@ func TestUpdateScriptVendorsOnlyAllowlistedFiles(t *testing.T) {
 		if line := hex.EncodeToString(sum[:]) + "  " + f + "\n"; !strings.Contains(sums, line) {
 			t.Errorf("SHA256SUMS lacks %q", line)
 		}
+	}
+}
+
+// A failure while assembling the new set (here: the parent directory is not
+// writable, so the staging directory cannot be created) leaves the old set
+// intact.
+func TestUpdateScriptStagingFailureKeepsOldFiles(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(fakeRegistry{version: "5.99.2", tarball: npmTarball(t, fullPackage())})
+	t.Cleanup(srv.Close)
+	parent := t.TempDir()
+	dest := filepath.Join(parent, "swaggerui")
+	if err := os.Mkdir(dest, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "VERSION"), []byte("1.0.0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0o500); err != nil { //nolint:gosec // test directory
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o700) })                    //nolint:gosec // let t.TempDir remove it
+	if f, err := os.Create(filepath.Join(parent, "probe")); err == nil { //nolint:gosec // test directory
+		_ = f.Close()
+		t.Skip("the parent directory is still writable (running as root?)")
+	}
+	before := snapshot(t, dest)
+	out, err := runUpdateScript(t, srv.URL, dest, "5.99.2")
+	if err == nil || !strings.Contains(out, "cannot stage") {
+		t.Fatalf("err = %v, output %q; want a staging failure", err, out)
+	}
+	if after := snapshot(t, dest); !maps.Equal(before, after) {
+		t.Errorf("files under %s changed", dest)
 	}
 }

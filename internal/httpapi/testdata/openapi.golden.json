@@ -159,7 +159,7 @@
           "ingestion"
         ],
         "summary": "Start an ingestion run",
-        "description": "Starts ingesting the maildir into the database in the background, unless a run is in progress on any replica. A new run replaces the data of the previous one. Any request body is ignored.",
+        "description": "Starts ingesting the maildir into the database in the background, unless a run is in progress on any replica. After a finished or failed run, it starts a new run that re-walks the dataset; files already stored (same relative path) are not inserted again, so re-running is the idempotent way to resume or redo an ingestion and nothing is double-counted (ADR 0011). Any request body is ignored.",
         "operationId": "startIngestion",
         "responses": {
           "202": {
@@ -552,6 +552,7 @@
           },
           "run_id": {
             "description": "ID of the current or last run; null when idle.",
+            "format": "int64",
             "type": [
               "null",
               "integer"

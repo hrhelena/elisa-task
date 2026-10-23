@@ -175,7 +175,7 @@ type statusResponse struct {
 	FilesSeen         int64            `json:"files_seen" required:"true" minimum:"0" description:"Files the current or last run has seen."`
 	SkipReasons       map[string]int64 `json:"skip_reasons" required:"true" nullable:"false" description:"Skipped files by reason."`
 	FieldErrors       map[string]int64 `json:"field_errors" required:"true" nullable:"false" description:"Header fields that could not be parsed, by field (the message is still stored)."`
-	RunID             *int64           `json:"run_id" required:"true" description:"ID of the current or last run; null when idle."`
+	RunID             *int64           `json:"run_id" required:"true" format:"int64" description:"ID of the current or last run; null when idle."`
 	StartedAt         *time.Time       `json:"started_at" required:"true" description:"When the run started; null when idle."`
 	FinishedAt        *time.Time       `json:"finished_at" required:"true" description:"When the run ended; null while running or when idle."`
 	UpdatedAt         *time.Time       `json:"updated_at" required:"true" description:"When the run last reported progress; null when idle."`
