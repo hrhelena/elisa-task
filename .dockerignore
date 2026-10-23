@@ -1,0 +1,19 @@
+# Keep the build context small: only go.mod, go.sum, cmd/ and internal/ are used by the Dockerfile.
+# The dataset (about 517k files) must never reach the build context or the image.
+Dataset/
+.git
+.github/
+.venv/
+.tools/
+.claude/
+bin/
+dist/
+deploy/
+Docs/
+*.out
+*.test
+coverage.*
+.env
+compose.yaml
+Dockerfile
+.dockerignore
