@@ -941,6 +941,12 @@ func TestBinaryReportsLinkerVersion(t *testing.T) {
 	cancel() // Kills the process: nothing after "starting" matters here.
 	_ = cmd.Wait()
 	<-scanned
+	if rec == nil { // select picks randomly when found and scanned are both ready.
+		select {
+		case rec = <-found:
+		default:
+		}
+	}
 	if rec == nil || rec["version"] != want {
 		t.Errorf("starting record = %v, want version %q; logs:\n%s", rec, want, logs.String())
 	}
