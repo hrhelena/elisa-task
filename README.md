@@ -13,3 +13,10 @@ make lint test   # golangci-lint + go vet, unit tests with -race
 make build       # bin/enron-service
 make help        # all targets
 ```
+
+Run `make tools` in every checkout and git worktree before committing. The pre-commit hook lives in the
+hooks directory that all worktrees share, but it uses the `.venv` of the worktree being committed to,
+and refuses the commit (with a hint) if that `.venv` is missing.
+
+Python dev tools are locked with hashes in `requirements-dev.txt`. To change them, edit `requirements-dev.in`
+and run `make py-lock`.
