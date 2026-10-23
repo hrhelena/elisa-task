@@ -429,6 +429,20 @@ func TestNormalizeAddress(t *testing.T) {
 		{"name <unterminated@enron.com", "unterminated@enron.com", true},
 		{`"john doe"@enron.com`, "", false},
 		{"<john doe@enron.com>", "", false},
+		// Specials that net/mail unquotes would not survive a second normalization.
+		{`"a<b>"@c.com`, "", false},
+		{"a<b>@c.com", "", false},
+		{`"a(b)"@c.com`, "", false},
+		{`"a,b"@c.com`, "", false},
+		{`"a[b]"@c.com`, "", false},
+		// Quote-mangled Enron forms normalize stably and are kept, like townend'.'andy.
+		{`<munn"."mary@enron.com>`, `munn"."mary@enron.com`, true},
+		{`"a\"b"@c.com`, `a"b@c.com`, true},
+		// Trailing list separators (lenient path) and mailto: prefixes.
+		{"a@b.com, c@d.com", "a@b.com", true},
+		{"a@b.com;", "a@b.com", true},
+		{"x <mailto:A@B.com>", "a@b.com", true},
+		{"MAILTO:a@b.com", "a@b.com", true},
 	}
 	for _, tc := range tests {
 		got, ok := mailparse.NormalizeAddress(tc.raw)
@@ -451,6 +465,16 @@ func TestParseAddressList(t *testing.T) {
 		{"a@b.com, nxi <p.>, c@d.com", []string{"a@b.com", "c@d.com"}, false},
 		{"a@b.com, c@d.com,", []string{"a@b.com", "c@d.com"}, true},
 		{"houston <.ward@enron.com>, a@b.com", []string{".ward@enron.com", "a@b.com"}, true},
+		// ";" separates entries too; nothing is dropped silently.
+		{"a@b.com; c@d.com", []string{"a@b.com", "c@d.com"}, true},
+		{"a@b.com; nxi <p.>; c@d.com;", []string{"a@b.com", "c@d.com"}, false},
+		{"houston <.ward@enron.com>; a@b.com", []string{".ward@enron.com", "a@b.com"}, true},
+		// Two addresses without a separator: only one can be kept, so it is reported.
+		{".x@b.com c@d.com", []string{".x@b.com"}, false},
+		// An "@" in the display name next to <...> is not a second address.
+		{`"x@y.com" <.lw@enron.com>, a@b.com`, []string{".lw@enron.com", "a@b.com"}, true},
+		// A strict parse whose address normalization fails is reported as well.
+		{`"a<b>"@c.com, d@e.com`, []string{"d@e.com"}, false},
 	}
 	for _, tc := range tests {
 		got, ok := mailparse.ParseAddressList(tc.raw)
@@ -460,28 +484,65 @@ func TestParseAddressList(t *testing.T) {
 	}
 }
 
+// TestParseDate runs the table under several host time zones (time.Local) to prove the result
+// does not depend on them. It is not parallel because it swaps time.Local.
 func TestParseDate(t *testing.T) {
-	t.Parallel()
-	want := time.Date(2001, 5, 14, 23, 39, 0, 0, time.UTC)
+	at := func(h, m int) time.Time { return time.Date(2001, 5, 14, h, m, 0, 0, time.UTC) }
 	tests := []struct {
-		raw string
-		ok  bool
+		raw  string
+		want time.Time // zero means "not parseable"
 	}{
-		{"Mon, 14 May 2001 16:39:00 -0700 (PDT)", true},
-		{"Mon, 14 May 2001 16:39:00 -0700", true},
-		{"14 May 2001 16:39:00 -0700", true},
-		{"Mon, 14 May 2001 16:39 -0700", true},
-		{"Mon,  14 May 2001   16:39:00 -0700  (Pacific Daylight Time)", true},
-		{"2001-05-14T16:39:00-07:00", true},
-		{"2001-05-14 23:39:00", true},
-		{"sometime last week", false},
-		{"", false},
+		{"Mon, 14 May 2001 16:39:00 -0700 (PDT)", at(23, 39)},
+		{"Mon, 14 May 2001 16:39:00 -0700", at(23, 39)},
+		{"14 May 2001 16:39:00 -0700", at(23, 39)},
+		{"Mon, 14 May 2001 16:39 -0700", at(23, 39)},
+		{"Mon,  14 May 2001   16:39:00 -0700  (Pacific Daylight Time)", at(23, 39)},
+		{"Mon, 14 May 2001 16:39:00 -0700 PDT", at(23, 39)},
+		{"2001-05-14T16:39:00-07:00", at(23, 39)},
+		{"2001-05-14 23:39:00", at(23, 39)},
+		// Named zones map to fixed offsets.
+		{"Mon, 14 May 2001 16:39:00 PDT", at(23, 39)},
+		{"Mon, 14 May 2001 16:39:00 PST", time.Date(2001, 5, 15, 0, 39, 0, 0, time.UTC)},
+		{"Mon, 14 May 2001 16:39:00 EST", at(21, 39)},
+		{"Mon, 14 May 2001 16:39:00 edt", at(20, 39)},
+		{"Mon, 14 May 2001 16:39:00 CDT (Central)", at(21, 39)},
+		{"Mon, 14 May 2001 16:39:00 CST", at(22, 39)},
+		{"Mon, 14 May 2001 16:39:00 MDT", at(22, 39)},
+		{"Mon, 14 May 2001 16:39:00 MST", at(23, 39)},
+		{"Mon, 14 May 2001 16:39:00 GMT", at(16, 39)},
+		{"Mon, 14 May 2001 16:39:00 UT", at(16, 39)},
+		{"14 May 2001 16:39:00 UTC", at(16, 39)},
+		{"Mon May 14 16:39:00 PDT 2001", at(23, 39)},
+		// Unknown named zones without a numeric offset are read as UTC.
+		{"Mon, 14 May 2001 16:39:00 JST", at(16, 39)},
+		{"Mon, 14 May 2001 16:39:00 XYZ", at(16, 39)},
+		{"sometime last week", time.Time{}},
+		{"", time.Time{}},
 	}
-	for _, tc := range tests {
-		got, ok := mailparse.ParseDate(tc.raw)
-		if ok != tc.ok || (ok && (!got.Equal(want) || got.Location() != time.UTC)) {
-			t.Errorf("ParseDate(%q) = (%v, %v), want ok=%v %v", tc.raw, got, ok, tc.ok, want)
+
+	locals := []string{"UTC", "America/Los_Angeles", "America/New_York", "America/Chicago", "Asia/Tokyo"}
+	orig := time.Local
+	t.Cleanup(func() { time.Local = orig })
+	for _, name := range locals {
+		loc, err := time.LoadLocation(name)
+		if err != nil {
+			t.Fatalf("loading %s: %v", name, err)
 		}
+		time.Local = loc
+		for _, tc := range tests {
+			got, ok := mailparse.ParseDate(tc.raw)
+			if ok != !tc.want.IsZero() || !got.Equal(tc.want) || (ok && got.Location() != time.UTC) {
+				t.Errorf("local=%s: ParseDate(%q) = (%v, %v), want %v", name, tc.raw, got, ok, tc.want)
+			}
+		}
+	}
+}
+
+func TestParse_FoldedHeaderWithEmptyFirstLine(t *testing.T) {
+	t.Parallel()
+	m := parseString(t, "From: a@b.com\nSubject:\n\tfolded   only\n  more\nTo:\n c@d.com\n\n")
+	if m.Subject != "folded   only more" || !slices.Equal(m.To, []string{"c@d.com"}) {
+		t.Fatalf("Subject = %q, To = %q", m.Subject, m.To)
 	}
 }
 
@@ -528,13 +589,45 @@ func FuzzParse(f *testing.F) {
 				t.Fatalf("output %q is not valid UTF-8 without NUL", s)
 			}
 		}
+		addrs := append([]string{}, m.To...)
+		addrs = append(addrs, m.Cc...)
+		addrs = append(addrs, m.Bcc...)
 		if m.From != "" {
-			if got, ok := mailparse.NormalizeAddress(m.From); !ok || got != m.From {
-				t.Fatalf("From %q is not a stable normalized address", m.From)
+			addrs = append(addrs, m.From)
+		}
+		for _, a := range addrs {
+			if got, ok := mailparse.NormalizeAddress(a); !ok || got != a {
+				t.Fatalf("address %q is not a stable normalized address (got %q, %v)", a, got, ok)
 			}
 		}
 		if m.Date.IsZero() == (m.DateRaw != "" && !m.HasIssue(mailparse.IssueInvalidDate)) {
 			t.Fatalf("Date %v inconsistent with DateRaw %q and Issues %q", m.Date, m.DateRaw, m.Issues)
+		}
+	})
+}
+
+// FuzzNormalizeAddress checks that normalization is idempotent and only returns plain addresses.
+func FuzzNormalizeAddress(f *testing.F) {
+	for _, s := range []string{
+		"phillip.allen@enron.com", "Phillip Allen <Phillip.Allen@Enron.com>", "houston <.ward@enron.com>",
+		"pep <performance.>", `"a<b>"@c.com`, `"a(b)"@c.com`, `"john doe"@enron.com`, "x <mailto:a@b.com>",
+		"a@b.com, c@d.com", "'jeff@enron.com'.", `<"linda".@enron@enron.com>`, "w..cantrell@enron.com",
+	} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, raw string) {
+		addr, ok := mailparse.NormalizeAddress(raw)
+		if !ok {
+			if addr != "" {
+				t.Fatalf("NormalizeAddress(%q) = (%q, false), want empty address", raw, addr)
+			}
+			return
+		}
+		if strings.Count(addr, "@") != 1 || strings.ContainsAny(addr, " \t<>") {
+			t.Fatalf("NormalizeAddress(%q) = %q is not a plain address", raw, addr)
+		}
+		if again, ok := mailparse.NormalizeAddress(addr); !ok || again != addr {
+			t.Fatalf("not idempotent: %q -> %q -> (%q, %v)", raw, addr, again, ok)
 		}
 	})
 }

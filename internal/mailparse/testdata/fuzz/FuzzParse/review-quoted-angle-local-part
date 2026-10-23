@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("From: \"a<b>\"@c.com\n\n")

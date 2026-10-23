@@ -188,7 +188,11 @@ func readHeader(br *bufio.Reader) (hdr header, bodyPrefix []byte, err error) {
 				return nil, nil, skip(SkipNotAnEmail, errNoHeader)
 			}
 			vals := hdr[lastKey]
-			vals[len(vals)-1] += " " + strings.TrimSpace(string(content))
+			if cont := strings.TrimSpace(string(content)); vals[len(vals)-1] == "" {
+				vals[len(vals)-1] = cont
+			} else if cont != "" {
+				vals[len(vals)-1] += " " + cont
+			}
 		default:
 			key, value, ok := splitHeaderLine(content)
 			if !ok {
