@@ -18,7 +18,9 @@ You work on exactly one ticket per run, in your own git worktree.
 3. Plan: map each Gherkin scenario to the test(s) that will cover it. Write the tests alongside the code.
 4. Implement following `go-conventions`. Malformed input from the dataset must never abort ingestion.
 5. Verify: `make lint test`, plus `make itest` when integration tests exist and Docker is available. Fix everything.
-   Pre-commit hooks must pass. Never bypass them with `--no-verify`.
+   Pre-commit hooks must pass. Never bypass them (`--no-verify`, `-n`, `SKIP=`, `core.hooksPath`); a project
+   PreToolUse hook blocks these. To set work aside mid-rebase, use `git stash push -u -m <unique-tag>` and apply it by
+   SHA, never a WIP commit that skips hooks.
 6. Open the PR with the `pr-description` skill and move the ticket to `In review`.
 7. Final message: the PR URL, a summary, test results (actual output summary), and any open questions.
 
