@@ -72,19 +72,21 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 if [ -n "$ready" ]; then pass "GET /readyz returned 200 within 60s"; else fail "GET /readyz not 200 within 60s"; fi
-for path in /healthz /metrics; do
+for path in /healthz /metrics /status; do
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$BASE$path")
   if [ "$code" = 200 ]; then pass "GET $path returned 200"; else fail "GET $path returned $code"; fi
 done
+start_body=$(curl -s -w '\n%{http_code}' --max-time 15 -X POST "$BASE/start")
+code=$(echo "$start_body" | tail -n1)
 if [ -d "$DATASET_DIR/maildir" ]; then
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST "$BASE/start")
-  case "$code" in
-    202) pass "POST /start returned 202" ;;
-    404) skip "POST /start returned 404: the endpoint is not merged yet (#8)" ;;
-    *) fail "POST /start returned $code, want 202" ;;
-  esac
+  if [ "$code" = 202 ]; then pass "POST /start returned 202"; else fail "POST /start returned $code, want 202"; fi
 else
-  skip "POST /start: no maildir in $DATASET_DIR (set DATASET_DIR to a dataset root)"
+  # No dataset mounted (the default): the endpoint must say so instead of starting a run.
+  if [ "$code" = 409 ] && echo "$start_body" | grep -q '"code":"dataset_missing"'; then
+    pass "POST /start without a maildir returned 409 dataset_missing"
+  else
+    fail "POST /start without a maildir returned $code, want 409 dataset_missing"
+  fi
 fi
 
 echo "== Scenario: App waits for Postgres"
