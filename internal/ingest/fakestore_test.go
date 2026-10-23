@@ -87,16 +87,23 @@ func (l *fakeLock) Err() error {
 	}
 }
 
+// end ends the lock and frees the store's lock slot in one step under fs.mu,
+// so no store call sees an ended lock still in the slot (#48).
 func (l *fakeLock) end(err error) {
+	l.fs.mu.Lock()
+	defer l.fs.mu.Unlock()
+	l.endLocked(err)
+}
+
+// endLocked is end for a caller that holds fs.mu.
+func (l *fakeLock) endLocked(err error) {
 	l.once.Do(func() {
 		l.err = err
 		close(l.done)
 	})
-	l.fs.mu.Lock()
 	if l.fs.lock == l {
 		l.fs.lock = nil
 	}
-	l.fs.mu.Unlock()
 }
 
 // Release ends the lock like store.Postgres: its Err wraps ErrLockReleased.
@@ -140,11 +147,10 @@ func (f *fakeStore) loseToAnotherHolder() *fakeLock {
 // ErrStoreClosed and the store refuses new locks.
 func (f *fakeStore) closeStore() {
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.closed = true
-	l := f.lock
-	f.mu.Unlock()
-	if l != nil {
-		l.end(fmt.Errorf("%w: %w", store.ErrLockNotHeld, store.ErrStoreClosed))
+	if f.lock != nil {
+		f.lock.endLocked(fmt.Errorf("%w: %w", store.ErrLockNotHeld, store.ErrStoreClosed))
 	}
 }
 
@@ -184,11 +190,14 @@ func (f *fakeStore) AcquireIngestLock(ctx context.Context) (store.IngestLock, er
 	return f.lock, nil
 }
 
-// held must be called with f.mu held. Like store.Postgres, an ended lock
-// reports why it ended.
+// held must be called with f.mu held. Like store.Postgres (withLock checks
+// the lock's Err before every write), a write on a lock whose Done is closed
+// is refused with the reason it ended, even if the lock were still in the
+// slot. Otherwise a write that races the end of the lock could be accepted
+// (#48).
 func (f *fakeStore) held(lock store.IngestLock) error {
 	l, ok := lock.(*fakeLock)
-	if ok && l != f.lock {
+	if ok {
 		if err := l.Err(); err != nil {
 			return err
 		}
