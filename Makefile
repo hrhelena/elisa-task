@@ -1,6 +1,6 @@
 # Single entry point for development, CI and deployment (ADR 0008).
 # All tools are project-local and pinned: Go tools via `tool` directives in go.mod (`go tool ...`),
-# pre-commit via requirements-dev.txt in .venv. Nothing is installed globally.
+# pre-commit via the hashed lock requirements-dev.txt in .venv. Nothing is installed globally.
 
 SHELL := bash
 .SHELLFLAGS := -eu -o pipefail -c
@@ -16,22 +16,37 @@ GO_TOOL := CGO_ENABLED=0 go tool
 # Keep pre-commit's own cache inside the repository (the git hook sets the same path).
 export PRE_COMMIT_HOME := $(CURDIR)/$(VENV)/pre-commit-home
 # Go files tracked or new (respects .gitignore, so other worktrees under .claude/ are never touched).
-GO_FILES = $(shell git ls-files --cached --others --exclude-standard '*.go')
+# Tracked files deleted from the working tree but not yet staged are skipped.
+GO_FILES = $(shell git ls-files --cached --others --exclude-standard '*.go' | while read -r f; do [ -f "$$f" ] && echo "$$f"; done || true)
+# pip-tools is only used by `make py-lock`, in a throwaway venv under the gitignored .tools/.
+PIP_TOOLS_VERSION := 7.6.2
+LOCK_VENV := .tools/pip-tools
+PIP_FLAGS := --quiet --disable-pip-version-check --no-cache-dir
 
 ##@ Setup
 
 .PHONY: tools
 tools: $(VENV)/.installed ## Install project-local tools (.venv with pre-commit, git hook, Go modules)
-	@# Worktree-aware replacement for `pre-commit install` (see scripts/git-hooks/pre-commit).
-	hooks_dir=$$(git rev-parse --git-path hooks); mkdir -p "$$hooks_dir"; \
-		install -m 0755 scripts/git-hooks/pre-commit "$$hooks_dir/pre-commit"; \
-		echo "git pre-commit hook installed at $$hooks_dir/pre-commit"
+	scripts/install-git-hook.sh
 	go mod download
 
+# requirements-dev.txt is the fully pinned, hashed lock. Rebuild .venv from scratch whenever it changes,
+# so no package from an older lock survives.
 $(VENV)/.installed: requirements-dev.txt
+	rm -rf $(VENV)
 	$(PYTHON) -m venv $(VENV)
-	$(VENV)/bin/pip install --quiet --disable-pip-version-check --no-cache-dir -r requirements-dev.txt
+	$(VENV)/bin/pip install $(PIP_FLAGS) --require-hashes -r requirements-dev.txt
 	touch $@
+
+.PHONY: py-lock
+py-lock: ## Re-resolve requirements-dev.in into the hashed lock requirements-dev.txt
+	rm -rf $(LOCK_VENV)
+	$(PYTHON) -m venv $(LOCK_VENV)
+	$(LOCK_VENV)/bin/pip install $(PIP_FLAGS) pip-tools==$(PIP_TOOLS_VERSION)
+	CUSTOM_COMPILE_COMMAND="make py-lock" PIP_NO_CACHE_DIR=1 $(LOCK_VENV)/bin/pip-compile --quiet \
+		--generate-hashes --allow-unsafe --strip-extras --no-emit-index-url --upgrade \
+		--cache-dir $(LOCK_VENV)/cache --output-file requirements-dev.txt requirements-dev.in
+	rm -rf $(LOCK_VENV)
 
 ##@ Development
 
