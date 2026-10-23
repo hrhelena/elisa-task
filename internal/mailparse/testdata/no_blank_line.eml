@@ -1,0 +1,5 @@
+Message-ID: <108.1075855378110.JavaMail.evans@thyme>
+Date: Tue, 15 May 2001 09:00:00 -0700 (PDT)
+From: phillip.allen@enron.com
+Subject: Header block ends without a blank line
+This line is not a header, so the body starts here.
