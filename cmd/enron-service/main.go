@@ -66,12 +66,14 @@ func main() {
 	os.Exit(code)
 }
 
-// dbStore is what run needs from the store so far: a readiness check, the
-// top-senders ranking (#9), the ingestion engine's storage (#7) and Close.
+// dbStore is what run needs from the store: a readiness check, the
+// top-senders ranking (#9), the ingestion engine's storage (#7), the ingest
+// lock check of POST /start (#8) and Close.
 type dbStore interface {
 	httpapi.Checker
 	senderRanker
 	ingest.Store
+	lockChecker
 	Close()
 }
 
@@ -182,7 +184,7 @@ func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, openStore
 	// runs first: it cancels the workers at once, then records the run as
 	// failed ("interrupted: shutdown") and releases the lock within
 	// ingestShutdownWrite, which leaves the rest of closeBudget to the other
-	// closers. POST /start and GET /status are wired to it in #8.
+	// closers. POST /start and GET /status are served from it (#8).
 	ingester := ingest.NewService(ingest.NewMaildirSource(cfg.MaildirPath()), st, ingest.Config{
 		Workers:              cfg.IngestWorkers,
 		BatchSize:            cfg.IngestBatchSize,
@@ -193,7 +195,12 @@ func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, openStore
 
 	readiness := httpapi.NewReadiness(st)
 	handler := httpapi.New(httpapi.Deps{
-		Registry: reg, Readiness: readiness, Fetcher: fetcher, Senders: senderStats{st},
+		Registry:  reg,
+		Readiness: readiness,
+		Fetcher:   fetcher,
+		Datasets:  fetcher,
+		Senders:   senderStats{st},
+		Ingester:  ingestion{svc: ingester, lock: st, maildir: cfg.MaildirPath(), logger: logger},
 	}, logger)
 	srv := newServer(handler, logger)
 

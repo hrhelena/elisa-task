@@ -196,9 +196,13 @@ error naming the variable and exit with status 1.
 
 | Endpoint | Purpose |
 |---|---|
+| `POST /start` | Starts an ingestion of `$DATA_DIR/maildir` in the background (ADR 0010, 0011); any body is ignored. `202` with `Location: /status` and `{"run_id":4,"state":"running","started_at":"..."}`, also after a completed or failed run (an idempotent re-ingest: files already stored are not inserted again); `409 ingestion_running` while a run is in progress on any replica; `409 dataset_missing` when the maildir is absent or not a plain directory (call `POST /fetch` first); `503 unavailable` when the database fails (10s budget) or the service is shutting down |
+| `GET /status` | State of the current or last run, consistent across replicas (read from Postgres): `state` (`idle`, `running`, `completed`, `failed`), `finished` (`true` only when `completed`), `messages_processed` (by this run; the task's "total number of messages processed"), `total_messages` (rows stored), `files_seen`, `messages_skipped`, `skip_reasons`, `field_errors`, `run_id`, `started_at`, `finished_at`, `updated_at`, `error` (for example `interrupted: shutdown`), and the `dataset` section of `POST /fetch`. `Cache-Control: no-store`; `503 unavailable` when the database fails or exceeds 5s |
 | `GET /top-senders[?limit=N]` | Senders ranked by message count (every maildir file counts once, ADR 0003), ties by address in byte order; messages without a valid sender are excluded (ADR 0012). `limit` is 1 to 100, default 10. `200 {"senders":[{"email":"kay.mann@enron.com","count":16735}]}`, `{"senders":[]}` when nothing is stored; `400 invalid_limit` for any other `limit` (non-numeric, out of range, empty or repeated); `503 unavailable` when the database query fails or exceeds 5s |
 
 ```sh
+curl -si -X POST localhost:8080/start   # 202 Accepted, Location: /status
+curl -s localhost:8080/status           # poll until "finished": true
 curl -s 'localhost:8080/top-senders?limit=3'
 ```
 
@@ -287,7 +291,7 @@ The engine (`internal/ingest`) walks `$DATA_DIR/maildir` in lexical order and pa
 goroutines. One writer stores the messages in batches of `INGEST_BATCH_SIZE` rows, or after 1s. Every file is one
 message (ADR 0003); the row key is its relative path, so a re-run inserts only files not stored yet (ADR 0011).
 At most one run is active in the cluster (an advisory lock, ADR 0010). Counters are written to the run row every
-`INGEST_PROGRESS_INTERVAL` and at the end. Starting runs over HTTP (`POST /start`, `GET /status`) comes with #8.
+`INGEST_PROGRESS_INTERVAL` and at the end, which is what `GET /status` reports. Runs are started with `POST /start`.
 
 Bad entries never fail a run (ADR 0007). Skips are counted per reason: `empty_file`, `not_an_email`,
 `header_too_large`, `read_error` (including an unreadable directory, counted once), `not_regular_file` (symlinks,

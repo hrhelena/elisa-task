@@ -113,8 +113,8 @@ func (f *fakeStore) TopSenders(_ context.Context, limit int) ([]store.SenderCoun
 	return []store.SenderCount{{Email: "kay.mann@enron.com", Count: 5}}, nil
 }
 
-// The ingestion methods are unused until #8 exposes POST /start: no run is
-// ever started in these tests.
+// The run-level tests never start an ingestion: the ingestion methods fail
+// (POST /start answers 503) and GET /status reports idle.
 var errNoIngestion = errors.New("fake store: ingestion not supported")
 
 func (*fakeStore) InsertMessages(context.Context, []store.Message) (int64, error) {
@@ -140,6 +140,8 @@ func (*fakeStore) FinishRun(context.Context, store.IngestLock, int64, store.RunS
 }
 
 func (*fakeStore) LatestRun(context.Context) (*store.Run, error) { return nil, nil }
+
+func (*fakeStore) IngestLockHeld(context.Context) (bool, error) { return false, nil }
 
 // fakeOpener returns an openStoreFunc that hands out st (or fails with
 // openErr) and records the URL it was called with.
