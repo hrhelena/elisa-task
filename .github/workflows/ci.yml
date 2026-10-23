@@ -257,7 +257,7 @@ jobs:
       # diagnostics and FAIL before the runner kills the job. A normal run takes about 2.5 minutes after the build;
       # 10m + 90s grace + about 2 minutes of setup stays below the 15-minute job timeout.
       - name: End-to-end on kind (scripts/kind-e2e.sh)
-        run: timeout --signal=TERM --kill-after=90s 45s scripts/kind-e2e.sh
+        run: timeout --signal=TERM --kill-after=90s 10m scripts/kind-e2e.sh
         env:
           KIND_CLUSTER: elisa-enron-e2e
           IMAGE: enron-service:dev
