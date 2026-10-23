@@ -135,6 +135,7 @@ for name in base kind cloud; do
 	expect "$name: runAsNonRoot" "$f" "$pod | .securityContext.runAsNonRoot" "true"
 	expect "$name: runAsUser 65532" "$f" "$pod | .securityContext.runAsUser" "65532"
 	expect "$name: fsGroup 65532" "$f" "$pod | .securityContext.fsGroup" "65532"
+	expect "$name: fsGroupChangePolicy OnRootMismatch" "$f" "$pod | .securityContext.fsGroupChangePolicy" "OnRootMismatch"
 	expect "$name: seccomp RuntimeDefault" "$f" "$pod | .securityContext.seccompProfile.type" "RuntimeDefault"
 	expect "$name: readOnlyRootFilesystem" "$f" "$ctr | .securityContext.readOnlyRootFilesystem" "true"
 	expect "$name: no privilege escalation" "$f" "$ctr | .securityContext.allowPrivilegeEscalation" "false"
@@ -156,6 +157,15 @@ expect "kind: Postgres headless Service" "$kind" \
 	'select(.kind == "Service" and .metadata.name == "postgres") | .spec.clusterIP' "None"
 expect "kind: Postgres volume 2Gi" "$kind" \
 	'select(.kind == "StatefulSet") | .spec.volumeClaimTemplates[0].spec.resources.requests.storage' "2Gi"
+# PGDATA must live on the persistent volume (a subdirectory of its mountPath); anywhere else, the data would be on
+# an emptyDir or the container filesystem and vanish with the pod.
+sts='select(.kind == "StatefulSet" and .metadata.name == "postgres")'
+pg="$sts | .spec.template.spec"
+expect "kind: PGDATA is under the Postgres volume mountPath" "$kind" \
+	"$sts | .spec.volumeClaimTemplates[0].metadata.name as \$v | .spec.template.spec.containers[] | select(.name == \"postgres\") | ([.volumeMounts[] | select(.name == \$v) | .mountPath] | .[0]) as \$m | ([.env[] | select(.name == \"PGDATA\") | .value] | .[0]) as \$d | (\$m != null and \$d != null and (\$d | test(\"^\" + \$m + \"/[^/]+\")))" \
+	"true"
+expect "kind: Postgres fsGroup 70, OnRootMismatch" "$kind" \
+	"$pg | .securityContext | (.fsGroup | tostring) + \" \" + .fsGroupChangePolicy" "70 OnRootMismatch"
 expect "kind: image enron-service:dev, IfNotPresent" "$kind" "$ctr | .image + \" \" + .imagePullPolicy" \
 	"enron-service:dev IfNotPresent"
 expect "kind: generated Secret enron-db is the one the Deployment uses" "$kind" \

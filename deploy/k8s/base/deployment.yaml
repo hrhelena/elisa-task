@@ -30,8 +30,15 @@ spec:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
-        # The PVC is group-owned by 65532, so POST /fetch can write the dataset.
+        # How /data becomes writable for uid 65532 depends on the volume type:
+        # - Cloud block volumes (EBS gp3, GCE PD via CSI) support fsGroup: kubelet makes the volume root group 65532
+        #   and group-writable (setgid) before the container starts.
+        # - kind's local-path provisioner backs the PVC with a hostPath directory that it creates with mode 0777;
+        #   kubelet does not apply fsGroup to hostPath volumes, so the directory is writable regardless.
         fsGroup: 65532
+        # Only change ownership when the volume root does not match. The default (Always) would chown the whole
+        # extracted dataset (about 517k files) recursively on every pod start on volumes that support fsGroup.
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       containers:

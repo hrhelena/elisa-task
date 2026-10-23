@@ -43,6 +43,8 @@ spec:
         runAsUser: 70
         runAsGroup: 70
         fsGroup: 70
+        # Only fix ownership when the volume root does not match, instead of a recursive chown on every start.
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       containers:
