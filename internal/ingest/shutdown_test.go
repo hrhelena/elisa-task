@@ -106,12 +106,17 @@ func TestShutdownFitsTheCloseBudgetWithAWriteInFlight(t *testing.T) {
 	t.Parallel()
 	st := newFakeStore()
 	st.updateBlocks = true // every progress write hangs until canceled
+	st.updateStarted = make(chan struct{}, 1)
 	cfg := testConfig()
 	cfg.WriteTimeout = time.Minute
 	cfg.ShutdownWriteTimeout = 500 * time.Millisecond
 	s := NewService(&memSource{files: memMessages(10), blockAfter: 5}, st, cfg, slog.New(slog.DiscardHandler), nil)
 	mustStart(t, s)
-	time.Sleep(50 * time.Millisecond) // let a progress write start
+	select { // Close must find a progress write in flight
+	case <-st.updateStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no progress write started")
+	}
 
 	ctx, cancel := context.WithTimeout(t.Context(), cfg.ShutdownWriteTimeout+time.Second)
 	defer cancel()
