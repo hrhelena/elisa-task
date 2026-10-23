@@ -19,14 +19,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
-)
 
-const (
-	postgresImage            = "postgres:16-alpine"
-	containerStartupDeadline = 3 * time.Minute
+	"github.com/hrhelena/elisa-task/internal/store/storetest"
 )
 
 // testEnv is the package-wide Postgres container shared by all tests. Each
@@ -44,22 +38,18 @@ func TestMain(m *testing.M) {
 
 func runWithPostgres(m *testing.M) int {
 	ctx := context.Background()
-	ctr, err := startPostgres(ctx)
+	pg, err := storetest.Start(ctx)
 	if err != nil {
-		log.Printf("starting postgres container: %v", err)
+		log.Print(err)
 		return 1
 	}
 	defer func() {
-		if err := testcontainers.TerminateContainer(ctr); err != nil {
+		if err := pg.Terminate(); err != nil {
 			log.Printf("terminating postgres container: %v", err)
 		}
 	}()
 
-	testEnv.baseURL, err = ctr.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		log.Printf("postgres connection string: %v", err)
-		return 1
-	}
+	testEnv.baseURL = pg.URL
 	testEnv.admin, err = pgxpool.New(ctx, testEnv.baseURL)
 	if err != nil {
 		log.Printf("admin pool: %v", err)
@@ -67,20 +57,6 @@ func runWithPostgres(m *testing.M) int {
 	}
 	defer testEnv.admin.Close()
 	return m.Run()
-}
-
-func startPostgres(ctx context.Context) (*tcpostgres.PostgresContainer, error) {
-	return tcpostgres.Run(ctx, postgresImage,
-		tcpostgres.WithDatabase("enron"),
-		tcpostgres.WithUsername("enron"),
-		tcpostgres.WithPassword("enron"),
-		// tcpostgres.BasicWaitStrategies with a longer deadline than its
-		// default 60s: initdb is slow on loaded Docker hosts and CI runners.
-		testcontainers.WithWaitStrategyAndDeadline(containerStartupDeadline,
-			wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
-			wait.ForListeningPort("5432/tcp"),
-		),
-	)
 }
 
 // newDatabase creates an empty database for one test and returns its URL.
@@ -602,26 +578,22 @@ func TestTopSendersQueryCanUseFromAddrIndex(t *testing.T) {
 	}
 }
 
-// Scenario: Readiness reflects the database (store half: the /readyz HTTP
-// half is wired once #3 is merged). It stops a dedicated container, so it
-// does not disturb the shared one.
+// Scenario: Readiness reflects the database (store half; the /readyz HTTP
+// half is in cmd/enron-service TestBinaryReadinessReflectsDatabase). It
+// stops a dedicated container, so it does not disturb the shared one.
 func TestReadinessReflectsDatabase(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	ctr, err := startPostgres(ctx)
+	pg, err := storetest.Start(ctx)
 	if err != nil {
-		t.Fatalf("starting dedicated postgres: %v", err)
+		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := testcontainers.TerminateContainer(ctr); err != nil {
+		if err := pg.Terminate(); err != nil {
 			t.Errorf("terminating container: %v", err)
 		}
 	})
-	dbURL, err := ctr.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("connection string: %v", err)
-	}
-	s := openStoreAt(t, dbURL)
+	s := openStoreAt(t, pg.URL)
 
 	if got := s.Name(); got != "postgres" {
 		t.Errorf("Name() = %q, want %q", got, "postgres")
@@ -630,8 +602,7 @@ func TestReadinessReflectsDatabase(t *testing.T) {
 		t.Fatalf("Check with database up: %v", err)
 	}
 
-	timeout := 5 * time.Second
-	if err := ctr.Stop(ctx, &timeout); err != nil {
+	if err := pg.Stop(ctx); err != nil {
 		t.Fatalf("stopping container: %v", err)
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second) // the /readyz per-check timeout (#3)
