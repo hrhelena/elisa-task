@@ -915,9 +915,10 @@ Makefile targets:
 | `itest` | `make itest` with testcontainers on the runner's Docker |
 | `docker` | Build the image with the GitHub Actions cache (never pushed), then `scripts/docker-smoke.sh` |
 | `manifests` | `make k8s-validate`, and a check that `kubectl kustomize` renders the same output as the pinned kustomize |
-| `e2e-kind` | Install the pinned kind binary (checksum verified), build the image with the same cache, then `scripts/kind-e2e.sh` under `timeout 10m` (SIGTERM, so the diagnostics still print); export kind logs as an artifact if a cluster is left over. Not a required check |
+| `e2e-kind` | Install the pinned kind binary (checksum verified), build the image with the same cache, then `scripts/kind-e2e.sh` under `timeout 10m` (SIGTERM, so the diagnostics still print); export kind logs as an artifact if a cluster is left over |
 
-A new push to a branch or PR cancels that ref's older run. On `main` every commit gets its own full run, which is
+Branch protection on `main` requires `lint`, `test`, `itest` and `e2e-kind` to pass before a merge, for admins too. `docker` and
+`manifests` run on every PR but are not required. A new push to a branch or PR cancels that ref's older run. On `main` every commit gets its own full run, which is
 never cancelled. Third-party actions are pinned to commit SHAs.
 
 ### Workflow
