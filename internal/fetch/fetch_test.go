@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -376,35 +377,140 @@ func TestFetch_StalledDownloadIsAborted(t *testing.T) {
 	assertNotExist(t, filepath.Join(dataDir, MaildirName))
 }
 
-func TestFetch_InsufficientDiskSpace(t *testing.T) {
+func TestFetch_DiskChecks(t *testing.T) {
 	t.Parallel()
-	dataDir := t.TempDir()
-	srv := newArchiveServer(t, serveBytes(sampleArchive(t)))
-	f, _ := newTestFetcher(t, dataDir, srv.URL, srv.Client(), WithMinFreeBytes(DefaultMinFreeBytes))
-	f.freeSpace = func(string) (uint64, error) { return 1536 << 20, nil }
+	const plenty = 1 << 40
+	tests := []struct {
+		name      string
+		stats     diskStats
+		statErr   error
+		wantError string // empty: the fetch succeeds.
+	}{
+		{
+			name:      "insufficient space",
+			stats:     diskStats{freeBytes: 1536 << 20, freeInodes: plenty, inodesKnown: true},
+			wantError: "insufficient disk space: need 4GiB, have 1.5GiB",
+		},
+		{
+			name:      "insufficient inodes",
+			stats:     diskStats{freeBytes: plenty, freeInodes: 100_000, inodesKnown: true},
+			wantError: "insufficient free inodes: need 530000, have 100000 (the dataset has about 521k files and directories)",
+		},
+		{
+			name:  "inodes not reported by the filesystem",
+			stats: diskStats{freeBytes: plenty, freeInodes: 0, inodesKnown: false},
+		},
+		{
+			name:  "enough of both",
+			stats: diskStats{freeBytes: DefaultMinFreeBytes, freeInodes: DefaultMinFreeInodes, inodesKnown: true},
+		},
+		{
+			name:    "platform without statfs",
+			statErr: errDiskStatsUnsupported,
+		},
+		{
+			name:      "statfs fails",
+			statErr:   errors.New("EIO"),
+			wantError: "checking free disk space: EIO",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dataDir := t.TempDir()
+			srv := newArchiveServer(t, serveBytes(sampleArchive(t)))
+			f, _ := newTestFetcher(t, dataDir, srv.URL, srv.Client(),
+				WithMinFreeBytes(DefaultMinFreeBytes), WithMinFreeInodes(DefaultMinFreeInodes))
+			f.statDisk = func(string) (diskStats, error) { return tt.stats, tt.statErr }
 
-	if _, err := f.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
+			if _, err := f.Start(); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			if tt.wantError == "" {
+				waitForState(t, f, StateReady)
+				return
+			}
+			p := waitForState(t, f, StateFailed)
+			if p.Error != tt.wantError {
+				t.Errorf("error = %q, want %q", p.Error, tt.wantError)
+			}
+			if n := srv.requests.Load(); n != 0 {
+				t.Errorf("requests = %d, want 0 (checks run before downloading)", n)
+			}
+			assertNoTempDirs(t, dataDir)
+		})
 	}
-	p := waitForState(t, f, StateFailed)
-	if p.Error != "insufficient disk space: need 4GiB, have 1.5GiB" {
-		t.Errorf("error = %q", p.Error)
-	}
-	if n := srv.requests.Load(); n != 0 {
-		t.Errorf("requests = %d, want 0", n)
-	}
-	assertNoTempDirs(t, dataDir)
 }
 
-func TestFetch_RealFreeSpaceCheckPasses(t *testing.T) {
+func TestStatDisk_ReportsTheRealFilesystem(t *testing.T) {
+	t.Parallel()
+	st, err := statDisk(t.TempDir())
+	if errors.Is(err, errDiskStatsUnsupported) {
+		t.Skip("no statfs on this platform")
+	}
+	if err != nil {
+		t.Fatalf("statDisk: %v", err)
+	}
+	if st.freeBytes == 0 {
+		t.Errorf("freeBytes = 0 for the test temp dir: %+v", st)
+	}
+	if st.inodesKnown && st.freeInodes == 0 {
+		t.Errorf("inodes reported but none free: %+v", st)
+	}
+}
+
+func TestFetch_RealDiskChecksPass(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
 	srv := newArchiveServer(t, serveBytes(sampleArchive(t)))
-	f, _ := newTestFetcher(t, dataDir, srv.URL, srv.Client(), WithMinFreeBytes(1))
+	f, _ := newTestFetcher(t, dataDir, srv.URL, srv.Client(), WithMinFreeBytes(1), WithMinFreeInodes(1))
 	if _, err := f.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	waitForState(t, f, StateReady)
+}
+
+func TestFetch_MaildirIsNotADirectory(t *testing.T) {
+	t.Parallel()
+	for _, kind := range []string{"file", "symlink to a directory"} {
+		t.Run(kind, func(t *testing.T) {
+			t.Parallel()
+			dataDir := t.TempDir()
+			maildir := filepath.Join(dataDir, MaildirName)
+			if kind == "file" {
+				if err := os.WriteFile(maildir, []byte("oops"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.Symlink(t.TempDir(), maildir); err != nil {
+				t.Fatal(err)
+			}
+			srv := newArchiveServer(t, serveBytes(sampleArchive(t)))
+			f, _ := newTestFetcher(t, dataDir, srv.URL, srv.Client())
+			if kind != "file" {
+				// A symlink to a directory is a usable dataset (os.Stat follows it).
+				if p, err := f.Start(); err != nil || p.State != StateReady {
+					t.Errorf("Start = %+v, %v; want ready", p, err)
+				}
+				return
+			}
+
+			p, err := f.Start()
+			if !errors.Is(err, ErrMaildirNotDirectory) {
+				t.Fatalf("Start error = %v, want ErrMaildirNotDirectory", err)
+			}
+			if !strings.Contains(err.Error(), maildir) {
+				t.Errorf("error %q does not name the path", err)
+			}
+			if p.State != StateAbsent {
+				t.Errorf("state = %q, want absent", p.State)
+			}
+			if n := srv.requests.Load(); n != 0 {
+				t.Errorf("requests = %d, want 0", n)
+			}
+			assertNoTempDirs(t, dataDir)
+			assertFile(t, maildir, "oops") // left untouched.
+		})
+	}
 }
 
 func TestFetch_DataDirNotWritable(t *testing.T) {
@@ -448,26 +554,79 @@ func TestFetch_UnreachableServer(t *testing.T) {
 
 func TestNew_RemovesLeftoverTempDirs(t *testing.T) {
 	t.Parallel()
-	dataDir := t.TempDir()
-	left := filepath.Join(dataDir, TempPrefix+"123", "maildir", "a")
-	if err := os.MkdirAll(left, 0o750); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(left, "1."), []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	other := filepath.Join(dataDir, "keep-me")
-	if err := os.Mkdir(other, 0o750); err != nil {
-		t.Fatal(err)
-	}
+	// Glob metacharacters in DATA_DIR must neither break nor widen the match.
+	for _, name := range []string{"data", "data[1]", "da*ta?", `data\[x`} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			dataDir := filepath.Join(t.TempDir(), name)
+			for _, d := range []string{TempPrefix + "123", TempPrefix + "abc"} {
+				left := filepath.Join(dataDir, d, "maildir", "a")
+				if err := os.MkdirAll(left, 0o750); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(left, "1."), []byte("x"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			keep := []string{"keep-me", "maildir", "x" + TempPrefix + "1"}
+			for _, d := range keep {
+				if err := os.Mkdir(filepath.Join(dataDir, d), 0o750); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// A regular file with the prefix is not ours (we only create directories).
+			if err := os.WriteFile(filepath.Join(dataDir, TempPrefix+"file"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
 
-	f, _ := newTestFetcher(t, dataDir, "http://127.0.0.1:1/unused", nil)
-	assertNoTempDirs(t, dataDir)
-	if _, err := os.Stat(other); err != nil {
-		t.Errorf("unrelated directory removed: %v", err)
+			f, _ := newTestFetcher(t, dataDir, "http://127.0.0.1:1/unused", nil)
+			for _, d := range []string{TempPrefix + "123", TempPrefix + "abc"} {
+				assertNotExist(t, filepath.Join(dataDir, d))
+			}
+			for _, d := range append(keep, TempPrefix+"file") {
+				if _, err := os.Stat(filepath.Join(dataDir, d)); err != nil {
+					t.Errorf("unrelated entry %q removed: %v", d, err)
+				}
+			}
+			if p := f.Progress(); p.State != StateReady {
+				t.Errorf("state = %q, want ready (maildir exists)", p.State)
+			}
+		})
 	}
+}
+
+func TestNew_LeftoverCleanupWithMissingDataDir(t *testing.T) {
+	t.Parallel()
+	dataDir := filepath.Join(t.TempDir(), "does-not-exist")
+	f, _ := newTestFetcher(t, dataDir, "http://127.0.0.1:1/unused", nil)
 	if p := f.Progress(); p.State != StateAbsent {
-		t.Errorf("state = %q, want absent (a leftover temp dir is not a dataset)", p.State)
+		t.Errorf("state = %q, want absent", p.State)
+	}
+	assertNotExist(t, dataDir) // New does not create the directory.
+}
+
+func TestNewHTTPClient_DoesNotRequestCompression(t *testing.T) {
+	t.Parallel()
+	archive := sampleArchive(t)
+	var acceptEncoding atomic.Value
+	srv := newArchiveServer(t, func(w http.ResponseWriter, r *http.Request) {
+		acceptEncoding.Store(r.Header.Get("Accept-Encoding"))
+		serveBytes(archive)(w, r)
+	})
+	dataDir := t.TempDir()
+	f, _ := newTestFetcher(t, dataDir, srv.URL, nil) // nil: the production client.
+	if _, err := f.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	p := waitForState(t, f, StateReady)
+	if got := acceptEncoding.Load(); got != "" {
+		t.Errorf("Accept-Encoding = %q, want none (the archive must arrive byte for byte)", got)
+	}
+	if p.BytesDownloaded != int64(len(archive)) {
+		t.Errorf("bytes = %d, want %d", p.BytesDownloaded, len(archive))
+	}
+	if tr, ok := NewHTTPClient().Transport.(*http.Transport); !ok || !tr.DisableCompression || !tr.DisableKeepAlives {
+		t.Errorf("transport = %+v, want DisableCompression and DisableKeepAlives", tr)
 	}
 }
 

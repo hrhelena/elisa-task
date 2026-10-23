@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -144,7 +145,7 @@ func serveInTwoParts(b []byte, g *gate) http.HandlerFunc {
 func newTestFetcher(t *testing.T, dataDir, url string, client *http.Client, opts ...Option) (*Fetcher, *prometheus.Registry) {
 	t.Helper()
 	reg := prometheus.NewRegistry()
-	opts = append([]Option{WithMinFreeBytes(0)}, opts...)
+	opts = append([]Option{WithMinFreeBytes(0), WithMinFreeInodes(0)}, opts...)
 	f := New(dataDir, url, client, slog.New(slog.DiscardHandler), reg, opts...)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -175,9 +176,15 @@ func waitForState(t *testing.T, f *Fetcher, want State) Progress {
 // assertNoTempDirs fails if any .fetch-tmp-* directory is left in dataDir.
 func assertNoTempDirs(t *testing.T, dataDir string) {
 	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(dataDir, TempPrefix+"*"))
-	if err != nil {
+	entries, err := os.ReadDir(dataDir) // not filepath.Glob: dataDir may contain glob characters.
+	if err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
+	}
+	var matches []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), TempPrefix) {
+			matches = append(matches, e.Name())
+		}
 	}
 	if len(matches) > 0 {
 		t.Errorf("temporary directories left behind: %v", matches)

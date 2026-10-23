@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -84,6 +85,13 @@ func TestFetchHandler(t *testing.T) {
 			err:        errors.Join(fetch.ErrDataDirNotWritable, os.ErrPermission),
 			wantStatus: http.StatusInternalServerError,
 			wantCode:   CodeDataDirNotWritable,
+		},
+		{
+			name:       "maildir is a file",
+			progress:   fetch.Progress{State: fetch.StateAbsent},
+			err:        fmt.Errorf("%w: /data/maildir", fetch.ErrMaildirNotDirectory),
+			wantStatus: http.StatusConflict,
+			wantCode:   CodeMaildirNotDirectory,
 		},
 		{
 			name:       "shutting down",
@@ -189,7 +197,7 @@ func newRoundTrip(t *testing.T, dataDir string, h http.HandlerFunc) *roundTrip {
 		h(w, r)
 	}))
 	t.Cleanup(srv.Close)
-	f := fetch.New(dataDir, srv.URL, srv.Client(), nil, nil, fetch.WithMinFreeBytes(0))
+	f := fetch.New(dataDir, srv.URL, srv.Client(), nil, nil, fetch.WithMinFreeBytes(0), fetch.WithMinFreeInodes(0))
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

@@ -79,6 +79,7 @@ curl -si -X POST localhost:8080/fetch
 | Dataset present | `200` with `"state":"ready"` |
 | Fetch started, already running, or retried after a failure | `202`, `Location: /status`, current progress |
 | `DATA_DIR` not writable | `500`, code `data_dir_not_writable` |
+| `$DATA_DIR/maildir` exists but is not a directory | `409`, code `maildir_not_directory` (nothing is downloaded) |
 | Service shutting down | `503`, code `unavailable` |
 
 States: `absent`, `downloading` (download and streamed extraction), `extracting` (archive fully received; verifying
@@ -88,9 +89,11 @@ and moving into place), `ready`, `failed` (with `error`, for example `download f
 How it works: the archive is streamed through gzip and tar into `$DATA_DIR/.fetch-tmp-*` (never buffered in memory),
 and renamed to `$DATA_DIR/maildir` only after the whole archive, including the gzip checksum, has been read. Then
 `$DATA_DIR/.fetch-complete` records the URL, SHA-256, size and file count. Entries that are absolute, escape the
-target (`..`), are links or devices, or lie outside `maildir/` are skipped and logged. A fetch fails if no data
-arrives for 60s, if less than 4 GiB is free in `DATA_DIR`, or if the archive extracts to more than 8 GiB. On
-failure or shutdown the temporary directory is removed; leftovers from a crash are removed at startup.
+target (`..`), are links or devices, or lie outside `maildir/` are skipped and logged. Before downloading, a fetch
+fails if `DATA_DIR` has less than 4 GiB free, or fewer than 530,000 free inodes on filesystems that report them
+(the dataset has about 521k files and directories, more than a small ext4 volume may hold). It also fails if no
+data arrives for 60s, or if the archive extracts to more than 8 GiB. On failure or shutdown the temporary
+directory is removed; leftovers from a crash are removed at startup.
 
 Metrics: `enron_fetch_bytes_total`, `enron_fetch_state{state}`, `enron_fetch_duration_seconds{result}`,
 `enron_fetch_entries_skipped_total{reason}`.

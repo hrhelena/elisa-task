@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -58,6 +60,11 @@ const (
 	// DefaultMinFreeBytes is the free space required in the data directory
 	// before a download starts (the extracted dataset is about 2.3 GB).
 	DefaultMinFreeBytes uint64 = 4 << 30
+	// DefaultMinFreeInodes is the number of free inodes required before a
+	// download starts: the dataset has 520,901 entries (517,401 files and
+	// 3,500 directories), plus about 2% headroom. Small ext4 volumes can run
+	// out of inodes long before they run out of bytes.
+	DefaultMinFreeInodes uint64 = 530_000
 	// DefaultProgressLogInterval is how often download progress is logged.
 	DefaultProgressLogInterval = 10 * time.Second
 )
@@ -68,6 +75,9 @@ var (
 	// ErrDataDirNotWritable is returned by Start when the data directory
 	// cannot be created or written to.
 	ErrDataDirNotWritable = errors.New("data directory is not writable")
+	// ErrMaildirNotDirectory is returned by Start when $DATA_DIR/maildir
+	// exists but is not a directory, so a fetch could never install the dataset.
+	ErrMaildirNotDirectory = errors.New("maildir path exists and is not a directory")
 	// errStalled is the cancel cause of a download that stopped receiving bytes.
 	errStalled = errors.New("download stalled")
 )
@@ -111,6 +121,12 @@ func WithMinFreeBytes(n uint64) Option {
 	return func(f *Fetcher) { f.minFreeBytes = n }
 }
 
+// WithMinFreeInodes sets the free inodes the data directory must have before
+// a download starts, where the platform reports inodes. Zero disables the check.
+func WithMinFreeInodes(n uint64) Option {
+	return func(f *Fetcher) { f.minFreeInodes = n }
+}
+
 // WithProgressLogInterval sets how often download progress is logged.
 func WithProgressLogInterval(d time.Duration) Option {
 	return func(f *Fetcher) { f.logInterval = d }
@@ -125,11 +141,12 @@ type Fetcher struct {
 	logger  *slog.Logger
 	metrics *metrics
 
-	stallTimeout time.Duration
-	minFreeBytes uint64
-	logInterval  time.Duration
-	// freeSpace reports the bytes available in a directory; replaced in tests.
-	freeSpace func(dir string) (uint64, error)
+	stallTimeout  time.Duration
+	minFreeBytes  uint64
+	minFreeInodes uint64
+	logInterval   time.Duration
+	// statDisk reports free space and inodes; replaced in tests.
+	statDisk func(dir string) (diskStats, error)
 
 	// baseCtx is the service-lifetime context fetches run under (never a
 	// request context); Close cancels it.
@@ -157,16 +174,17 @@ func New(dataDir, url string, client *http.Client, logger *slog.Logger, reg prom
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	f := &Fetcher{
-		dataDir:      dataDir,
-		url:          url,
-		client:       client,
-		logger:       logger.With(slog.String("component", "fetch")),
-		stallTimeout: DefaultStallTimeout,
-		minFreeBytes: DefaultMinFreeBytes,
-		logInterval:  DefaultProgressLogInterval,
-		freeSpace:    freeSpace,
-		baseCtx:      ctx,
-		baseCancel:   cancel,
+		dataDir:       dataDir,
+		url:           url,
+		client:        client,
+		logger:        logger.With(slog.String("component", "fetch")),
+		stallTimeout:  DefaultStallTimeout,
+		minFreeBytes:  DefaultMinFreeBytes,
+		minFreeInodes: DefaultMinFreeInodes,
+		logInterval:   DefaultProgressLogInterval,
+		statDisk:      statDisk,
+		baseCtx:       ctx,
+		baseCancel:    cancel,
 	}
 	for _, opt := range opts {
 		opt(f)
@@ -181,7 +199,8 @@ func New(dataDir, url string, client *http.Client, logger *slog.Logger, reg prom
 // Start starts a fetch unless the dataset is already present or a fetch is
 // in progress, and returns the resulting progress. It never waits for the
 // download. It returns ErrDataDirNotWritable if the data directory cannot be
-// written and ErrClosed after Close.
+// written, ErrMaildirNotDirectory if $DATA_DIR/maildir exists but is not a
+// directory, and ErrClosed after Close.
 func (f *Fetcher) Start() (Progress, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -194,6 +213,11 @@ func (f *Fetcher) Start() (Progress, error) {
 	}
 	if f.refreshLocked(); f.progress.State == StateReady {
 		return f.snapshotLocked(), nil
+	}
+	if fi, err := os.Lstat(f.maildirPath()); err == nil && !fi.IsDir() {
+		f.logger.Error("cannot fetch: maildir path is not a directory",
+			slog.String("path", f.maildirPath()), slog.String("mode", fi.Mode().String()))
+		return f.snapshotLocked(), fmt.Errorf("%w: %s (mode %s)", ErrMaildirNotDirectory, f.maildirPath(), fi.Mode())
 	}
 
 	tmp, err := f.makeTempDir()
@@ -305,18 +329,28 @@ func (f *Fetcher) makeTempDir() (string, error) {
 }
 
 // removeLeftovers deletes temporary directories left by a fetch that was
-// interrupted by a crash or a kill (ticket #10: removed at startup).
+// interrupted by a crash or a kill (ticket #10: removed at startup). It lists
+// the data directory and matches the prefix literally, so glob characters in
+// DATA_DIR (for example "[") cannot break or widen the match.
 func (f *Fetcher) removeLeftovers() {
-	matches, err := filepath.Glob(filepath.Join(f.dataDir, TempPrefix+"*"))
+	entries, err := os.ReadDir(f.dataDir)
 	if err != nil {
-		return // only ErrBadPattern, impossible for a constant pattern.
+		if !errors.Is(err, fs.ErrNotExist) {
+			f.logger.Warn("listing the data directory for leftovers failed",
+				slog.String("data_dir", f.dataDir), slog.Any("err", err))
+		}
+		return
 	}
-	for _, m := range matches {
-		if err := os.RemoveAll(m); err != nil {
-			f.logger.Warn("removing leftover temporary directory failed", slog.String("path", m), slog.Any("err", err))
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), TempPrefix) {
 			continue
 		}
-		f.logger.Info("removed leftover temporary directory", slog.String("path", m))
+		path := filepath.Join(f.dataDir, e.Name())
+		if err := os.RemoveAll(path); err != nil {
+			f.logger.Warn("removing leftover temporary directory failed", slog.String("path", path), slog.Any("err", err))
+			continue
+		}
+		f.logger.Info("removed leftover temporary directory", slog.String("path", path))
 	}
 }
 
@@ -368,7 +402,7 @@ type result struct {
 // fetch downloads and extracts the archive into tmp, then moves the maildir
 // into place and writes the marker.
 func (f *Fetcher) fetch(ctx context.Context, tmp string) (result, error) {
-	if err := f.checkFreeSpace(); err != nil {
+	if err := f.checkDisk(); err != nil {
 		return result{}, err
 	}
 
@@ -449,19 +483,34 @@ func (f *Fetcher) describe(ctx context.Context, err error) error {
 	}
 }
 
-func (f *Fetcher) checkFreeSpace() error {
-	if f.minFreeBytes == 0 {
+// diskStats describes the free capacity of a filesystem.
+type diskStats struct {
+	freeBytes  uint64
+	freeInodes uint64
+	// inodesKnown is false when the filesystem reports no inode limit
+	// (statfs f_files == 0); the inode check is then skipped.
+	inodesKnown bool
+}
+
+// checkDisk fails fast, before any byte is downloaded, when the data
+// directory lacks the space or the inodes for the extracted dataset.
+func (f *Fetcher) checkDisk() error {
+	if f.minFreeBytes == 0 && f.minFreeInodes == 0 {
 		return nil
 	}
-	free, err := f.freeSpace(f.dataDir)
+	st, err := f.statDisk(f.dataDir)
 	if err != nil {
-		if errors.Is(err, errFreeSpaceUnsupported) {
+		if errors.Is(err, errDiskStatsUnsupported) {
 			return nil
 		}
 		return fmt.Errorf("checking free disk space: %w", err)
 	}
-	if free < f.minFreeBytes {
-		return fmt.Errorf("insufficient disk space: need %s, have %s", formatBytes(f.minFreeBytes), formatBytes(free))
+	if st.freeBytes < f.minFreeBytes {
+		return fmt.Errorf("insufficient disk space: need %s, have %s", formatBytes(f.minFreeBytes), formatBytes(st.freeBytes))
+	}
+	if st.inodesKnown && st.freeInodes < f.minFreeInodes {
+		return fmt.Errorf("insufficient free inodes: need %d, have %d (the dataset has about 521k files and directories)",
+			f.minFreeInodes, st.freeInodes)
 	}
 	return nil
 }
