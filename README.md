@@ -68,7 +68,7 @@ error naming the variable and exit with status 1.
 | Variable | Default | Meaning |
 |---|---|---|
 | `HTTP_ADDR` | `:8080` | HTTP listen address, `[host]:port` with a numeric port |
-| `DATABASE_URL` | `postgres://enron:enron@localhost:5432/enron?sslmode=disable` | Postgres connection string; pgxpool options such as `pool_max_conns` may be added as query parameters. See [Startup](#startup) |
+| `DATABASE_URL` | `postgres://enron:enron@localhost:5432/enron?sslmode=disable` | Postgres connection string; pgxpool options such as `pool_max_conns` may be added as query parameters (keep it at 2 or more: a running ingestion holds one connection for its cluster-wide lock). See [Startup](#startup) |
 | `DB_STARTUP_TIMEOUT` | `60s` | Budget for opening the database at startup: connection retries, the migration lock wait and the migrations (positive duration) |
 | `DATA_DIR` | `./Dataset` | Dataset root; the maildir is expected at `$DATA_DIR/maildir` |
 | `DATASET_URL` | `https://www.cs.cmu.edu/~enron/enron_mail_20150507.tar.gz` | Archive downloaded by `POST /fetch` (http or https) |

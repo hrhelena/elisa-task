@@ -68,11 +68,13 @@ type MessageStats interface {
 // Store is the full storage surface of the service. It exists to document
 // the backend contract and to let other backends be added (ADR 0001, 0009).
 // Consumers should still declare the narrow interface they need (for example
-// MessageStats) rather than depend on Store. Later tickets extend it by
-// embedding further role interfaces (run state, #5).
+// MessageStats) rather than depend on Store.
 type Store interface {
 	MessageWriter
 	MessageStats
+	IngestLocker
+	RunWriter
+	RunReader
 	// Name and Check make a Store usable as a readiness checker.
 	Name() string
 	Check(ctx context.Context) error
