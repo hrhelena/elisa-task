@@ -1,0 +1,25 @@
+# Dataset (downloaded/extracted locally, never committed)
+/Dataset/
+
+# Go
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+
+# Local env / tooling
+.env
+.venv/
+.tools/
+*.db
+*.sqlite
+
+# Claude Code local state
+.claude/settings.local.json
+.claude/worktrees/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
