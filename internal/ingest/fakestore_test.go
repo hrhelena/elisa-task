@@ -119,6 +119,23 @@ func (l *fakeLock) Release(ctx context.Context) error {
 // lose simulates the lock's session dying: a real loss.
 func (l *fakeLock) lose() { l.end(fmt.Errorf("%w: lock connection lost", store.ErrLockNotHeld)) }
 
+// loseToAnotherHolder simulates the held lock's session dying and another
+// replica taking the freed lock before this replica notices the loss, and
+// returns the new holder's lock. The new holder is in place before the old
+// lock's Done is closed, so the engine can never take the lock back first.
+// (With lose followed by AcquireIngestLock, the engine can win that race and
+// record the outcome itself, which is correct behavior but not this case.)
+func (f *fakeStore) loseToAnotherHolder() *fakeLock {
+	f.mu.Lock()
+	old := f.lock
+	f.acquires++
+	f.lock = &fakeLock{fs: f, done: make(chan struct{})}
+	other := f.lock
+	f.mu.Unlock()
+	old.lose()
+	return other
+}
+
 // closeStore simulates store.Postgres.Close: the held lock ends with
 // ErrStoreClosed and the store refuses new locks.
 func (f *fakeStore) closeStore() {
