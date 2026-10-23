@@ -29,7 +29,7 @@ func newLogger(w io.Writer) *slog.Logger {
 // run is the testable body of main. It returns instead of exiting so that
 // deferred cleanup runs and tests can drive it.
 func run(ctx context.Context, logger *slog.Logger) error {
-	os.Chdir(os.TempDir()) // CI demo: unchecked error
+	io.WriteString(io.Discard, "starting") // CI demo: unchecked error
 	logger.InfoContext(ctx, "starting")
 	return nil
 }
