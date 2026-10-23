@@ -33,11 +33,14 @@ make docker-smoke    # build, then check the image and the compose stack on port
 
 The image is built in two stages: a static binary (`CGO_ENABLED=0`, `-trimpath -s -w`, version from `VERSION`) on
 `gcr.io/distroless/static-debian12:nonroot`. It has no shell, runs as `65532:65532`, listens on 8080 and is about
-19 MB. Base images are pinned by digest in `Dockerfile` and `compose.yaml`.
+24 MB. Base images are pinned by digest in `Dockerfile` and `compose.yaml`.
 
-`compose.yaml` starts the app only after the Postgres healthcheck passes. It sets `DATABASE_URL` to the compose
-Postgres and mounts `./Dataset` read-write at `/data` (`DATA_DIR`), so `POST /fetch` can fill an empty directory,
-which is created if missing. The app has no container healthcheck (no shell or curl in the image), so poll `/readyz`.
+`compose.yaml` starts the app only after the Postgres healthcheck (`pg_isready` over TCP) passes, and restarts it
+if it exits with an error (for example, if it cannot reach the database at startup). It sets `DATABASE_URL` to the
+compose Postgres and mounts `./Dataset` read-write at `/data` (`DATA_DIR`), so `POST /fetch` can fill an empty
+directory. `make compose-up` creates the directory as you before it starts compose. Use it rather than a bare
+`docker compose up`: on a rootful Linux daemon, compose would create a missing directory owned by root, and the
+app could not write to it. The app has no container healthcheck (no shell or curl in the image), so poll `/readyz`.
 Compose variables:
 
 | Variable | Default | Meaning |
@@ -45,7 +48,7 @@ Compose variables:
 | `DATASET_DIR` | `./Dataset` | Host directory mounted at `/data` (e.g. the main checkout's `Dataset/` from a git worktree) |
 | `APP_PORT` | `8080` | Host port for the service |
 | `POSTGRES_PORT` | `5432` | Host port for Postgres |
-| `APP_USER` | `65532:65532` | Container user; on Linux use `"$(id -u):$(id -g)"` so the app can write to the bind mount |
+| `APP_USER` | `65532:65532` | Container user. On Linux, use `"$(id -u):$(id -g)"` so the app can write to the bind mount; this works when you own the dataset directory, which `make compose-up` ensures for a new one |
 | `LOG_LEVEL` | `info` | Passed to the service |
 
 ## CI

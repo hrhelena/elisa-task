@@ -29,6 +29,9 @@ IMAGE    ?= enron-service:dev
 VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 REVISION ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 COMPOSE  ?= docker compose
+# Host directory compose mounts at /data. compose-up creates it as the invoking user first: if compose's
+# create_host_path made it, a rootful Linux daemon would create it root-owned and the app could not write to it.
+DATASET_DIR ?= ./Dataset
 
 ##@ Setup
 
@@ -110,7 +113,9 @@ docker-smoke: docker ## Build the image, then smoke-test it and the compose stac
 
 .PHONY: compose-up
 compose-up: ## Build the image and start Postgres plus the service (docker compose)
-	IMAGE=$(IMAGE) VERSION=$(VERSION) $(COMPOSE) up -d --build
+	mkdir -p "$(DATASET_DIR)"
+	IMAGE=$(IMAGE) VERSION=$(VERSION) REVISION=$(REVISION) CREATED=$$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+		DATASET_DIR="$(DATASET_DIR)" $(COMPOSE) up -d --build
 
 .PHONY: compose-down
 compose-down: ## Stop the docker compose stack (keeps the database volume)
