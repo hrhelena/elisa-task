@@ -43,6 +43,10 @@ DATASET_DIR ?= ./Dataset
 # kind and kubectl are host prerequisites.
 KIND_CLUSTER ?= elisa-enron
 KIND_CONTEXT := kind-$(KIND_CLUSTER)
+# Opt-in (#40): mount the local dataset into kind read-only instead of using POST /fetch. Pass it to both kind-up
+# (cluster created with the mount) and deploy (overlays/kind-local-dataset). 1 means Dataset/ of the main checkout
+# (also from a worktree); a path means that directory, which must contain maildir/. Empty: unchanged behaviour.
+LOCAL_DATASET ?=
 
 ##@ Setup
 
@@ -138,20 +142,8 @@ k8s-validate: ## Render the kustomize base and overlays, kubeconform them and as
 	scripts/k8s-validate.sh
 
 .PHONY: kind-up
-kind-up: ## Create the kind cluster $(KIND_CLUSTER) (no-op if it exists; needs kind and Docker)
-	@if kind get clusters 2>/dev/null | grep -qx "$(KIND_CLUSTER)"; then \
-		echo "kind cluster $(KIND_CLUSTER) already exists"; \
-	else \
-		prev=$$(kubectl config current-context 2>/dev/null || true); \
-		kind create cluster --name "$(KIND_CLUSTER)" --config deploy/kind/cluster.yaml --wait 120s; \
-		if [ -n "$$prev" ]; then \
-			kubectl config use-context "$$prev" >/dev/null; \
-			echo "restored current kube context to $$prev (use --context $(KIND_CONTEXT))"; \
-		else \
-			kubectl config unset current-context >/dev/null; \
-			echo "no current kube context before; left unset (use --context $(KIND_CONTEXT))"; \
-		fi; \
-	fi
+kind-up: ## Create the kind cluster $(KIND_CLUSTER) (no-op if it exists; LOCAL_DATASET=1 mounts Dataset/)
+	@KIND_CLUSTER="$(KIND_CLUSTER)" LOCAL_DATASET="$(LOCAL_DATASET)" scripts/kind-up.sh
 
 .PHONY: kind-down
 kind-down: ## Delete the kind cluster $(KIND_CLUSTER) (no-op if it does not exist)
@@ -162,13 +154,15 @@ kind-down: ## Delete the kind cluster $(KIND_CLUSTER) (no-op if it does not exis
 	fi
 
 .PHONY: deploy
-deploy: docker ## Build the image, load it into kind $(KIND_CLUSTER) and apply the kind overlay
-	IMAGE=$(IMAGE) KIND_CLUSTER=$(KIND_CLUSTER) scripts/kind-deploy.sh
+deploy: docker ## Build the image, load it into kind $(KIND_CLUSTER) and apply the kind overlay (LOCAL_DATASET=1: local Dataset/)
+	IMAGE=$(IMAGE) KIND_CLUSTER=$(KIND_CLUSTER) LOCAL_DATASET="$(LOCAL_DATASET)" scripts/kind-deploy.sh
 
 .PHONY: undeploy
 undeploy: ## Delete the kind overlay's resources from $(KIND_CLUSTER), including the namespace and its volumes
 	$(GO_TOOL) kustomize build deploy/k8s/overlays/kind | \
 		kubectl --context "$(KIND_CONTEXT)" delete --ignore-not-found --wait=true -f -
+	@# The cluster-scoped PersistentVolume of the LOCAL_DATASET variant (Retain: the host files are never touched).
+	kubectl --context "$(KIND_CONTEXT)" delete persistentvolume enron-local-dataset --ignore-not-found --wait=true
 
 ##@ Help
 
