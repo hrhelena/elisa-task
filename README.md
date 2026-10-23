@@ -21,12 +21,40 @@ and refuses the commit (with a hint) if that `.venv` is missing.
 Python dev tools are locked with hashes in `requirements-dev.txt`. To change them, edit `requirements-dev.in`
 and run `make py-lock`.
 
+## Container image and docker compose
+
+```bash
+make docker          # image enron-service:dev (override: make docker IMAGE=... VERSION=...)
+make compose-up      # build, then start Postgres 16 and the service in the background
+curl localhost:8080/readyz
+make compose-down    # stop (the database volume is kept); make compose-clean also deletes it
+make docker-smoke    # build, then check the image and the compose stack on ports 18080/15432
+```
+
+The image is built in two stages: a static binary (`CGO_ENABLED=0`, `-trimpath -s -w`, version from `VERSION`) on
+`gcr.io/distroless/static-debian12:nonroot`. It has no shell, runs as `65532:65532`, listens on 8080 and is about
+19 MB. Base images are pinned by digest in `Dockerfile` and `compose.yaml`.
+
+`compose.yaml` starts the app only after the Postgres healthcheck passes. It sets `DATABASE_URL` to the compose
+Postgres and mounts `./Dataset` read-write at `/data` (`DATA_DIR`), so `POST /fetch` can fill an empty directory,
+which is created if missing. The app has no container healthcheck (no shell or curl in the image), so poll `/readyz`.
+Compose variables:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DATASET_DIR` | `./Dataset` | Host directory mounted at `/data` (e.g. the main checkout's `Dataset/` from a git worktree) |
+| `APP_PORT` | `8080` | Host port for the service |
+| `POSTGRES_PORT` | `5432` | Host port for Postgres |
+| `APP_USER` | `65532:65532` | Container user; on Linux use `"$(id -u):$(id -g)"` so the app can write to the bind mount |
+| `LOG_LEVEL` | `info` | Passed to the service |
+
 ## CI
 
 GitHub Actions (`.github/workflows/ci.yml`) runs on every pull request and on pushes to `main`, using the same
 Makefile targets: `lint` (all pre-commit hooks, including the `go mod tidy` and formatting checks, then `make lint`),
-`test` (`make test` with `-race`; `coverage.out` is uploaded as an artifact) and `itest` (`make itest` with
-testcontainers on the runner's Docker). A new push to a branch or PR cancels that ref's older run;
+`test` (`make test` with `-race`; `coverage.out` is uploaded as an artifact), `itest` (`make itest` with
+testcontainers on the runner's Docker) and `docker` (builds the image with the GitHub Actions build cache, never
+pushes it, then runs `scripts/docker-smoke.sh`). A new push to a branch or PR cancels that ref's older run;
 on `main` every commit gets its own full run, which is never cancelled.
 
 ## Configuration

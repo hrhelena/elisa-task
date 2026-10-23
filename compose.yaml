@@ -1,0 +1,57 @@
+# Local dev loop (ADR 0006, ticket #11): Postgres plus the service, with the local Dataset/ mounted.
+#   make compose-up      build the image and start both services in the background
+#   make compose-down    stop them (the database volume is kept)
+#   make compose-clean   stop them and delete the database volume
+# The app image has no shell, so it has no container healthcheck; poll `curl localhost:8080/readyz`.
+name: enron
+
+services:
+  postgres:
+    # postgres:16-alpine, pinned by digest (resolved 2026-10-23, 16.15-alpine3.24).
+    image: postgres:16-alpine@sha256:f4610795587492cd4fb887c2dc3de301b813278bb6f616992061141b5f15ac36
+    environment:
+      POSTGRES_USER: enron
+      POSTGRES_PASSWORD: enron
+      POSTGRES_DB: enron
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U enron -d enron"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+      start_interval: 1s
+
+  app:
+    image: ${IMAGE:-enron-service:dev}
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+    # The image runs as 65532:65532. On Linux, a bind mount keeps host ownership, so set
+    # APP_USER="$(id -u):$(id -g)" to let POST /fetch write into ./Dataset (Docker Desktop maps it).
+    user: ${APP_USER:-65532:65532}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://enron:enron@postgres:5432/enron?sslmode=disable
+      DATA_DIR: /data
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    volumes:
+      # Read-write so that POST /fetch can download into an empty Dataset/. create_host_path
+      # creates the directory if it is missing. DATASET_DIR points elsewhere (e.g. from a git worktree).
+      - type: bind
+        source: ${DATASET_DIR:-./Dataset}
+        target: /data
+        bind:
+          create_host_path: true
+    stop_grace_period: 30s
+
+volumes:
+  pgdata:

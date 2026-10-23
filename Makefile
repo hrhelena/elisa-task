@@ -24,6 +24,11 @@ LOCK_VENV := .tools/pip-tools
 PIP_FLAGS := --quiet --disable-pip-version-check --no-cache-dir
 # Extra `go test` flags, e.g. `make test TEST_FLAGS=-coverprofile=coverage.out` (CI uses this).
 TEST_FLAGS ?=
+# Container image (#11), overridable: `make docker IMAGE=... VERSION=...`.
+IMAGE    ?= enron-service:dev
+VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+REVISION ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+COMPOSE  ?= docker compose
 
 ##@ Setup
 
@@ -92,16 +97,28 @@ define not_implemented
 endef
 
 .PHONY: docker
-docker: ## Build the container image (#11)
-	$(call not_implemented,11)
+docker: ## Build the container image $(IMAGE) (IMAGE and VERSION overridable)
+	docker build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg REVISION=$(REVISION) \
+		--build-arg CREATED=$$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+		-t $(IMAGE) .
+
+.PHONY: docker-smoke
+docker-smoke: docker ## Build the image, then smoke-test it and the compose stack (ports 18080/15432)
+	IMAGE=$(IMAGE) scripts/docker-smoke.sh
 
 .PHONY: compose-up
-compose-up: ## Start the docker compose dev stack (#11)
-	$(call not_implemented,11)
+compose-up: ## Build the image and start Postgres plus the service (docker compose)
+	IMAGE=$(IMAGE) VERSION=$(VERSION) $(COMPOSE) up -d --build
 
 .PHONY: compose-down
-compose-down: ## Stop the docker compose dev stack (#11)
-	$(call not_implemented,11)
+compose-down: ## Stop the docker compose stack (keeps the database volume)
+	$(COMPOSE) down
+
+.PHONY: compose-clean
+compose-clean: ## Stop the docker compose stack and delete the database volume
+	$(COMPOSE) down -v
 
 .PHONY: kind-up
 kind-up: ## Create the local kind cluster (#12)
