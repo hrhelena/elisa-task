@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/hrhelena/elisa-task/internal/transient"
 )
 
 // State is the lifecycle state of the dataset.
@@ -86,6 +88,12 @@ var (
 	// directory the service cannot open: it is not a usable dataset
 	// (ingestion refuses it too), and a fetch could not replace it.
 	ErrMaildirUnreadable = errors.New("maildir directory is not readable")
+	// ErrTransient is returned by Start when $DATA_DIR/maildir could not be
+	// checked because of a transient system error (out of file descriptors
+	// or memory, an interrupted call). It says nothing about the maildir:
+	// the dataset state is left as it was, and the caller should retry
+	// (POST /fetch answers 503 unavailable, #49).
+	ErrTransient = errors.New("checking the maildir failed temporarily")
 	// errStalled is the cancel cause of a download that stopped receiving bytes.
 	errStalled = errors.New("download stalled")
 )
@@ -156,6 +164,10 @@ type Fetcher struct {
 	logInterval   time.Duration
 	// statDisk reports free space and inodes; replaced in tests.
 	statDisk func(dir string) (diskStats, error)
+	// lstat and openDir check the maildir (os.Lstat and os.Open); replaced
+	// in tests to inject errors.
+	lstat   func(name string) (fs.FileInfo, error)
+	openDir func(name string) (*os.File, error)
 
 	// baseCtx is the service-lifetime context fetches run under (never a
 	// request context); Close cancels it.
@@ -192,6 +204,8 @@ func New(dataDir, url string, client *http.Client, logger *slog.Logger, reg prom
 		minFreeInodes: DefaultMinFreeInodes,
 		logInterval:   DefaultProgressLogInterval,
 		statDisk:      statDisk,
+		lstat:         os.Lstat,
+		openDir:       os.Open,
 		baseCtx:       ctx,
 		baseCancel:    cancel,
 	}
@@ -210,7 +224,8 @@ func New(dataDir, url string, client *http.Client, logger *slog.Logger, reg prom
 // download. It returns ErrDataDirNotWritable if the data directory cannot be
 // written, ErrMaildirNotDirectory if $DATA_DIR/maildir exists but is not a
 // directory (including a symlink to one), ErrMaildirUnreadable if it is a
-// directory that cannot be opened, and ErrClosed after Close.
+// directory that cannot be opened, ErrTransient if it could not be checked
+// right now, and ErrClosed after Close.
 func (f *Fetcher) Start() (Progress, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -226,6 +241,11 @@ func (f *Fetcher) Start() (Progress, error) {
 	err := f.refreshLocked()
 	if err == nil {
 		return f.snapshotLocked(), nil
+	}
+	if errors.Is(err, ErrTransient) {
+		f.logger.Warn("cannot fetch now: checking the maildir failed temporarily",
+			slog.String("path", f.maildirPath()), slog.Any("err", err))
+		return f.snapshotLocked(), err
 	}
 	if unusable(err) {
 		f.logger.Error("cannot fetch: maildir path exists and is not usable",
@@ -296,11 +316,14 @@ func (f *Fetcher) inFlightLocked() bool {
 // local copy without a marker); a vanished maildir turns ready back into
 // absent; a maildir that exists but cannot be used (a file, a symlink to
 // anything, an unreadable directory) is absent with an error that says so.
-// A failed state is kept so its error stays visible. It returns the result
-// of checkMaildir.
+// A failed state is kept so its error stays visible, and a transient error
+// changes nothing: it says nothing about the maildir (#49). It returns the
+// result of checkMaildir.
 func (f *Fetcher) refreshLocked() error {
-	err := checkMaildir(f.maildirPath())
+	err := f.checkMaildir()
 	switch {
+	case errors.Is(err, ErrTransient):
+		return err
 	case err == nil:
 		if f.progress.State == StateReady {
 			return nil
@@ -337,15 +360,19 @@ func (f *Fetcher) setStateLocked(s State) {
 	f.metrics.setState(s)
 }
 
-// checkMaildir returns nil if path is a directory the service can open, an
-// error wrapping ErrMaildirNotDirectory if it exists but is something else,
-// one wrapping ErrMaildirUnreadable if it is a directory that cannot be
-// opened, and the Lstat error otherwise. It uses Lstat: a symlink is never
-// followed. Ingestion applies the same rules, so /fetch, /status and /start
-// agree (#45).
-func checkMaildir(path string) error {
-	fi, err := os.Lstat(path)
+// checkMaildir returns nil if the maildir is a directory the service can
+// open, an error wrapping ErrMaildirNotDirectory if it exists but is
+// something else, one wrapping ErrMaildirUnreadable if it is a directory that
+// cannot be opened, one wrapping ErrTransient if a transient system error
+// prevented the check, and the Lstat error otherwise. It uses Lstat: a
+// symlink is never followed. Ingestion applies the same rules, so /fetch,
+// /status and /start agree (#45).
+func (f *Fetcher) checkMaildir() error {
+	path := f.maildirPath()
+	fi, err := f.lstat(path)
 	switch {
+	case transient.Is(err):
+		return fmt.Errorf("%w: %w", ErrTransient, err)
 	case err != nil:
 		return err //nolint:wrapcheck // *fs.PathError already names the path.
 	case fi.Mode()&fs.ModeSymlink != 0:
@@ -353,7 +380,10 @@ func checkMaildir(path string) error {
 	case !fi.IsDir():
 		return fmt.Errorf("%w: %s (mode %s)", ErrMaildirNotDirectory, path, fi.Mode())
 	}
-	d, err := os.Open(path) //nolint:gosec // the configured dataset path.
+	d, err := f.openDir(path)
+	if transient.Is(err) {
+		return fmt.Errorf("%w: %w", ErrTransient, err)
+	}
 	if err != nil {
 		cause := err
 		if pe, ok := errors.AsType[*fs.PathError](err); ok {

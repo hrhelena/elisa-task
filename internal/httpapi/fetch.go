@@ -57,6 +57,17 @@ func fetchHandler(f Fetcher, logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p, err := f.Start()
 		switch {
+		case errors.Is(err, fetch.ErrClosed):
+			// First: shutdown wins over anything it is joined with.
+			writeError(w, http.StatusServiceUnavailable, CodeUnavailable, "the service is shutting down")
+			return
+		case errors.Is(err, fetch.ErrTransient):
+			// Out of file descriptors or memory: nothing is wrong with the
+			// maildir, and nothing was changed; retry (#49).
+			logger.WarnContext(r.Context(), "checking the maildir failed temporarily",
+				slog.Any("err", err), slog.String("request_id", RequestIDFromContext(r.Context())))
+			writeError(w, http.StatusServiceUnavailable, CodeUnavailable, transientMessage)
+			return
 		case errors.Is(err, fetch.ErrDataDirNotWritable):
 			writeError(w, http.StatusInternalServerError, CodeDataDirNotWritable,
 				"the data directory is not writable; check DATA_DIR and the volume permissions")
@@ -70,9 +81,6 @@ func fetchHandler(f Fetcher, logger *slog.Logger) http.Handler {
 		case errors.Is(err, fetch.ErrMaildirUnreadable):
 			writeError(w, http.StatusConflict, CodeMaildirUnreadable,
 				"$DATA_DIR/maildir is a directory the service cannot read; fix its permissions or remove it and retry")
-			return
-		case errors.Is(err, fetch.ErrClosed):
-			writeError(w, http.StatusServiceUnavailable, CodeUnavailable, "the service is shutting down")
 			return
 		case err != nil:
 			logger.ErrorContext(r.Context(), "starting fetch failed", slog.Any("err", err))

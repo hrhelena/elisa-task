@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -48,6 +51,8 @@ func TestIngestionStart(t *testing.T) {
 	t.Parallel()
 	started := time.Date(2026, 10, 23, 10, 0, 0, 0, time.UTC)
 	missing := fmt.Errorf("%w: lstat /data/maildir: no such file or directory", ingest.ErrDatasetMissing)
+	transientErr := fmt.Errorf("%w: %w", ingest.ErrTransient,
+		&fs.PathError{Op: "open", Path: "/data/maildir", Err: syscall.EMFILE})
 	tests := []struct {
 		name       string
 		lock       fakeLockChecker
@@ -112,6 +117,32 @@ func TestIngestionStart(t *testing.T) {
 				if !errors.As(err, &dm) || dm.Path != "/data/maildir" || dm.Problem != "it is a symlink, which is not followed" ||
 					!errors.Is(err, ingest.ErrDatasetInvalid) {
 					t.Errorf("err = %v, want a DatasetMissingError with the symlink problem wrapping ErrDatasetInvalid", err)
+				}
+			},
+		},
+		{
+			// Scenario: Running out of file descriptors is transient (#49):
+			// a 503 to retry, never the 409 dataset_missing.
+			name:       "dataset check fails with EMFILE",
+			startErr:   transientErr,
+			wantStarts: 1,
+			check: func(t *testing.T, err error) {
+				t.Helper()
+				var dm *httpapi.DatasetMissingError
+				if !errors.Is(err, httpapi.ErrDatasetUnavailable) || !errors.Is(err, syscall.EMFILE) || errors.As(err, &dm) {
+					t.Errorf("err = %v, want ErrDatasetUnavailable wrapping EMFILE and no DatasetMissingError", err)
+				}
+			},
+		},
+		{
+			// Shutdown still wins over a transient error.
+			name:       "closed joined with a transient error",
+			startErr:   errors.Join(ingest.ErrClosed, transientErr),
+			wantStarts: 1,
+			check: func(t *testing.T, err error) {
+				t.Helper()
+				if !errors.Is(err, httpapi.ErrIngesterClosed) {
+					t.Errorf("err = %v, want ErrIngesterClosed", err)
 				}
 			},
 		},
@@ -341,5 +372,24 @@ func TestIngestionLockCheckLogging(t *testing.T) {
 				t.Errorf("log record = %v, want level %s with request_id req-123", rec, tt.wantLevel)
 			}
 		})
+	}
+}
+
+// Scenario: Running out of file descriptors is transient (#49), from the
+// engine's error to the response: POST /start answers 503 unavailable with a
+// retry message, not 409 dataset_missing.
+func TestStartTransientDatasetErrorIs503(t *testing.T) {
+	t.Parallel()
+	engineErr := fmt.Errorf("%w: %w", ingest.ErrTransient,
+		&fs.PathError{Op: "open", Path: "/data/maildir", Err: syscall.EMFILE})
+	ing := newTestIngestion(&fakeIngestService{startErr: engineErr}, fakeLockChecker{})
+	h := httpapi.New(httpapi.Deps{Ingester: ing}, slog.New(slog.DiscardHandler))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/start", nil))
+
+	const want = `{"error":{"code":"unavailable","message":"the dataset cannot be checked right now ` +
+		`(a temporary system error such as too many open files); retry later"}}`
+	if rec.Code != http.StatusServiceUnavailable || strings.TrimSpace(rec.Body.String()) != want {
+		t.Errorf("POST /start = %d %s, want 503 %s", rec.Code, rec.Body.String(), want)
 	}
 }

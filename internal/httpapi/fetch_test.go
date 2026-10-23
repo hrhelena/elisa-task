@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -52,6 +53,7 @@ func TestFetchHandler(t *testing.T) {
 		wantStatus   int
 		wantLocation string
 		wantCode     string
+		wantMessage  string // checked if set
 		wantFields   map[string]any
 	}{
 		{
@@ -117,6 +119,23 @@ func TestFetchHandler(t *testing.T) {
 			wantCode:   CodeUnavailable,
 		},
 		{
+			// Scenario: Running out of file descriptors is transient (#49).
+			name:        "maildir check fails with EMFILE",
+			progress:    fetch.Progress{State: fetch.StateReady, Path: "/data/maildir"},
+			err:         fmt.Errorf("%w: open /data/maildir: %w", fetch.ErrTransient, syscall.EMFILE),
+			wantStatus:  http.StatusServiceUnavailable,
+			wantCode:    CodeUnavailable,
+			wantMessage: transientMessage,
+		},
+		{
+			// Shutdown wins over the transient error it is joined with.
+			name:        "shutting down joined with a transient error",
+			err:         errors.Join(fetch.ErrTransient, fetch.ErrClosed),
+			wantStatus:  http.StatusServiceUnavailable,
+			wantCode:    CodeUnavailable,
+			wantMessage: "the service is shutting down",
+		},
+		{
 			name:       "unexpected error",
 			err:        errors.New("boom"),
 			wantStatus: http.StatusInternalServerError,
@@ -137,6 +156,12 @@ func TestFetchHandler(t *testing.T) {
 			if tt.wantCode != "" {
 				if got := errorCode(t, rec); got != tt.wantCode {
 					t.Errorf("error code = %q, want %q", got, tt.wantCode)
+				}
+				if tt.wantMessage != "" {
+					errObj, _ := decodeBody(t, rec)["error"].(map[string]any)
+					if got := errObj["message"]; got != tt.wantMessage {
+						t.Errorf("error message = %q, want %q", got, tt.wantMessage)
+					}
 				}
 				return
 			}
