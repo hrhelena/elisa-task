@@ -118,14 +118,17 @@ The service connects to Postgres and applies the embedded migrations before it l
 |---|---|
 | `GET /healthz` | Liveness: `200 {"status":"ok"}` while the process serves HTTP |
 | `GET /readyz` | Readiness: `200 {"status":"ready"}`; `503` with the failing `checks` when a dependency check fails (2s timeout each; currently `postgres`, a ping), or `{"status":"shutting_down"}` during shutdown |
-| `GET /metrics` | Prometheus metrics: `enron_http_requests_total`, `enron_http_request_duration_seconds`, `enron_http_panics_total`, the `enron_fetch_*` metrics below, Go runtime and process metrics |
+| `GET /metrics` | Prometheus metrics: `enron_http_requests_total`, `enron_http_request_duration_seconds`, `enron_http_panics_total`, the `enron_fetch_*` and `enron_ingest_*` metrics below, Go runtime and process metrics |
 
 Every response carries an `X-Request-ID` header (a valid incoming one is reused). Errors from every endpoint use
 `{"error":{"code":"<snake_case>","message":"<text>"}}`; unknown routes return `404 not_found`, and a wrong method
 returns `405 method_not_allowed` with an `Allow` header. On `SIGINT`/`SIGTERM` the service drains in-flight
 requests, then closes its resources, and exits with status 0, or with 1 if draining exceeds `SHUTDOWN_TIMEOUT`.
 A second signal exits immediately. The worst-case shutdown takes `SHUTDOWN_DRAIN_DELAY` + `SHUTDOWN_TIMEOUT` + 5s,
-which must fit in the pod's `terminationGracePeriodSeconds`.
+which must fit in the pod's `terminationGracePeriodSeconds`. With the defaults that is 25s, within the 30s
+`stop_grace_period` in `compose.yaml` (the Kubernetes manifests of #12 should set at least that much). Of the final 5s, an ingestion
+run in progress takes at most 3s. Its workers stop at once, then it is recorded as failed with
+`interrupted: shutdown` and releases its lock.
 
 ## Getting the dataset: `POST /fetch`
 
@@ -162,3 +165,30 @@ directory is removed; leftovers from a crash are removed at startup.
 
 Metrics: `enron_fetch_bytes_total`, `enron_fetch_state{state}`, `enron_fetch_duration_seconds{result}`,
 `enron_fetch_entries_skipped_total{reason}`.
+
+## Ingestion engine
+
+The engine (`internal/ingest`) walks `$DATA_DIR/maildir` in lexical order and parses files on `INGEST_WORKERS`
+goroutines. One writer stores the messages in batches of `INGEST_BATCH_SIZE` rows, or after 1s. Every file is one
+message (ADR 0003); the row key is its relative path, so a re-run inserts only files not stored yet (ADR 0011).
+At most one run is active in the cluster (an advisory lock, ADR 0010). Counters are written to the run row every
+`INGEST_PROGRESS_INTERVAL` and at the end. Starting runs over HTTP (`POST /start`, `GET /status`) comes with #8.
+
+Bad entries never fail a run (ADR 0007). Skips are counted per reason: `empty_file`, `not_an_email`,
+`header_too_large`, `read_error` (including an unreadable directory, counted once), `not_regular_file` (symlinks,
+devices), `outside_mailbox` (a file at the maildir root), `parse_panic` and `parse_error`. Field errors such as
+`invalid_sender` and `invalid_date` are counted once per message, and the message is still stored. A run fails
+only when the process shuts down (`interrupted: shutdown`), when the ingest lock is lost (`lock_lost`, for example
+if its database session is killed), when the dataset root disappears, or when a batch insert still fails after
+3 retries with backoff (each attempt times out after 30s). A run whose process died is reported as failed with
+`interrupted`. `files_seen = messages_processed + messages_skipped` holds in every progress update, also for
+failed runs: a file counts as seen once it is skipped or stored. The dataset root itself must be a directory, not
+a symlink (the same rule as `POST /fetch`). One rare inaccuracy remains: if a batch commit succeeds but its
+answer is lost, the retry finds the rows already stored. `messages_inserted` then undercounts, while
+`messages_processed` and the stored rows stay exact.
+
+Measured on the full local dataset (517,401 files, MacBook with 10 cores, Postgres 16 in Docker): about 23 s,
+with no skipped files and a peak RSS of about 60 MiB.
+
+Metrics: `enron_ingest_files_total`, `enron_ingest_messages_total`, `enron_ingest_skipped_total{reason}`,
+`enron_ingest_field_errors_total{field}`, `enron_ingest_batch_duration_seconds`, `enron_ingest_running`.
