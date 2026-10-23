@@ -36,14 +36,14 @@ error naming the variable and exit with status 1.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `HTTP_ADDR` | `:8080` | HTTP listen address |
+| `HTTP_ADDR` | `:8080` | HTTP listen address, `[host]:port` with a numeric port |
 | `DATABASE_URL` | `postgres://enron:enron@localhost:5432/enron?sslmode=disable` | Postgres connection string |
 | `DATA_DIR` | `./Dataset` | Dataset root; the maildir is expected at `$DATA_DIR/maildir` |
 | `DATASET_URL` | `https://www.cs.cmu.edu/~enron/enron_mail_20150507.tar.gz` | Archive downloaded by `POST /fetch` (http or https) |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` (JSON logs on stdout) |
-| `SHUTDOWN_TIMEOUT` | `20s` | Upper bound for draining in-flight requests and closing resources |
+| `SHUTDOWN_TIMEOUT` | `20s` | Upper bound for draining in-flight requests (resources are then closed within a separate fixed 5s budget) |
 | `SHUTDOWN_DRAIN_DELAY` | `0s` | After `SIGTERM`, keep serving while `/readyz` reports `503` for this long before the listener closes (set a few seconds behind a load balancer) |
-| `INGEST_WORKERS` | number of CPUs | Parallel ingestion workers (>= 1) |
+| `INGEST_WORKERS` | number of CPUs (at most 256) | Parallel ingestion workers (1 to 256) |
 | `INGEST_BATCH_SIZE` | `2000` | Rows per insert batch (1 to 50000) |
 | `INGEST_PROGRESS_INTERVAL` | `5s` | How often ingestion progress is persisted |
 
@@ -58,4 +58,6 @@ error naming the variable and exit with status 1.
 Every response carries an `X-Request-ID` header (a valid incoming one is reused). Errors from every endpoint use
 `{"error":{"code":"<snake_case>","message":"<text>"}}`; unknown routes return `404 not_found`, and a wrong method
 returns `405 method_not_allowed` with an `Allow` header. On `SIGINT`/`SIGTERM` the service drains in-flight
-requests and exits with status 0, or with 1 if draining exceeds `SHUTDOWN_TIMEOUT`.
+requests, then closes its resources, and exits with status 0, or with 1 if draining exceeds `SHUTDOWN_TIMEOUT`.
+A second signal exits immediately. The worst-case shutdown takes `SHUTDOWN_DRAIN_DELAY` + `SHUTDOWN_TIMEOUT` + 5s,
+which must fit in the pod's `terminationGracePeriodSeconds`.

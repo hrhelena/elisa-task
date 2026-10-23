@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -239,6 +240,12 @@ type drainHarness struct {
 	done      chan error    // serve's result
 	cancel    context.CancelFunc
 	closeLogs []string
+	// closeCtxErrs is ctx.Err() as each closer saw it on entry.
+	closeCtxErrs []error
+	// slowDoneAtClose is whether the /slow handler had returned when each
+	// closer ran.
+	slowDoneAtClose []bool
+	slowReturned    atomic.Bool
 }
 
 func startDrainHarness(t *testing.T, slow func(w http.ResponseWriter, r *http.Request), opts shutdownOpts) *drainHarness {
@@ -255,6 +262,7 @@ func startDrainHarness(t *testing.T, slow func(w http.ResponseWriter, r *http.Re
 	mux.HandleFunc("GET /slow", func(w http.ResponseWriter, r *http.Request) {
 		once.Do(func() { close(h.inFlight) })
 		slow(w, r)
+		h.slowReturned.Store(true)
 	})
 	srv := newServer(mux, logger)
 
@@ -268,12 +276,17 @@ func startDrainHarness(t *testing.T, slow func(w http.ResponseWriter, r *http.Re
 	var cl closers
 	var mu sync.Mutex
 	for _, name := range []string{"db", "ingest"} {
-		cl.add(name, func(context.Context) error {
+		cl.add(name, func(ctx context.Context) error {
 			mu.Lock()
 			defer mu.Unlock()
 			h.closeLogs = append(h.closeLogs, name)
+			h.closeCtxErrs = append(h.closeCtxErrs, ctx.Err())
+			h.slowDoneAtClose = append(h.slowDoneAtClose, h.slowReturned.Load())
 			return nil
 		})
+	}
+	if opts.closeBudget == 0 {
+		opts.closeBudget = 5 * time.Second
 	}
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -408,7 +421,66 @@ func TestShutdownTimeoutIsAnError(t *testing.T) {
 	if got := strings.Join(h.closeLogs, ","); got != "ingest,db" {
 		t.Errorf("closers ran as %q, want them run even after a timeout", got)
 	}
+	// Closers get a fresh budget, not the expired drain context, and run only
+	// after the force-closed handler has returned.
+	for i, cerr := range h.closeCtxErrs {
+		if cerr != nil {
+			t.Errorf("closer %s got an already expired context: %v", h.closeLogs[i], cerr)
+		}
+		if !h.slowDoneAtClose[i] {
+			t.Errorf("closer %s ran while a handler was still running", h.closeLogs[i])
+		}
+	}
 	<-slow // The forced close ends the request.
+}
+
+// TestClosersWaitForSlowToStopHandlers: after a drain timeout, a handler that
+// takes a while to notice its canceled context is still waited for before the
+// closers release resources it may use.
+func TestClosersWaitForSlowToStopHandlers(t *testing.T) {
+	t.Parallel()
+
+	h := startDrainHarness(t, func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+		time.Sleep(300 * time.Millisecond) // e.g. finishing a DB write
+	}, shutdownOpts{timeout: 100 * time.Millisecond, closeBudget: 5 * time.Second})
+
+	slow := h.startSlowRequest(t.Context())
+	<-h.inFlight
+	h.cancel()
+
+	if err := <-h.done; !errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "waiting for handlers") {
+		t.Errorf("serve returned %v, want only the drain deadline error", err)
+	}
+	if len(h.slowDoneAtClose) != 2 || !h.slowDoneAtClose[0] || !h.slowDoneAtClose[1] {
+		t.Errorf("closers ran before the handler returned: %v", h.slowDoneAtClose)
+	}
+	<-slow
+}
+
+// TestHandlerIgnoringCancellationIsReported: a handler that ignores its
+// context for the whole close budget is reported, and the closers still run.
+func TestHandlerIgnoringCancellationIsReported(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	h := startDrainHarness(t, func(http.ResponseWriter, *http.Request) {
+		<-release // Ignores r.Context().
+	}, shutdownOpts{timeout: 50 * time.Millisecond, closeBudget: 200 * time.Millisecond})
+
+	slow := h.startSlowRequest(t.Context())
+	<-h.inFlight
+	h.cancel()
+
+	err := <-h.done
+	if err == nil || !strings.Contains(err.Error(), "waiting for handlers") {
+		t.Errorf("serve returned %v, want a waiting-for-handlers error", err)
+	}
+	if got := strings.Join(h.closeLogs, ","); got != "ingest,db" {
+		t.Errorf("closers ran as %q, want them run anyway", got)
+	}
+	close(release)
+	<-slow
 }
 
 func TestServeReturnsErrorWhenServerFails(t *testing.T) {
@@ -557,66 +629,145 @@ func TestBuildProducesStaticBinary(t *testing.T) {
 	}
 }
 
+// runningBinary is the service process started by startBinary.
+type runningBinary struct {
+	cmd      *exec.Cmd
+	logs     syncBuffer
+	listen   chan string   // listen_addr from the "listening" line
+	shutting chan struct{} // closed on the "shutting down" line
+	readDone chan struct{} // closed when stdout is closed
+}
+
+// startBinary starts the built service with a minimal environment (only env),
+// so settings from the developer's shell cannot change the outcome.
+func startBinary(t *testing.T, env ...string) *runningBinary {
+	t.Helper()
+	b := &runningBinary{
+		cmd:      exec.CommandContext(t.Context(), hostBinary(t)), //nolint:gosec // the binary is built by this test run.
+		listen:   make(chan string, 1),
+		shutting: make(chan struct{}),
+		readDone: make(chan struct{}),
+	}
+	b.cmd.Env = env
+	stdout, err := b.cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	if err := b.cmd.Start(); err != nil {
+		t.Fatalf("starting binary: %v", err)
+	}
+	go func() {
+		defer close(b.readDone)
+		var once sync.Once
+		sc := bufio.NewScanner(stdout)
+		for sc.Scan() {
+			line := sc.Bytes()
+			_, _ = b.logs.Write(append(line, '\n'))
+			var rec map[string]any
+			if json.Unmarshal(line, &rec) != nil {
+				continue
+			}
+			msg, _ := rec["msg"].(string)
+			switch {
+			case msg == "listening":
+				addr, _ := rec["listen_addr"].(string)
+				b.listen <- addr
+			case strings.HasPrefix(msg, "shutting down"):
+				once.Do(func() { close(b.shutting) })
+			}
+		}
+	}()
+	return b
+}
+
+// waitListening returns the bound address, failing if the binary does not
+// listen within 10s.
+func (b *runningBinary) waitListening(t *testing.T) string {
+	t.Helper()
+	select {
+	case addr := <-b.listen:
+		return addr
+	case <-b.readDone:
+		t.Fatalf("binary exited before listening:\n%s", b.logs.String())
+	case <-time.After(10 * time.Second):
+		t.Fatalf("binary did not log listening:\n%s", b.logs.String())
+	}
+	return ""
+}
+
+func (b *runningBinary) signal(t *testing.T) {
+	t.Helper()
+	if err := b.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("sending SIGTERM: %v", err)
+	}
+}
+
 // TestBinaryServesAndExitsCleanlyOnSIGTERM runs the real binary: it logs
 // JSON ("starting", then "listening"), serves /healthz, and on a real SIGTERM
 // shuts down and exits 0. It also covers the run half of "Build produces a
 // static binary" (#1), which now serves until signaled.
 func TestBinaryServesAndExitsCleanlyOnSIGTERM(t *testing.T) {
 	t.Parallel()
-	bin := hostBinary(t)
 
-	cmd := exec.CommandContext(t.Context(), bin) //nolint:gosec // bin is built by this test run.
-	cmd.Env = append(os.Environ(), "HTTP_ADDR=127.0.0.1:0")
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatalf("stdout pipe: %v", err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("starting binary: %v", err)
+	b := startBinary(t, "HTTP_ADDR=127.0.0.1:0")
+	addr := b.waitListening(t)
+	if code, body := get(t, newClient(), "http://"+addr+"/healthz"); code != http.StatusOK || !strings.Contains(body, `"ok"`) {
+		t.Errorf("GET /healthz = %d %q", code, body)
 	}
 
-	var (
-		logs     syncBuffer
-		listenCh = make(chan string, 1)
-		readDone = make(chan struct{})
-	)
-	go func() {
-		defer close(readDone)
-		sc := bufio.NewScanner(stdout)
-		for sc.Scan() {
-			line := sc.Bytes()
-			_, _ = logs.Write(append(line, '\n'))
-			var rec map[string]any
-			if json.Unmarshal(line, &rec) == nil && rec["msg"] == "listening" {
-				addr, _ := rec["listen_addr"].(string)
-				listenCh <- addr
-			}
+	b.signal(t)
+	<-b.readDone
+	if err := b.cmd.Wait(); err != nil {
+		t.Errorf("binary exited with %v, want status 0:\n%s", err, b.logs.String())
+	}
+	lines := decodeLogLines(t, []byte(b.logs.String()))
+	for _, msg := range []string{"starting", "listening", "stopped"} {
+		if findLog(lines, msg) == nil {
+			t.Errorf("no %q log line in:\n%s", msg, b.logs.String())
 		}
-	}()
+	}
+	select {
+	case <-b.shutting:
+	default:
+		t.Errorf("no shutting down log line in:\n%s", b.logs.String())
+	}
+}
+
+// TestBinarySecondSignalForcesExit: during a long drain, a second SIGTERM
+// kills the process at once instead of waiting for the graceful shutdown.
+func TestBinarySecondSignalForcesExit(t *testing.T) {
+	t.Parallel()
+
+	b := startBinary(t, "HTTP_ADDR=127.0.0.1:0", "SHUTDOWN_DRAIN_DELAY=1m")
+	b.waitListening(t)
+
+	b.signal(t)
+	select {
+	case <-b.shutting:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("binary did not start shutting down:\n%s", b.logs.String())
+	}
+	start := time.Now()
+	b.signal(t)
 
 	select {
-	case addr := <-listenCh:
-		if code, body := get(t, newClient(), "http://"+addr+"/healthz"); code != http.StatusOK || !strings.Contains(body, `"ok"`) {
-			t.Errorf("GET /healthz = %d %q", code, body)
-		}
-	case <-readDone:
-		t.Fatalf("binary exited before listening:\n%s", logs.String())
+	case <-b.readDone:
 	case <-time.After(10 * time.Second):
-		t.Fatalf("binary did not log listening:\n%s", logs.String())
+		t.Fatalf("second SIGTERM did not end the process:\n%s", b.logs.String())
 	}
-
-	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatalf("sending SIGTERM: %v", err)
+	err := b.cmd.Wait()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("exit = %v, want termination by signal", err)
 	}
-	<-readDone
-	if err := cmd.Wait(); err != nil {
-		t.Errorf("binary exited with %v, want status 0:\n%s", err, logs.String())
+	if ws, ok := exitErr.Sys().(syscall.WaitStatus); !ok || !ws.Signaled() || ws.Signal() != syscall.SIGTERM {
+		t.Errorf("exit = %v, want killed by SIGTERM", err)
 	}
-	lines := decodeLogLines(t, []byte(logs.String()))
-	for _, msg := range []string{"starting", "listening", "shutting down", "stopped"} {
-		if findLog(lines, msg) == nil {
-			t.Errorf("no %q log line in:\n%s", msg, logs.String())
-		}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("exit took %v after the second signal", elapsed)
+	}
+	if findLog(decodeLogLines(t, []byte(b.logs.String())), "stopped") != nil {
+		t.Error(`forced exit logged "stopped" as if the shutdown were graceful`)
 	}
 }
 
@@ -626,7 +777,7 @@ func TestBinaryInvalidConfigurationExitsWithStatus1(t *testing.T) {
 	bin := hostBinary(t)
 
 	cmd := exec.CommandContext(t.Context(), bin) //nolint:gosec // bin is built by this test run.
-	cmd.Env = append(os.Environ(), "INGEST_WORKERS=zero")
+	cmd.Env = []string{"INGEST_WORKERS=zero"}    // Minimal environment, see startBinary.
 	out, err := cmd.Output()
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {

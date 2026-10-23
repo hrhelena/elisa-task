@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,6 +29,12 @@ import (
 
 // HTTP server timeouts (ticket #3).
 const (
+	// closeBudget is the fresh time budget for releasing resources after the
+	// drain: waiting for force-closed handlers to return, then the closers.
+	// It is separate from SHUTDOWN_TIMEOUT so that a drain timeout never
+	// leaves the closers an expired context.
+	closeBudget = 5 * time.Second
+
 	readHeaderTimeout = 5 * time.Second
 	readTimeout       = 30 * time.Second
 	writeTimeout      = 30 * time.Second
@@ -36,6 +43,10 @@ const (
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// Restore default signal handling as soon as the first signal arrives, so
+	// a second SIGINT/SIGTERM kills the process at once instead of waiting
+	// for the graceful shutdown.
+	context.AfterFunc(ctx, stop)
 	code := run(ctx, os.LookupEnv, os.Stdout, nil)
 	stop()
 	os.Exit(code)
@@ -103,7 +114,11 @@ func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, onListen 
 		onListen(ln.Addr())
 	}
 
-	opts := shutdownOpts{timeout: cfg.ShutdownTimeout, drainDelay: cfg.ShutdownDrainDelay}
+	opts := shutdownOpts{
+		timeout:     cfg.ShutdownTimeout,
+		drainDelay:  cfg.ShutdownDrainDelay,
+		closeBudget: closeBudget,
+	}
 	if err := serve(ctx, srv, ln, readiness, cl, opts, logger); err != nil {
 		logger.Error("shutdown failed", slog.Any("err", err))
 		return 1
@@ -114,18 +129,26 @@ func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, onListen 
 
 // shutdownOpts tune graceful shutdown.
 type shutdownOpts struct {
-	// timeout bounds draining in-flight requests and running the closers.
+	// timeout bounds draining in-flight requests.
 	timeout time.Duration
 	// drainDelay is how long to keep serving, reporting not ready, before
 	// the listener closes.
 	drainDelay time.Duration
+	// closeBudget bounds what follows the drain, with a fresh deadline:
+	// waiting for force-closed handlers to return, then running the closers.
+	closeBudget time.Duration
 }
 
 // serve runs srv on ln until ctx is done or the server fails. On a signal it
 // marks the service not ready and keeps serving for opts.drainDelay (so
 // /readyz answers 503 and load balancers stop routing to it), then stops
-// accepting connections, drains in-flight requests and runs the closers
-// within opts.timeout. It returns nil only for a clean, timely shutdown.
+// accepting connections and drains in-flight requests within opts.timeout.
+// If the drain times out, it closes the remaining connections and waits for
+// their handlers to return. Closers run only after that, under a fresh
+// opts.closeBudget deadline, so they never release a resource (such as the DB
+// pool) that a handler is still using, unless a handler ignores its
+// canceled context for the whole budget; that is logged and reported. It
+// returns nil only for a clean, timely shutdown.
 func serve(
 	ctx context.Context,
 	srv *http.Server,
@@ -135,6 +158,8 @@ func serve(
 	opts shutdownOpts,
 	logger *slog.Logger,
 ) error {
+	var handlers inFlight
+	srv.Handler = handlers.track(srv.Handler)
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
 
@@ -147,7 +172,7 @@ func serve(
 		served = true
 		errs = append(errs, fmt.Errorf("serving: %w", err))
 	case <-ctx.Done():
-		logger.Info("shutting down",
+		logger.Info("shutting down (send the signal again to exit immediately)",
 			slog.Duration("drain_delay", opts.drainDelay), slog.Duration("timeout", opts.timeout))
 	}
 
@@ -168,7 +193,8 @@ func serve(
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		errs = append(errs, fmt.Errorf("draining HTTP server: %w", err))
-		// Shutdown gave up on active connections; cut them.
+		// Shutdown gave up on active connections; cut them. This cancels
+		// their request contexts but does not wait for their handlers.
 		_ = srv.Close()
 	}
 	if !served {
@@ -177,10 +203,47 @@ func serve(
 			errs = append(errs, fmt.Errorf("serving: %w", err))
 		}
 	}
-	if err := cl.closeAll(shutdownCtx, logger); err != nil {
+
+	closeCtx, cancelClose := context.WithTimeout(context.WithoutCancel(ctx), opts.closeBudget)
+	defer cancelClose()
+	if err := handlers.wait(closeCtx); err != nil {
+		logger.Error("handlers still running; closing resources anyway",
+			slog.Int64("handlers", handlers.active.Load()), slog.Any("err", err))
+		errs = append(errs, fmt.Errorf("waiting for handlers: %w", err))
+	}
+	if err := cl.closeAll(closeCtx, logger); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// inFlight counts running handlers. http.Server.Close does not wait for
+// handlers, so serve uses it to know when resources are no longer in use.
+type inFlight struct {
+	active atomic.Int64
+}
+
+func (f *inFlight) track(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.active.Add(1)
+		defer f.active.Add(-1)
+		h.ServeHTTP(w, r)
+	})
+}
+
+// wait polls until no handler runs or ctx ends. Polling keeps it simple; it
+// only runs once, during shutdown.
+func (f *inFlight) wait(ctx context.Context) error {
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for f.active.Load() > 0 {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%d handler(s) still running: %w", f.active.Load(), ctx.Err())
+		case <-tick.C:
+		}
+	}
+	return nil
 }
 
 // closer releases one resource on shutdown.
@@ -189,7 +252,9 @@ type closer struct {
 	close func(context.Context) error
 }
 
-// closers are run in reverse order of registration, like defers.
+// closers are run in reverse order of registration, like defers, once no
+// HTTP handler runs any more. They share one fresh context bounded by
+// closeBudget, even when the drain timed out.
 type closers []closer
 
 // add registers a closer; used by the DB (#4) and ingestion (#7) wiring.
