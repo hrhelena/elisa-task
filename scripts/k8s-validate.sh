@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Validates the Kubernetes manifests (#12): renders the base and both overlays with the pinned kustomize,
-# validates every resource against the Kubernetes JSON schema with kubeconform, and asserts the values that
-# the ticket's Gherkin scenarios and ADRs 0014/0015 fix, so a regression fails `make k8s-validate` and CI.
+# Validates the Kubernetes manifests (#12): renders the base and the overlays (kind, cloud, and the opt-in
+# kind-local-dataset variant of #40) with the pinned kustomize, validates every resource against the Kubernetes JSON
+# schema with kubeconform, and asserts the values that the tickets' Gherkin scenarios and ADRs 0014/0015 fix, so a
+# regression fails `make k8s-validate` and CI. It also checks the kind cluster configs that scripts/kind-up.sh uses.
 # All three tools are pinned in go.mod (tool directives) and run with `go tool`.
 #
 # Environment:
@@ -63,7 +64,7 @@ for tool in kustomize kubeconform yq; do
 done
 
 echo "== Render (kustomize $(go tool kustomize version))"
-for target in base overlays/kind overlays/cloud; do
+for target in base overlays/kind overlays/cloud overlays/kind-local-dataset; do
 	name=${target#overlays/}
 	if ! go tool kustomize build "deploy/k8s/$target" >"$out/$name.yaml"; then
 		fail "deploy/k8s/$target does not render"
@@ -79,7 +80,8 @@ if [[ -n "$KUBECONFORM_CACHE" ]]; then
 	kc_args+=(-cache "$KUBECONFORM_CACHE")
 fi
 # -strict rejects unknown fields; kubeconform exits non-zero on any invalid resource or missing schema.
-if ! go tool kubeconform "${kc_args[@]}" "$out/base.yaml" "$out/kind.yaml" "$out/cloud.yaml"; then
+if ! go tool kubeconform "${kc_args[@]}" "$out/base.yaml" "$out/kind.yaml" "$out/cloud.yaml" \
+	"$out/kind-local-dataset.yaml"; then
 	fail "kubeconform reported invalid resources"
 fi
 
@@ -89,11 +91,18 @@ ctr="$pod | .containers[] | select(.name == \"enron-service\")"
 cm='select(.kind == "ConfigMap" and .metadata.name == "enron-service-config")'
 pvc='select(.kind == "PersistentVolumeClaim" and .metadata.name == "enron-data")'
 
-# Checks that hold for the base and must survive both overlays unchanged.
-for name in base kind cloud; do
+# Checks that hold for the base and must survive every overlay unchanged (kind-local-dataset only replaces the
+# dataset volume; its own checks are below).
+for name in base kind cloud kind-local-dataset; do
 	f="$out/$name.yaml"
 	echo "== $name: shutdown and probe timing, hardening, topology"
-	expect "$name: namespace enron" "$f" '[.metadata.namespace // "enron"] | unique | join(",")' "enron"
+	expect "$name: namespace enron" "$f" '[select(.kind != "PersistentVolume") | .metadata.namespace // "enron"] | unique | join(",")' "enron"
+	expect "$name: Namespace enron enforces Pod Security restricted" "$f" \
+		'select(.kind == "Namespace" and .metadata.name == "enron") | .metadata.labels["pod-security.kubernetes.io/enforce"]' \
+		"restricted"
+	# "restricted" rejects hostPath volumes; catch one here rather than at admission time on a cluster.
+	expect "$name: no hostPath volume in any pod template" "$f" \
+		'[select(.spec.template.spec.volumes != null) | .spec.template.spec.volumes[] | select(has("hostPath"))] | length' "0"
 	expect "$name: env from ConfigMap enron-service-config" "$f" \
 		"$ctr | [.envFrom[].configMapRef.name | select(. != null)] | join(\",\")" "enron-service-config"
 	expect "$name: SHUTDOWN_DRAIN_DELAY 5s" "$f" "$cm | .data.SHUTDOWN_DRAIN_DELAY" "5s"
@@ -127,11 +136,14 @@ for name in base kind cloud; do
 
 	expect "$name: replicas 1" "$f" "$deploy | .spec.replicas" "1"
 	expect "$name: strategy Recreate" "$f" "$deploy | .spec.strategy.type" "Recreate"
-	expect "$name: PVC enron-data ReadWriteOnce" "$f" "$pvc | .spec.accessModes | join(\",\")" "ReadWriteOnce"
-	expect "$name: PVC enron-data 10Gi" "$f" "$pvc | .spec.resources.requests.storage" "10Gi"
-	expect "$name: PVC enron-data mounted at /data" "$f" \
-		"$pod as \$p | \$p.volumes[] | select(.persistentVolumeClaim.claimName == \"enron-data\") | .name as \$v | \$p.containers[0].volumeMounts[] | select(.name == \$v) | .mountPath" \
-		"/data"
+	if [[ "$name" != kind-local-dataset ]]; then
+		expect "$name: PVC enron-data ReadWriteOnce" "$f" "$pvc | .spec.accessModes | join(\",\")" "ReadWriteOnce"
+		expect "$name: PVC enron-data 10Gi" "$f" "$pvc | .spec.resources.requests.storage" "10Gi"
+		expect "$name: PVC enron-data mounted at /data" "$f" \
+			"$pod as \$p | \$p.volumes[] | select(.persistentVolumeClaim.claimName == \"enron-data\") | .name as \$v | \$p.containers[0].volumeMounts[] | select(.name == \$v) | .mountPath" \
+			"/data"
+		expect "$name: no PersistentVolume (dynamically provisioned)" "$f" '[select(.kind == "PersistentVolume")] | length' "0"
+	fi
 	expect "$name: runAsNonRoot" "$f" "$pod | .securityContext.runAsNonRoot" "true"
 	expect "$name: runAsUser 65532" "$f" "$pod | .securityContext.runAsUser" "65532"
 	expect "$name: fsGroup 65532" "$f" "$pod | .securityContext.fsGroup" "65532"
@@ -182,6 +194,72 @@ expect "cloud: references Secret enron-db" "$cloud" \
 	"$ctr | [.envFrom[].secretRef.name | select(. != null)] | join(\",\")" "enron-db"
 expect "cloud: PVC enron-data sets no storageClassName" "$cloud" "$pvc | (.spec | has(\"storageClassName\") | not)" "true"
 expect "cloud: registry image placeholder" "$cloud" "$ctr | .image" "REGISTRY/enron-service:VERSION"
+
+local="$out/kind-local-dataset.yaml"
+pv='select(.kind == "PersistentVolume" and .metadata.name == "enron-local-dataset")'
+lpvc='select(.kind == "PersistentVolumeClaim" and .metadata.name == "enron-local-dataset")'
+echo "== kind-local-dataset overlay (#40)"
+# Everything but the dataset volume is exactly overlays/kind: drop the PV/PVCs and the Deployment's "data" volume
+# and mount from both renders and compare the rest.
+same='[select(.kind != "PersistentVolumeClaim" and .kind != "PersistentVolume") | (select(.kind == "Deployment" and .metadata.name == "enron-service") |= (del(.spec.template.spec.volumes[] | select(.name == "data")) | del(.spec.template.spec.containers[].volumeMounts[] | select(.name == "data"))))] | sort_by(.kind + "/" + .metadata.name) | to_json(0)'
+if [[ "$(go tool yq eval-all "$same" "$kind")" == "$(go tool yq eval-all "$same" "$local")" ]]; then
+	ok "kind-local-dataset: identical to overlays/kind except the dataset volume"
+else
+	fail "kind-local-dataset: differs from overlays/kind beyond the dataset volume"
+fi
+expect "kind-local-dataset: no PVC enron-data" "$local" "[$pvc] | length" "0"
+expect "kind-local-dataset: PersistentVolumeClaims" "$local" \
+	'[select(.kind == "PersistentVolumeClaim") | .metadata.name] | join(",")' "enron-local-dataset"
+expect "kind-local-dataset: PV is cluster-scoped" "$local" "$pv | .metadata | has(\"namespace\") | not" "true"
+expect "kind-local-dataset: PV is a static local volume at /var/local/enron-dataset" "$local" "$pv | .spec.local.path" \
+	"/var/local/enron-dataset"
+expect "kind-local-dataset: PV ReadOnlyMany, Retain, no StorageClass" "$local" \
+	"$pv | (.spec.accessModes | join(\",\")) + \" \" + .spec.persistentVolumeReclaimPolicy + \" '\" + .spec.storageClassName + \"'\"" \
+	"ReadOnlyMany Retain ''"
+expect "kind-local-dataset: PV pinned to nodes labelled elisa-enron/local-dataset=true" "$local" \
+	"$pv | .spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0] | .key + \" \" + .operator + \" \" + (.values | join(\",\"))" \
+	"elisa-enron/local-dataset In true"
+expect "kind-local-dataset: PVC binds the PV by name, ReadOnlyMany, no StorageClass" "$local" \
+	"$lpvc | .spec.volumeName + \" \" + (.spec.accessModes | join(\",\")) + \" '\" + .spec.storageClassName + \"'\"" \
+	"enron-local-dataset ReadOnlyMany ''"
+expect "kind-local-dataset: pod volume data is the PVC, read-only" "$local" \
+	"$pod | .volumes[] | select(.name == \"data\") | .persistentVolumeClaim.claimName + \" \" + (.persistentVolumeClaim.readOnly | tostring)" \
+	"enron-local-dataset true"
+expect "kind-local-dataset: /data mounted read-only" "$local" \
+	"$ctr | .volumeMounts[] | select(.name == \"data\") | .mountPath + \" \" + (.readOnly | tostring)" "/data true"
+
+echo "== kind cluster configs (scripts/kind-up.sh)"
+# Default unchanged: without LOCAL_DATASET the tracked config is used as is.
+if PRINT_CONFIG=1 LOCAL_DATASET= scripts/kind-up.sh >"$out/kind-cluster.yaml" &&
+	cmp -s "$out/kind-cluster.yaml" deploy/kind/cluster.yaml; then
+	ok "kind config without LOCAL_DATASET is deploy/kind/cluster.yaml unchanged"
+else
+	fail "kind config without LOCAL_DATASET differs from deploy/kind/cluster.yaml"
+fi
+expect "kind config without LOCAL_DATASET has no extraMounts" deploy/kind/cluster.yaml \
+	'[.nodes[] | select(has("extraMounts"))] | length' "0"
+# With LOCAL_DATASET: a stand-in dataset directory, so the check does not depend on the developer's Dataset/.
+mkdir -p "$out/dataset/maildir"
+dataset=$(cd "$out/dataset" && pwd -P)
+if PRINT_CONFIG=1 LOCAL_DATASET="$out/dataset" scripts/kind-up.sh >"$out/kind-cluster-local.yaml"; then
+	cfg="$out/kind-cluster-local.yaml"
+	expect "kind config with LOCAL_DATASET: only extraMounts and labels added" "$cfg" \
+		'del(.nodes[0].extraMounts, .nodes[0].labels) | to_json(0)' \
+		"$(go tool yq eval 'to_json(0)' deploy/kind/cluster.yaml)"
+	expect "kind config with LOCAL_DATASET: mounts the dataset read-only at the PV's node path" "$cfg" \
+		'.nodes[0].extraMounts | length as $n | .[0] | ($n | tostring) + " " + .hostPath + " " + .containerPath + " " + (.readOnly | tostring)' \
+		"1 $dataset $(go tool yq eval-all "$pv | .spec.local.path" "$local") true"
+	expect "kind config with LOCAL_DATASET: node label matches the PV's nodeAffinity" "$cfg" \
+		".nodes[0].labels[\"$(go tool yq eval-all "$pv | .spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].key" "$local")\"]" \
+		"true"
+else
+	fail "scripts/kind-up.sh cannot render the LOCAL_DATASET config"
+fi
+if PRINT_CONFIG=1 LOCAL_DATASET="$out/no-such-dir" scripts/kind-up.sh >/dev/null 2>&1; then
+	fail "kind config with LOCAL_DATASET: a directory without maildir/ must be rejected"
+else
+	ok "kind config with LOCAL_DATASET: a directory without maildir/ is rejected"
+fi
 
 if ((fails > 0)); then
 	echo "k8s-validate: $fails check(s) failed" >&2

@@ -155,8 +155,9 @@ jobs:
       - name: Smoke test (image and compose stack)
         run: scripts/docker-smoke.sh
 
-  # Kubernetes manifests (#12): render the kustomize base and both overlays, validate them with kubeconform and
-  # assert the ticket's values (scripts/k8s-validate.sh). The kind deployment e2e is #13.
+  # Kubernetes manifests (#12, #40): render the kustomize base and the overlays (kind, cloud, kind-local-dataset),
+  # validate them with kubeconform, assert the tickets' values and check the kind cluster configs that
+  # scripts/kind-up.sh generates (scripts/k8s-validate.sh). The kind deployment e2e is #13.
   # Not named lint/test/itest: those are the required checks.
   manifests:
     name: manifests
@@ -192,7 +193,7 @@ jobs:
       # The Gherkin renders with `kubectl kustomize`; it must match the pinned kustomize used above.
       - name: kubectl kustomize renders the same output
         run: |
-          for overlay in kind cloud; do
+          for overlay in kind cloud kind-local-dataset; do
             CGO_ENABLED=0 go tool kustomize build "deploy/k8s/overlays/$overlay" > "/tmp/$overlay.pinned.yaml"
             kubectl kustomize "deploy/k8s/overlays/$overlay" > "/tmp/$overlay.kubectl.yaml"
             diff -u "/tmp/$overlay.pinned.yaml" "/tmp/$overlay.kubectl.yaml"

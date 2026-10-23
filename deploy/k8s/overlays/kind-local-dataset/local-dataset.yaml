@@ -1,0 +1,45 @@
+# The local Dataset/ as a statically provisioned, read-only volume (#40). The node path and the node label must
+# match NODE_PATH and NODE_LABEL in scripts/kind-up.sh; make k8s-validate checks that they do.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: enron-local-dataset
+  labels:
+    app.kubernetes.io/name: enron-local-dataset
+    app.kubernetes.io/part-of: enron
+spec:
+  capacity:
+    # Informational for a static local volume; the claim below requests the same.
+    storage: 10Gi
+  accessModes:
+    - ReadOnlyMany
+  # Retain: releasing the claim must never try to delete the developer's files.
+  persistentVolumeReclaimPolicy: Retain
+  # "" matches only claims that also ask for no class, so the default local-path provisioner never takes part.
+  storageClassName: ""
+  volumeMode: Filesystem
+  local:
+    path: /var/local/enron-dataset
+  # Required for `local` volumes: only the node created with the dataset mount has the path.
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: elisa-enron/local-dataset
+              operator: In
+              values: ["true"]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: enron-local-dataset
+  labels:
+    app.kubernetes.io/name: enron-local-dataset
+spec:
+  accessModes:
+    - ReadOnlyMany
+  storageClassName: ""
+  volumeName: enron-local-dataset
+  resources:
+    requests:
+      storage: 10Gi

@@ -3,8 +3,9 @@
 #   1. Tags $IMAGE with a content-derived tag (enron-service:dev-<image id>) and loads it into the kind node,
 #      so a rebuilt image changes the pod spec and rolls out; with a fixed "dev" tag and IfNotPresent, a
 #      re-deploy would keep running the old image.
-#   2. Renders deploy/k8s/overlays/kind with that image (a generated kustomization under .tools/), applies it,
-#      and waits for Postgres and the service to roll out.
+#   2. Renders the overlay with that image (a generated kustomization under .tools/), applies it, and waits for
+#      Postgres and the service to roll out. The overlay is deploy/k8s/overlays/kind, or, with LOCAL_DATASET set
+#      (any value but 0), deploy/k8s/overlays/kind-local-dataset, which mounts the local Dataset/ read-only (#40).
 # Always targets the context kind-$KIND_CLUSTER explicitly; never the current kube context.
 set -euo pipefail
 
@@ -16,6 +17,15 @@ CONTEXT="kind-$KIND_CLUSTER"
 IMAGE=${IMAGE:-enron-service:dev}
 NAMESPACE=enron
 ROLLOUT_TIMEOUT=${ROLLOUT_TIMEOUT:-180s}
+LOCAL_DATASET=${LOCAL_DATASET:-}
+# Keep in sync with NODE_PATH in scripts/kind-up.sh.
+NODE_PATH=/var/local/enron-dataset
+PV=enron-local-dataset
+
+overlay=kind
+if [[ -n "$LOCAL_DATASET" && "$LOCAL_DATASET" != 0 ]]; then
+	overlay=kind-local-dataset
+fi
 
 for bin in docker kind kubectl; do
 	command -v "$bin" >/dev/null || {
@@ -26,6 +36,26 @@ done
 if ! kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
 	echo "kind-deploy: kind cluster '$KIND_CLUSTER' does not exist; run 'make kind-up' first" >&2
 	exit 1
+fi
+
+if [[ "$overlay" == kind-local-dataset ]]; then
+	# Fail here rather than leave the pod Pending on a volume whose node path does not exist.
+	src=$(docker inspect --format "{{range .Mounts}}{{if eq .Destination \"$NODE_PATH\"}}{{.Source}}{{end}}{{end}}" \
+		"$KIND_CLUSTER-control-plane")
+	src=${src#/host_mnt} # Docker Desktop's file-sharing root
+	if [[ -z "$src" ]]; then
+		echo "kind-deploy: cluster '$KIND_CLUSTER' has no local dataset mount; recreate it with" \
+			"'make kind-down kind-up LOCAL_DATASET=1'" >&2
+		exit 1
+	fi
+	echo "kind-deploy: using the local dataset $src (read-only); POST /fetch is not needed"
+	# A Retain volume whose claim was deleted (e.g. the namespace) stays Released and never binds again; it holds
+	# no data of its own (the files are on the host), so recreate it.
+	phase=$(kubectl --context "$CONTEXT" get pv "$PV" -o jsonpath='{.status.phase}' --ignore-not-found)
+	if [[ "$phase" == Released ]]; then
+		echo "kind-deploy: PersistentVolume $PV is Released; recreating it (the host files are untouched)"
+		kubectl --context "$CONTEXT" delete pv "$PV" --wait=true
+	fi
 fi
 
 id=$(docker image inspect --format '{{.Id}}' "$IMAGE")
@@ -44,14 +74,14 @@ cat >"$work/kustomization.yaml" <<EOF
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - ../../deploy/k8s/overlays/kind
+  - ../../deploy/k8s/overlays/$overlay
 images:
   - name: enron-service
     newName: enron-service
     newTag: $tag
 EOF
 
-echo "kind-deploy: applying deploy/k8s/overlays/kind with image $ref to context $CONTEXT"
+echo "kind-deploy: applying deploy/k8s/overlays/$overlay with image $ref to context $CONTEXT"
 go tool kustomize build "$work" | kubectl --context "$CONTEXT" apply -f -
 kubectl --context "$CONTEXT" -n "$NAMESPACE" rollout status statefulset/postgres --timeout="$ROLLOUT_TIMEOUT"
 kubectl --context "$CONTEXT" -n "$NAMESPACE" rollout status deployment/enron-service --timeout="$ROLLOUT_TIMEOUT"

@@ -1,0 +1,53 @@
+# Opt-in kind variant (#40): the kind overlay, but /data is the developer's local Dataset/ mounted read-only, so the
+# dataset never has to be downloaded with POST /fetch. Use it with `make kind-up deploy LOCAL_DATASET=1`.
+#
+# How the host directory reaches the pod without a hostPath volume in the pod (the namespace enforces the
+# "restricted" Pod Security profile, which forbids hostPath):
+#   1. `make kind-up LOCAL_DATASET=1` (scripts/kind-up.sh) creates the cluster with a read-only kind extraMount of
+#      LOCAL_DATASET_DIR (the directory that contains maildir/) at /var/local/enron-dataset on the node, and labels
+#      the node elisa-enron/local-dataset=true. The host path only appears in a generated file under .tools/.
+#   2. local-dataset.yaml: a static `local` PersistentVolume for that node path (pinned to the labelled node), and
+#      the PVC enron-local-dataset bound to it by name (storageClassName "", so no provisioner takes part).
+#   3. The Deployment's volume "data" uses that PVC read-only, and /data is mounted read-only. The PVC replaces
+#      enron-data, which this variant removes so no unused 10Gi volume is provisioned.
+# Pod Security Admission only inspects the pod's volumes, and a persistentVolumeClaim volume is allowed under
+# "restricted" whatever backs the PersistentVolume.
+#
+# Read-only on three levels (kind extraMount, PVC volume, volumeMount). kubelet skips fsGroup ownership changes on a
+# read-only local volume, so the host files are never chowned. POST /fetch answers 200 "ready" because
+# /data/maildir exists, and writes nothing.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: enron
+
+resources:
+  - ../kind
+  - local-dataset.yaml
+
+patches:
+  - patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: enron-data
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: enron-service
+      spec:
+        template:
+          spec:
+            containers:
+              - name: enron-service
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+                    readOnly: true
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: enron-local-dataset
+                  readOnly: true
