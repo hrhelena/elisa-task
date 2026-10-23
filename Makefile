@@ -164,6 +164,13 @@ undeploy: ## Delete the kind overlay's resources from $(KIND_CLUSTER), including
 	@# The cluster-scoped PersistentVolume of the LOCAL_DATASET variant (Retain: the host files are never touched).
 	kubectl --context "$(KIND_CONTEXT)" delete persistentvolume enron-local-dataset --ignore-not-found --wait=true
 
+# End-to-end test (#13) on its own throwaway cluster, so it never touches the KIND_CLUSTER used for development.
+E2E_KIND_CLUSTER ?= elisa-enron-e2e
+
+.PHONY: e2e-kind
+e2e-kind: docker ## Build the image, then fetch, ingest and restart-test it on a throwaway kind cluster
+	IMAGE=$(IMAGE) KIND_CLUSTER=$(E2E_KIND_CLUSTER) scripts/kind-e2e.sh
+
 ##@ Help
 
 .PHONY: help

@@ -759,7 +759,34 @@ kind configs that `scripts/kind-up.sh` generates, it checks that the default is 
 and that the `LOCAL_DATASET` one only adds a read-only mount at the PersistentVolume's node path and the node label
 its node affinity selects. `kubectl kustomize` renders the same output as the pinned kustomize for every overlay (CI
 `manifests` job).
-<!-- #13 (kind end-to-end smoke test) adds its section here. -->
+
+### End-to-end test on kind
+
+`make e2e-kind` builds the image and runs `scripts/kind-e2e.sh`. It tests the real deployment path and the whole API
+on a throwaway cluster `elisa-enron-e2e` (`E2E_KIND_CLUSTER`), separate from the development cluster:
+
+1. It generates a fixture maildir of 58 files: 54 messages from 14 senders, some with a display name and an
+   upper-case address, plus one message without `From`, one with an unusable `From`, one empty file and one binary
+   file. It packs them as a tar.gz with the layout of the real archive.
+2. It creates the cluster as `make kind-up` does and deploys with `scripts/kind-deploy.sh`. It serves the tarball
+   from an in-cluster busybox `httpd` (pinned by digest, tarball in a ConfigMap) and sets the service's
+   `DATASET_URL` to it, so `POST /fetch` downloads and extracts it like the real archive.
+3. Through a port-forward on a free local port that kubectl picks (restarted if it dies), it checks that:
+   - `POST /fetch` returns 202, and `dataset.state` reaches `ready` with 58 files;
+   - `POST /start` returns 202, and `/status` reaches `finished: true` with exactly 56 processed, 2 skipped
+     (`empty_file`, `not_an_email`), 58 files seen and 2 field errors (`missing_sender`, `invalid_sender`);
+   - `/top-senders` returns the expected order, with ties broken by address in byte order (the ordering contract):
+     `mark.taylor@` comes before `mark_taylor@`. kind's Postgres already sorts in byte order, so this does not detect
+     a dropped `COLLATE "C"`; the store integration tests on ICU en-US databases cover that;
+   - after the `enron-service` pod is deleted and its replacement is ready, `/status` reports the same completed run
+     and `/top-senders` is unchanged;
+   - a second `POST /start` completes with the same totals and ranking (idempotent re-ingestion).
+
+The script fails if a cluster of that name already exists, because the counts are exact.
+`E2E_REUSE_CLUSTER=1` reuses one after deleting its `enron` namespace; it refuses `elisa-enron`. On exit the script
+deletes only a cluster it created (`E2E_KEEP_CLUSTER=1` keeps it). On failure, including Ctrl-C or SIGTERM, it
+prints the namespace's resources, pod descriptions, container logs and events, and reports FAIL. It needs Docker,
+kind, `kubectl`, `curl` and `jq`, and takes about 3 minutes.
 
 ## Development
 
@@ -794,7 +821,7 @@ make help        # every target
 | `kind-up`, `deploy`, `undeploy`, `kind-down` | The [kind](#local-cluster-with-kind) workflow (`LOCAL_DATASET=1` on `kind-up` and `deploy`: [local dataset](#local-dataset-opt-in)) |
 | `py-lock` | Re-resolve `requirements-dev.in` into the hashed lock |
 | `clean` | Remove build outputs (`bin/`) |
-<!-- #13 adds its `e2e-kind` target as a row here. -->
+| `e2e-kind` | Build the image, then run the [end-to-end test on kind](#end-to-end-test-on-kind) on a throwaway cluster |
 
 The image is built in two stages: a static binary (`CGO_ENABLED=0`, `-trimpath -s -w`, version from `VERSION`) on
 `gcr.io/distroless/static-debian12:nonroot`. It has no shell, runs as `65532:65532`, listens on 8080 and is about
@@ -820,7 +847,7 @@ For the AI agents that work on this repository, a Claude Code `PreToolUse` hook
 | Full dataset | `TestCorpus` (parser) and the `FullCorpus` ingestion test, skipped unless `ENRON_MAILDIR` is set | see [Results on the real dataset](#results-on-the-real-dataset) |
 | Image and compose | `scripts/docker-smoke.sh` | `make docker-smoke` |
 | Manifests | `scripts/k8s-validate.sh` | `make k8s-validate` |
-<!-- #13 adds the kind end-to-end test as a row here. -->
+| End to end on kind | `scripts/kind-e2e.sh`: fetch, ingest, exact counts, ranking, pod restart, re-ingestion against a generated fixture | `make e2e-kind` (needs Docker, kind, kubectl) |
 
 `-race` needs cgo. If your C toolchain cannot link (for example Xcode command line tools that do not match the
 macOS SDK), `CGO_ENABLED=0 go test -count=1 ./...` runs the same tests without the race detector; CI always uses
@@ -838,7 +865,7 @@ Makefile targets:
 | `itest` | `make itest` with testcontainers on the runner's Docker |
 | `docker` | Build the image with the GitHub Actions cache (never pushed), then `scripts/docker-smoke.sh` |
 | `manifests` | `make k8s-validate`, and a check that `kubectl kustomize` renders the same output as the pinned kustomize |
-<!-- #13 adds the kind e2e job as a row here. -->
+| `e2e-kind` | Install the pinned kind binary (checksum verified), build the image with the same cache, then `scripts/kind-e2e.sh` under `timeout 10m` (SIGTERM, so the diagnostics still print); export kind logs as an artifact if a cluster is left over. Not a required check |
 
 A new push to a branch or PR cancels that ref's older run. On `main` every commit gets its own full run, which is
 never cancelled. Third-party actions are pinned to commit SHAs.

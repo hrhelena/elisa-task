@@ -1,7 +1,7 @@
 # CI (ADR 0008): lint, unit tests with -race, integration tests with testcontainers, image build + smoke test,
-# Kubernetes manifest validation.
-# Every step goes through the Makefile (or, for docker, the script `make docker-smoke` runs), so CI runs what
-# developers run locally; the docker job builds with build-push-action only to use the GHA layer cache.
+# Kubernetes manifest validation, and an end-to-end test on kind.
+# Every step goes through the Makefile (or, for docker and e2e-kind, the script the make target runs), so CI runs what
+# developers run locally; the docker and e2e-kind jobs build with build-push-action only to use the GHA layer cache.
 # Job names (lint, test, itest) are stable so they can be required status checks.
 # Third-party actions are pinned to full commit SHAs; the comment gives the release tag.
 name: CI
@@ -157,7 +157,7 @@ jobs:
 
   # Kubernetes manifests (#12, #40): render the kustomize base and the overlays (kind, cloud, kind-local-dataset),
   # validate them with kubeconform, assert the tickets' values and check the kind cluster configs that
-  # scripts/kind-up.sh generates (scripts/k8s-validate.sh). The kind deployment e2e is #13.
+  # scripts/kind-up.sh generates (scripts/k8s-validate.sh). The kind deployment e2e is the e2e-kind job.
   # Not named lint/test/itest: those are the required checks.
   manifests:
     name: manifests
@@ -199,3 +199,85 @@ jobs:
             diff -u "/tmp/$overlay.pinned.yaml" "/tmp/$overlay.kubectl.yaml"
             echo "overlays/$overlay: kubectl $(kubectl version --client -o json | jq -r .kustomizeVersion) matches the pinned kustomize"
           done
+
+  # End-to-end on kind (#13): a throwaway cluster from deploy/kind/cluster.yaml (pinned node image), the image
+  # deployed with scripts/kind-deploy.sh, then POST /fetch of a small generated fixture served in-cluster, POST /start,
+  # exact /status counts, /top-senders order, a pod restart and a second ingestion (scripts/kind-e2e.sh). The script
+  # prints pod descriptions, logs and events when it fails. Not named lint/test/itest: those are the required checks.
+  e2e-kind:
+    name: e2e-kind
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      # kind v0.33.0 publishes the node image pinned in deploy/kind/cluster.yaml; kubectl matches its version.
+      KIND_VERSION: v0.33.0
+      KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+      KUBECTL_VERSION: v1.37.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # kind-deploy.sh renders the overlay with the pinned kustomize (go tool).
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - name: Install kind (pinned, checksum verified)
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSLo "$RUNNER_TEMP/bin/kind" \
+            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  $RUNNER_TEMP/bin/kind" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bin/kind"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Same build as the docker job; it only reads the GHA layer cache, which the docker job writes.
+      - name: Build image (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: enron-service:dev
+          build-args: |
+            VERSION=${{ github.event.pull_request.head.sha || github.sha }}
+            REVISION=${{ github.event.pull_request.head.sha || github.sha }}
+          cache-from: type=gha
+
+      # Bounded well below timeout-minutes, so that on a hang (a stalled image pull in kind create or kind load, for
+      # example) the script itself gets SIGTERM (timeout signals its whole process group) and its trap prints the
+      # diagnostics and FAIL before the runner kills the job. A normal run takes about 2.5 minutes after the build;
+      # 10m + 90s grace + about 2 minutes of setup stays below the 15-minute job timeout.
+      - name: End-to-end on kind (scripts/kind-e2e.sh)
+        run: timeout --signal=TERM --kill-after=90s 10m scripts/kind-e2e.sh
+        env:
+          KIND_CLUSTER: elisa-enron-e2e
+          IMAGE: enron-service:dev
+
+      # Normally the script deletes its cluster even on failure; one is left only if the script was killed. Then
+      # export the node and pod logs kind collects.
+      - name: Export kind logs if the cluster is still there
+        if: failure()
+        run: |
+          if kind get clusters 2>/dev/null | grep -x elisa-enron-e2e >/dev/null; then
+            kind export logs "$RUNNER_TEMP/kind-logs" --name elisa-enron-e2e
+          else
+            echo "no leftover cluster; the diagnostics are in the previous step's log"
+          fi
+
+      - name: Upload kind logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kind-logs
+          path: ${{ runner.temp }}/kind-logs
+          if-no-files-found: ignore
+          retention-days: 14
