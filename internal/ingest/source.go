@@ -50,13 +50,16 @@ func NewMaildirSource(root string) Source {
 	return &maildirSource{root: root}
 }
 
+// Available requires the root itself to be a directory, not a symlink to
+// one: the walk does not follow links, and POST /fetch treats a symlinked
+// maildir the same way (409 maildir_not_directory).
 func (s *maildirSource) Available() error {
-	fi, err := os.Stat(s.root)
+	fi, err := os.Lstat(s.root)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrDatasetMissing, err)
 	}
 	if !fi.IsDir() {
-		return fmt.Errorf("%w: %s is not a directory", ErrDatasetMissing, s.root)
+		return fmt.Errorf("%w: %s is not a directory (%s)", ErrDatasetMissing, s.root, fi.Mode().Type())
 	}
 	f, err := os.Open(s.root)
 	if err != nil {

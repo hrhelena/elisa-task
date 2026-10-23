@@ -45,6 +45,10 @@ const (
 	// It is separate from SHUTDOWN_TIMEOUT so that a drain timeout never
 	// leaves the closers an expired context.
 	closeBudget = 5 * time.Second
+	// ingestShutdownWrite bounds the ingestion run's final write and lock
+	// release on shutdown (#7). It must stay below closeBudget, which all
+	// closers share; the ingest closer runs first.
+	ingestShutdownWrite = 3 * time.Second
 
 	readHeaderTimeout = 5 * time.Second
 	readTimeout       = 30 * time.Second
@@ -175,13 +179,15 @@ func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, openStore
 	cl.add("fetch", fetcher.Close)
 
 	// The ingestion service owns a run in progress (ADR 0010). Its closer
-	// cancels the run and waits for it to be recorded as failed
-	// ("interrupted: shutdown") and to release the lock, before the pool
-	// closes. POST /start and GET /status are wired to it in #8.
+	// runs first: it cancels the workers at once, then records the run as
+	// failed ("interrupted: shutdown") and releases the lock within
+	// ingestShutdownWrite, which leaves the rest of closeBudget to the other
+	// closers. POST /start and GET /status are wired to it in #8.
 	ingester := ingest.NewService(ingest.NewMaildirSource(cfg.MaildirPath()), st, ingest.Config{
-		Workers:          cfg.IngestWorkers,
-		BatchSize:        cfg.IngestBatchSize,
-		ProgressInterval: cfg.IngestProgressInterval,
+		Workers:              cfg.IngestWorkers,
+		BatchSize:            cfg.IngestBatchSize,
+		ProgressInterval:     cfg.IngestProgressInterval,
+		ShutdownWriteTimeout: ingestShutdownWrite,
 	}, logger, reg)
 	cl.add("ingest", ingester.Close)
 

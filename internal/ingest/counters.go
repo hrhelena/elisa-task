@@ -8,7 +8,13 @@ import (
 )
 
 // counters are the in-memory progress counters of one run, shared by the
-// walker, the workers and the writer, and copied out for progress writes.
+// workers and the writer, and copied out for progress writes.
+//
+// An entry counts as seen when its outcome is recorded (skipped, or stored
+// with its batch), in the same critical section, so every snapshot, also
+// of a failed or interrupted run, has FilesSeen = MessagesProcessed +
+// MessagesSkipped (ADR 0007). Entries still in flight when a run stops are
+// not counted at all; the next run sees them again.
 type counters struct {
 	mu sync.Mutex
 	c  store.Counters
@@ -18,14 +24,9 @@ func newCounters() *counters {
 	return &counters{c: store.Counters{SkipReasons: map[string]int64{}, FieldErrors: map[string]int64{}}}
 }
 
-func (c *counters) fileSeen() {
-	c.mu.Lock()
-	c.c.FilesSeen++
-	c.mu.Unlock()
-}
-
 func (c *counters) skipped(reason string) {
 	c.mu.Lock()
+	c.c.FilesSeen++
 	c.c.MessagesSkipped++
 	c.c.SkipReasons[reason]++
 	c.mu.Unlock()
@@ -40,6 +41,7 @@ func (c *counters) fieldError(issue string) {
 // stored records a written batch: processed messages and newly inserted rows.
 func (c *counters) stored(processed, inserted int64) {
 	c.mu.Lock()
+	c.c.FilesSeen += processed
 	c.c.MessagesProcessed += processed
 	c.c.MessagesInserted += inserted
 	c.mu.Unlock()

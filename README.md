@@ -125,7 +125,10 @@ Every response carries an `X-Request-ID` header (a valid incoming one is reused)
 returns `405 method_not_allowed` with an `Allow` header. On `SIGINT`/`SIGTERM` the service drains in-flight
 requests, then closes its resources, and exits with status 0, or with 1 if draining exceeds `SHUTDOWN_TIMEOUT`.
 A second signal exits immediately. The worst-case shutdown takes `SHUTDOWN_DRAIN_DELAY` + `SHUTDOWN_TIMEOUT` + 5s,
-which must fit in the pod's `terminationGracePeriodSeconds`.
+which must fit in the pod's `terminationGracePeriodSeconds`. With the defaults that is 25s, within the 30s
+`stop_grace_period` in `compose.yaml` (the Kubernetes manifests of #12 should set at least that much). Of the final 5s, an ingestion
+run in progress takes at most 3s. Its workers stop at once, then it is recorded as failed with
+`interrupted: shutdown` and releases its lock.
 
 ## Getting the dataset: `POST /fetch`
 
@@ -177,7 +180,12 @@ devices), `outside_mailbox` (a file at the maildir root), `parse_panic` and `par
 `invalid_sender` and `invalid_date` are counted once per message, and the message is still stored. A run fails
 only when the process shuts down (`interrupted: shutdown`), when the ingest lock is lost (`lock_lost`, for example
 if its database session is killed), when the dataset root disappears, or when a batch insert still fails after
-3 retries with backoff. A run whose process died is reported as failed with `interrupted`.
+3 retries with backoff (each attempt times out after 30s). A run whose process died is reported as failed with
+`interrupted`. `files_seen = messages_processed + messages_skipped` holds in every progress update, also for
+failed runs: a file counts as seen once it is skipped or stored. The dataset root itself must be a directory, not
+a symlink (the same rule as `POST /fetch`). One rare inaccuracy remains: if a batch commit succeeds but its
+answer is lost, the retry finds the rows already stored. `messages_inserted` then undercounts, while
+`messages_processed` and the stored rows stay exact.
 
 Measured on the full local dataset (517,401 files, MacBook with 10 cores, Postgres 16 in Docker): about 23 s,
 with no skipped files and a peak RSS of about 60 MiB.

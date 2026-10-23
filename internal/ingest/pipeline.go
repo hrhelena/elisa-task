@@ -71,8 +71,7 @@ func (p *pipeline) run(ctx context.Context) error {
 
 func (p *pipeline) walk(ctx context.Context, jobs chan<- job) error {
 	err := p.s.src.Walk(ctx, func(rel string, open OpenFunc) error {
-		p.c.fileSeen()
-		p.s.m.files.Inc()
+		p.s.m.files.Inc() // the run's files_seen is counted at the entry's outcome (counters)
 		select {
 		case jobs <- job{rel: rel, open: open}:
 			return nil
@@ -217,13 +216,21 @@ func (p *pipeline) writeLoop(ctx context.Context, msgs <-chan store.Message) err
 }
 
 // writeBatch inserts one batch, retrying a failed insert MaxRetries times
-// with exponential backoff. Rows are keyed by source path, so a retry of a
-// batch that was in fact committed inserts nothing twice.
+// with exponential backoff. Each attempt is bounded by InsertTimeout, so an
+// unresponsive database fails the run after the retries instead of hanging.
+//
+// Rows are keyed by source path, so a retry of a batch that was in fact
+// committed (the commit's answer was lost) inserts nothing twice. Its rows
+// then count as processed but not as inserted by this run: in that rare case
+// messages_inserted is lower than the rows this run really wrote, while
+// messages_processed and the stored rows are exact.
 func (p *pipeline) writeBatch(ctx context.Context, batch []store.Message) error {
 	cfg := p.s.cfg
 	for attempt := 0; ; attempt++ {
 		start := time.Now()
-		inserted, err := p.s.st.InsertMessages(ctx, batch)
+		actx, cancel := context.WithTimeout(ctx, cfg.InsertTimeout)
+		inserted, err := p.s.st.InsertMessages(actx, batch)
+		cancel()
 		p.s.m.batchDuration.Observe(time.Since(start).Seconds())
 		if err == nil {
 			p.c.stored(int64(len(batch)), inserted)

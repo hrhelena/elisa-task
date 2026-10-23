@@ -25,6 +25,23 @@ type fakeStore struct {
 	// when an insert begins.
 	insertGate    chan struct{}
 	insertStarted chan struct{}
+	// insertBlocks makes every insert wait for its context (an unresponsive
+	// database that honors cancellation).
+	insertBlocks bool
+	// acquireBlocks makes AcquireIngestLock wait for its context.
+	acquireBlocks bool
+	// updateBlocks makes UpdateRunProgress wait for its context.
+	updateBlocks bool
+
+	closed   bool
+	acquires int            // successful AcquireIngestLock calls
+	finishes []finishRecord // every FinishRun call, accepted or not
+}
+
+type finishRecord struct {
+	state store.RunState
+	msg   string
+	err   error
 }
 
 func newFakeStore() *fakeStore { return &fakeStore{msgs: map[string]store.Message{}} }
@@ -59,13 +76,38 @@ func (l *fakeLock) end(err error) {
 	l.fs.mu.Unlock()
 }
 
+// Release ends the lock like store.Postgres: its Err wraps ErrLockReleased.
 func (l *fakeLock) Release(context.Context) error {
-	l.end(fmt.Errorf("%w: released", store.ErrLockNotHeld))
+	l.end(fmt.Errorf("%w: %w", store.ErrLockNotHeld, store.ErrLockReleased))
 	return nil
 }
 
-// lose simulates the lock's session dying.
+// lose simulates the lock's session dying: a real loss.
 func (l *fakeLock) lose() { l.end(fmt.Errorf("%w: lock connection lost", store.ErrLockNotHeld)) }
+
+// closeStore simulates store.Postgres.Close: the held lock ends with
+// ErrStoreClosed and the store refuses new locks.
+func (f *fakeStore) closeStore() {
+	f.mu.Lock()
+	f.closed = true
+	l := f.lock
+	f.mu.Unlock()
+	if l != nil {
+		l.end(fmt.Errorf("%w: %w", store.ErrLockNotHeld, store.ErrStoreClosed))
+	}
+}
+
+func (f *fakeStore) acquireCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.acquires
+}
+
+func (f *fakeStore) finishRecords() []finishRecord {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]finishRecord(nil), f.finishes...)
+}
 
 func (f *fakeStore) heldLock() *fakeLock {
 	f.mu.Lock()
@@ -73,19 +115,34 @@ func (f *fakeStore) heldLock() *fakeLock {
 	return f.lock
 }
 
-func (f *fakeStore) AcquireIngestLock(context.Context) (store.IngestLock, error) {
+func (f *fakeStore) AcquireIngestLock(ctx context.Context) (store.IngestLock, error) {
+	if f.acquireBlocks {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.closed {
+		return nil, fmt.Errorf("acquiring ingest lock: %w", store.ErrStoreClosed)
+	}
 	if f.lock != nil {
 		return nil, store.ErrLockHeld
 	}
+	f.acquires++
 	f.lock = &fakeLock{fs: f, done: make(chan struct{})}
 	return f.lock, nil
 }
 
-// held must be called with f.mu held.
+// held must be called with f.mu held. Like store.Postgres, an ended lock
+// reports why it ended.
 func (f *fakeStore) held(lock store.IngestLock) error {
-	if l, ok := lock.(*fakeLock); !ok || l != f.lock {
+	l, ok := lock.(*fakeLock)
+	if ok && l != f.lock {
+		if err := l.Err(); err != nil {
+			return err
+		}
+	}
+	if !ok || l != f.lock {
 		return fmt.Errorf("%w: not the held lock", store.ErrLockNotHeld)
 	}
 	return nil
@@ -118,6 +175,9 @@ func (f *fakeStore) run(id int64) (*store.Run, error) {
 }
 
 func (f *fakeStore) UpdateRunProgress(ctx context.Context, lock store.IngestLock, id int64, c store.Counters) error {
+	if f.updateBlocks {
+		<-ctx.Done()
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -137,12 +197,19 @@ func (f *fakeStore) UpdateRunProgress(ctx context.Context, lock store.IngestLock
 
 func (f *fakeStore) FinishRun(ctx context.Context, lock store.IngestLock, id int64, state store.RunState,
 	c store.Counters, errMsg *string,
-) error {
+) (err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	defer func() {
+		msg := ""
+		if errMsg != nil {
+			msg = *errMsg
+		}
+		f.finishes = append(f.finishes, finishRecord{state: state, msg: msg, err: err})
+	}()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	if err := f.held(lock); err != nil {
 		return err
 	}
@@ -188,6 +255,9 @@ func (f *fakeStore) InsertMessages(ctx context.Context, msgs []store.Message) (i
 	}
 	if f.insertGate != nil {
 		<-f.insertGate
+	}
+	if f.insertBlocks {
+		<-ctx.Done()
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err

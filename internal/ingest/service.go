@@ -44,6 +44,7 @@ const (
 var (
 	errShutdown      = errors.New(ErrorShutdown)
 	errLockLost      = errors.New(ErrorLockLost)
+	errLockReleased  = errors.New("interrupted: ingest lock released")
 	errRunNotRunning = errors.New("run is no longer running")
 )
 
@@ -71,7 +72,16 @@ type Config struct {
 	ProgressLogInterval time.Duration // INFO progress log; default 30s
 	MaxRetries          int           // retries of a failed batch insert; default 3
 	RetryBackoff        time.Duration // first retry delay, doubled each time; default 500ms
-	WriteTimeout        time.Duration // bounds each run-state write and the final write; default 10s
+	// InsertTimeout bounds one batch insert attempt, so an unresponsive
+	// database fails the run after the retries instead of hanging; default 30s.
+	InsertTimeout time.Duration
+	// WriteTimeout bounds each run-state write, and the final write of a run
+	// that ends on its own; default 10s.
+	WriteTimeout time.Duration
+	// ShutdownWriteTimeout bounds the final "interrupted: shutdown" write
+	// and the lock release after Close. It must fit in the caller's close
+	// budget (main gives all closers 5s); default 3s.
+	ShutdownWriteTimeout time.Duration
 }
 
 func (c Config) withDefaults() Config {
@@ -82,7 +92,9 @@ func (c Config) withDefaults() Config {
 	setDefault(&c.ProgressLogInterval, 30*time.Second)
 	setDefault(&c.MaxRetries, 3)
 	setDefault(&c.RetryBackoff, 500*time.Millisecond)
+	setDefault(&c.InsertTimeout, 30*time.Second)
 	setDefault(&c.WriteTimeout, 10*time.Second)
+	setDefault(&c.ShutdownWriteTimeout, 3*time.Second)
 	return c
 }
 
@@ -114,9 +126,13 @@ type Service struct {
 	life     context.Context
 	stopLife context.CancelCauseFunc
 
+	// mu guards closed and done. It is never held across a database call,
+	// so a slow Start never delays Close.
 	mu     sync.Mutex
 	closed bool
-	done   chan struct{} // non-nil while a run of this Service is active; closed when it ends
+	// done is non-nil from the moment Start claims the service until its
+	// run (or its failed start) has ended; it is closed then.
+	done chan struct{}
 }
 
 // NewService returns a Service. reg may be nil (metrics are not exported).
@@ -140,35 +156,70 @@ func NewService(src Source, st Store, cfg Config, logger *slog.Logger, reg prome
 // and ErrClosed after Close. A new run after a finished one re-walks the
 // dataset; files already stored are not inserted again (ADR 0011).
 func (s *Service) Start(ctx context.Context) (store.Run, error) {
+	done, err := s.claim()
+	if err != nil {
+		return store.Run{}, err
+	}
+	run, lock, err := s.begin(ctx)
+	if err != nil {
+		s.unclaim(done)
+		if s.life.Err() != nil {
+			return store.Run{}, errors.Join(ErrClosed, err)
+		}
+		return store.Run{}, err
+	}
+	// The run outlives the request: its context derives from s.life.
+	go s.execute(run, lock, done) //nolint:contextcheck // deliberately not the request context
+	return run, nil
+}
+
+// claim reserves the service for one Start, so that concurrent Starts in
+// this process do not race for the lock, and Close waits for the Start.
+func (s *Service) claim() (chan struct{}, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed || s.life.Err() != nil {
-		return store.Run{}, ErrClosed
+		return nil, ErrClosed
 	}
 	if s.done != nil {
-		return store.Run{}, ErrAlreadyRunning
+		return nil, ErrAlreadyRunning
 	}
+	s.done = make(chan struct{})
+	return s.done, nil
+}
+
+// unclaim ends a claim when its Start failed or its run ended.
+func (s *Service) unclaim(done chan struct{}) {
+	s.mu.Lock()
+	s.done = nil
+	s.mu.Unlock()
+	close(done)
+}
+
+// begin checks the dataset, takes the cluster-wide lock and starts a run.
+// Close cancels its database calls too.
+func (s *Service) begin(ctx context.Context) (store.Run, store.IngestLock, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(s.life, cancel) //nolint:contextcheck // Close must also cancel a pending Start
+	defer stop()
+
 	if err := s.src.Available(); err != nil {
-		return store.Run{}, err
+		return store.Run{}, nil, err
 	}
 	lock, err := s.st.AcquireIngestLock(ctx)
 	if errors.Is(err, store.ErrLockHeld) {
-		return store.Run{}, ErrAlreadyRunning
+		return store.Run{}, nil, ErrAlreadyRunning
 	}
 	if err != nil {
-		return store.Run{}, fmt.Errorf("acquiring ingest lock: %w", err)
+		return store.Run{}, nil, fmt.Errorf("acquiring ingest lock: %w", err)
 	}
 	run, err := s.st.BeginRun(ctx, lock)
 	if err != nil {
 		s.release(ctx, lock)
-		return store.Run{}, fmt.Errorf("beginning run: %w", err)
+		return store.Run{}, nil, fmt.Errorf("beginning run: %w", err)
 	}
-	done := make(chan struct{})
-	s.done = done
-	// The run outlives the request: its context derives from s.life.
-	go s.execute(run, lock, done) //nolint:contextcheck // deliberately not the request context
-
-	return run, nil
+	return run, lock, nil
 }
 
 // Status returns the state of the current or last run and the number of
@@ -189,9 +240,13 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 	return st, nil
 }
 
-// Close cancels a run in progress and waits, bounded by ctx, until it has
-// stopped, recorded itself as failed ("interrupted: shutdown") and released
-// the lock. Later calls to Start return ErrClosed.
+// Close cancels a run in progress (or a Start in flight) and waits, bounded
+// by ctx, until it has stopped, recorded itself as failed ("interrupted:
+// shutdown") and released the lock. Later calls to Start return ErrClosed.
+//
+// The workers stop at once (inserts in flight are canceled); the final write
+// and the lock release then take at most Config.ShutdownWriteTimeout, so a
+// ctx of ShutdownWriteTimeout plus about a second is enough.
 func (s *Service) Close(ctx context.Context) error {
 	s.stopLife(errShutdown)
 	s.mu.Lock()
@@ -212,12 +267,7 @@ func (s *Service) Close(ctx context.Context) error {
 // execute runs the pipeline of one run and records its outcome. It owns lock
 // and releases it before closing done.
 func (s *Service) execute(run store.Run, lock store.IngestLock, done chan struct{}) {
-	defer func() {
-		s.mu.Lock()
-		s.done = nil
-		s.mu.Unlock()
-		close(done)
-	}()
+	defer s.unclaim(done)
 	s.m.running.Set(1)
 	defer s.m.running.Set(0)
 
@@ -238,19 +288,32 @@ func (s *Service) execute(run store.Run, lock store.IngestLock, done chan struct
 	p := &pipeline{s: s, runID: run.ID, c: c, log: newSampler()}
 	workErr := p.run(runCtx)
 	close(stopMonitor)
-	<-monitorDone
 
 	state, msg := outcome(runCtx, workErr)
 	final := c.snapshot()
-	// The run context may be canceled; the last writes get a fresh budget.
-	finishCtx, cancelFinish := context.WithTimeout(context.WithoutCancel(runCtx), s.cfg.WriteTimeout)
+	// The run context may be canceled; the last writes get a fresh budget,
+	// a short one on shutdown so that it fits in the caller's close budget.
+	budget := s.cfg.WriteTimeout
+	if s.life.Err() != nil {
+		budget = s.cfg.ShutdownWriteTimeout
+	}
+	finishCtx, cancelFinish := context.WithTimeout(context.WithoutCancel(runCtx), budget)
 	defer cancelFinish()
+	// A progress write in flight was canceled with runCtx; the final write
+	// waits for it (on the lock's connection) within the same budget.
+	select {
+	case <-monitorDone:
+	case <-finishCtx.Done():
+	}
 	if err := s.finish(finishCtx, lock, run.ID, state, final, msg); err != nil {
 		log.Error("recording the end of the ingestion run failed", slog.Any("err", err))
 	}
+	// Release honors finishCtx: when it ends, the lock's socket is closed,
+	// which also ends a write still in flight, so the monitor returns.
 	if err := lock.Release(finishCtx); err != nil {
 		log.Warn("releasing the ingest lock failed", slog.Any("err", err))
 	}
+	<-monitorDone
 
 	attrs := append(counterAttrs(final),
 		slog.String("state", string(state)), slog.Duration("duration", time.Since(started)))
@@ -271,7 +334,8 @@ func outcome(runCtx context.Context, workErr error) (store.RunState, *string) {
 	msg := workErr.Error()
 	if runCtx.Err() != nil {
 		switch cause := context.Cause(runCtx); {
-		case errors.Is(cause, errShutdown), errors.Is(cause, errLockLost), errors.Is(cause, errRunNotRunning):
+		case errors.Is(cause, errShutdown), errors.Is(cause, errLockLost), errors.Is(cause, errLockReleased),
+			errors.Is(cause, errRunNotRunning):
 			msg = cause.Error()
 		}
 	}
@@ -297,8 +361,9 @@ func (s *Service) monitor(ctx context.Context, stop <-chan struct{}, cancel cont
 		case <-ctx.Done():
 			return
 		case <-lost:
-			log.Error("ingest lock lost, stopping the run", slog.Any("err", lock.Err()))
-			cancel(errLockLost)
+			err := lock.Err()
+			log.Error("ingest lock ended, stopping the run", slog.Any("err", err))
+			cancel(lockEndCause(err))
 			return
 		case <-report.C:
 			log.Info("ingestion progress", append(counterAttrs(c.snapshot()),
@@ -313,11 +378,35 @@ func (s *Service) monitor(ctx context.Context, stop <-chan struct{}, cancel cont
 }
 
 // lockLost returns a channel that is closed when the ingest lock is no
-// longer held (its session died, or the store was closed). It is the single
-// lock-loss signal of a run; a lost lock is also reported by the next run
-// write as ErrLockNotHeld.
+// longer held. It is the single lock-loss signal of a run; a lost lock is
+// also reported by the next run write as ErrLockNotHeld. lockEndCause tells
+// a real loss from a normal ending.
 func lockLost(lock store.IngestLock) <-chan struct{} {
 	return lock.Done()
+}
+
+// lockEndCause maps why the lock is no longer held (lock.Err, or an
+// ErrLockNotHeld from a run write) to the run's cancel cause. Only a real
+// loss, such as a dead session, is lock_lost. A closed store means the
+// process is shutting down (in main, the store closes after the engine, so
+// this only happens if the order is broken). A released lock means
+// someone released this run's lock early; neither is recorded as a loss.
+func lockEndCause(err error) error {
+	switch {
+	case errors.Is(err, store.ErrStoreClosed):
+		return errShutdown
+	case errors.Is(err, store.ErrLockReleased):
+		return errLockReleased
+	default:
+		return errLockLost
+	}
+}
+
+// lockWasLost reports whether a run write failed because the lock's session
+// was lost (as opposed to the lock being released or the store closed). Only
+// then may the lock be taken again to record the outcome.
+func lockWasLost(err error) bool {
+	return errors.Is(err, store.ErrLockNotHeld) && errors.Is(lockEndCause(err), errLockLost)
 }
 
 // writeProgress stores the counters. It returns a cancel cause if the run
@@ -325,17 +414,17 @@ func lockLost(lock store.IngestLock) <-chan struct{} {
 func (s *Service) writeProgress(ctx context.Context, lock store.IngestLock, id int64, c *counters,
 	log *slog.Logger,
 ) error {
-	// A write canceled mid-flight keeps the lock (#5), but it would lose this
-	// update; shutdown waits for it instead, within WriteTimeout.
-	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.WriteTimeout)
+	// Canceling a run write keeps the lock (#5): on shutdown the update in
+	// flight is dropped at once, and the final write carries the counters.
+	wctx, cancel := context.WithTimeout(ctx, s.cfg.WriteTimeout)
 	defer cancel()
 	err := s.st.UpdateRunProgress(wctx, lock, id, c.snapshot())
 	switch {
 	case err == nil:
 		return nil
 	case errors.Is(err, store.ErrLockNotHeld):
-		log.Error("ingest lock lost, stopping the run", slog.Any("err", err))
-		return errLockLost
+		log.Error("ingest lock not held, stopping the run", slog.Any("err", err))
+		return lockEndCause(err)
 	case errors.Is(err, store.ErrRunNotRunning):
 		log.Error("run no longer accepts progress, stopping it", slog.Any("err", err))
 		return errRunNotRunning
@@ -345,14 +434,15 @@ func (s *Service) writeProgress(ctx context.Context, lock store.IngestLock, id i
 	}
 }
 
-// finish records the final state. If the lock was lost, Postgres released
-// it with the session: unless another replica took it meanwhile, it is taken
-// again just to record the outcome, so the run does not stay "running".
+// finish records the final state. If the lock was lost (not released, and
+// not ended by closing the store), Postgres released it with the session:
+// unless another replica took it meanwhile, it is taken again just to record
+// the outcome, so the run does not stay "running".
 func (s *Service) finish(ctx context.Context, lock store.IngestLock, id int64, state store.RunState,
 	c store.Counters, msg *string,
 ) error {
 	err := s.st.FinishRun(ctx, lock, id, state, c, msg)
-	if !errors.Is(err, store.ErrLockNotHeld) {
+	if !errors.Is(err, store.ErrLockNotHeld) || !lockWasLost(lockErrOr(lock, err)) {
 		return err
 	}
 	again, aerr := s.st.AcquireIngestLock(ctx)
@@ -361,6 +451,15 @@ func (s *Service) finish(ctx context.Context, lock store.IngestLock, id int64, s
 	}
 	defer s.release(ctx, again)
 	return s.st.FinishRun(ctx, again, id, state, c, msg)
+}
+
+// lockErrOr returns lock.Err() if the lock has ended, else err. The lock's
+// own reason is the more precise one.
+func lockErrOr(lock store.IngestLock, err error) error {
+	if lerr := lock.Err(); lerr != nil {
+		return lerr
+	}
+	return err
 }
 
 // release releases lock with a fresh bounded context: ctx may already be
