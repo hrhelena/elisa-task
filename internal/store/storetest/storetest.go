@@ -5,8 +5,11 @@ package storetest
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -25,6 +28,8 @@ type Postgres struct {
 	*tcpostgres.PostgresContainer
 	// URL connects to the container's default database "enron".
 	URL string
+
+	dbSeq atomic.Int64 // names the databases made by CreateDatabase
 }
 
 // Start starts a Postgres container and waits until it accepts connections.
@@ -62,4 +67,26 @@ func (p *Postgres) Terminate() error {
 func (p *Postgres) Stop(ctx context.Context) error {
 	timeout := 5 * time.Second
 	return p.PostgresContainer.Stop(ctx, &timeout)
+}
+
+// CreateDatabase creates an empty database with a unique name in the
+// container and returns its connection string, so that a test can have data
+// of its own on a shared container. The database lives as long as the
+// container.
+func (p *Postgres) CreateDatabase(ctx context.Context) (string, error) {
+	name := fmt.Sprintf("test_%d", p.dbSeq.Add(1))
+	conn, err := pgx.Connect(ctx, p.URL)
+	if err != nil {
+		return "", fmt.Errorf("connecting to postgres: %w", err)
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	if _, err := conn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
+		return "", fmt.Errorf("creating database %s: %w", name, err)
+	}
+	u, err := url.Parse(p.URL)
+	if err != nil {
+		return "", fmt.Errorf("parsing connection string: %w", err)
+	}
+	u.Path = "/" + name
+	return u.String(), nil
 }

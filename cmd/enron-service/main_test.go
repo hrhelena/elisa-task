@@ -25,6 +25,7 @@ import (
 
 	"github.com/hrhelena/elisa-task/internal/config"
 	"github.com/hrhelena/elisa-task/internal/httpapi"
+	"github.com/hrhelena/elisa-task/internal/store"
 )
 
 // testEnvSetup, when set (by the integration-tagged file), prepares shared
@@ -89,6 +90,7 @@ func envLookup(env map[string]string) config.LookupFunc {
 type fakeStore struct {
 	checkErr atomic.Pointer[error] // nil -> healthy
 	closed   atomic.Bool
+	topLimit atomic.Int64 // limit of the last TopSenders call
 }
 
 func (*fakeStore) Name() string { return "postgres" }
@@ -103,6 +105,12 @@ func (f *fakeStore) Check(context.Context) error {
 func (f *fakeStore) Close() { f.closed.Store(true) }
 
 func (f *fakeStore) setCheckErr(err error) { f.checkErr.Store(&err) }
+
+// TopSenders returns one fixed sender and records the limit it was asked for.
+func (f *fakeStore) TopSenders(_ context.Context, limit int) ([]store.SenderCount, error) {
+	f.topLimit.Store(int64(limit))
+	return []store.SenderCount{{Email: "kay.mann@enron.com", Count: 5}}, nil
+}
 
 // fakeOpener returns an openStoreFunc that hands out st (or fails with
 // openErr) and records the URL it was called with.
@@ -306,6 +314,26 @@ func TestRunReadinessReflectsDatabase(t *testing.T) {
 	}
 	if !opener.st.closed.Load() {
 		t.Error("store was not closed on shutdown")
+	}
+}
+
+// GET /top-senders is wired to the store opened at startup. The real binary
+// against Postgres is TestBinaryTopSenders (integration).
+func TestRunServesTopSendersFromTheStore(t *testing.T) {
+	t.Parallel()
+
+	base, opener, cancel, done, out := startRun(t, map[string]string{"HTTP_ADDR": "127.0.0.1:0"})
+	want := `{"senders":[{"email":"kay.mann@enron.com","count":5}]}`
+	if code, body := get(t, newClient(), base+"/top-senders?limit=3"); code != http.StatusOK || strings.TrimSpace(body) != want {
+		t.Errorf("GET /top-senders = %d %q, want 200 %s", code, body, want)
+	}
+	if got := opener.st.topLimit.Load(); got != 3 {
+		t.Errorf("store TopSenders limit = %d, want 3", got)
+	}
+
+	cancel()
+	if code := <-done; code != 0 {
+		t.Errorf("exit code = %d, want 0:\n%s", code, out.String())
 	}
 }
 
