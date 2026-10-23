@@ -21,8 +21,8 @@ type Fetcher interface {
 	Start() (fetch.Progress, error)
 }
 
-// datasetJSON is the dataset progress as served by POST /fetch (and, with
-// #8, by the dataset section of GET /status).
+// datasetJSON is the dataset progress as served by POST /fetch and by the
+// dataset section of GET /status.
 type datasetJSON struct {
 	State           fetch.State `json:"state"`
 	Path            string      `json:"path"`

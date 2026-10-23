@@ -1,0 +1,15 @@
+{
+  "state": "failed",
+  "finished": false,
+  "messages_processed": 3,
+  "total_messages": 5,
+  "messages_skipped": 0,
+  "files_seen": 3,
+  "skip_reasons": {},
+  "field_errors": {},
+  "run_id": 2,
+  "started_at": "2026-10-23T10:00:00Z",
+  "finished_at": "2026-10-23T10:01:30Z",
+  "updated_at": "2026-10-23T10:01:30Z",
+  "error": "interrupted: shutdown"
+}

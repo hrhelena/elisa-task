@@ -1,0 +1,21 @@
+{
+  "state": "running",
+  "finished": false,
+  "messages_processed": 120345,
+  "total_messages": 120345,
+  "messages_skipped": 2,
+  "files_seen": 120347,
+  "skip_reasons": {
+    "empty_file": 1,
+    "not_an_email": 1
+  },
+  "field_errors": {
+    "invalid_date": 0,
+    "invalid_sender": 1
+  },
+  "run_id": 3,
+  "started_at": "2026-10-23T10:00:00Z",
+  "finished_at": null,
+  "updated_at": "2026-10-23T10:01:05Z",
+  "error": null
+}

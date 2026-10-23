@@ -22,8 +22,12 @@ type Deps struct {
 	// Senders backs GET /top-senders (#9). Nil means the route is not registered.
 	Senders SenderStats
 
-	// Feature dependencies (#8 Ingester and StatsReader) are added here and
-	// registered in routes.
+	// Ingester backs POST /start and GET /status (#8). Nil means neither
+	// route is registered.
+	Ingester Ingester
+	// Datasets fills the dataset section of GET /status (#10). Nil means
+	// the section is omitted.
+	Datasets DatasetReporter
 }
 
 // New returns the service's HTTP handler: every route, wrapped in the
@@ -87,12 +91,10 @@ func (rt *router) routes(deps Deps) {
 	if deps.Senders != nil {
 		rt.read("GET /top-senders", topSendersHandler(deps.Senders, rt.logger))
 	}
-
-	// Feature routes follow this shape (nil dependency, no route):
-	//
-	//	if deps.Ingester != nil {
-	//		rt.mutate("POST /start", startHandler(deps.Ingester))
-	//	}
+	if deps.Ingester != nil {
+		rt.mutate("POST /start", startHandler(deps.Ingester, rt.logger))
+		rt.read("GET /status", statusHandler(deps.Ingester, deps.Datasets, rt.logger))
+	}
 }
 
 // read registers a route that only reads state.
