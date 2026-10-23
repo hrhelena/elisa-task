@@ -2,33 +2,211 @@
 // serves email metrics over HTTP.
 //
 // This is the composition root: it is the only place that knows concrete
-// types (ADR 0009). Configuration, the HTTP server and graceful shutdown are
-// wired in here by later tickets.
+// types (ADR 0009). It loads the configuration, wires the HTTP server and
+// owns the process lifecycle, including graceful shutdown.
 package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+
+	"github.com/hrhelena/elisa-task/internal/config"
+	"github.com/hrhelena/elisa-task/internal/httpapi"
+)
+
+// HTTP server timeouts (ticket #3).
+const (
+	readHeaderTimeout = 5 * time.Second
+	readTimeout       = 30 * time.Second
+	writeTimeout      = 30 * time.Second
+	idleTimeout       = 120 * time.Second
 )
 
 func main() {
-	logger := newLogger(os.Stdout)
-	if err := run(context.Background(), logger); err != nil {
-		logger.Error("exiting", slog.Any("err", err))
-		os.Exit(1)
-	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	code := run(ctx, os.LookupEnv, os.Stdout, nil)
+	stop()
+	os.Exit(code)
 }
 
 // newLogger returns the service's structured JSON logger writing to w.
-func newLogger(w io.Writer) *slog.Logger {
-	return slog.New(slog.NewJSONHandler(w, nil)).With(slog.String("service", "enron-service"))
+func newLogger(w io.Writer, level slog.Level) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level})).
+		With(slog.String("service", "enron-service"))
 }
 
-// run is the testable body of main. It returns instead of exiting so that
-// deferred cleanup runs and tests can drive it.
-func run(ctx context.Context, logger *slog.Logger) error {
+// newRegistry returns the service's dedicated Prometheus registry (never the
+// global default one) with the Go runtime and process collectors.
+func newRegistry() *prometheus.Registry {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
+	return reg
+}
+
+// newServer returns the HTTP server with the service's timeouts.
+func newServer(handler http.Handler, logger *slog.Logger) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
+	}
+}
+
+// run is the testable body of main and returns the process exit code. It
+// serves until ctx is canceled (by SIGINT or SIGTERM in main), then shuts down
+// gracefully. onListen, if not nil, is called with the bound address once the
+// listener is open.
+func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, onListen func(net.Addr)) int {
+	cfg, err := config.LoadFrom(lookup)
+	if err != nil {
+		newLogger(out, slog.LevelInfo).ErrorContext(ctx, "invalid configuration", slog.Any("err", err))
+		return 1
+	}
+	logger := newLogger(out, cfg.LogLevel)
 	logger.InfoContext(ctx, "starting")
-	return nil
+
+	// Closers run in reverse registration order after the server has drained:
+	// #4 registers the DB pool, #7 the ingestion cancel.
+	var cl closers
+
+	readiness := httpapi.NewReadiness() // #4 adds the Postgres checker.
+	handler := httpapi.New(httpapi.Deps{Registry: newRegistry(), Readiness: readiness}, logger)
+	srv := newServer(handler, logger)
+
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", cfg.HTTPAddr)
+	if err != nil {
+		logger.ErrorContext(ctx, "listen failed", slog.String("addr", cfg.HTTPAddr), slog.Any("err", err))
+		return 1
+	}
+	logger.InfoContext(ctx, "listening",
+		slog.String("addr", cfg.HTTPAddr), slog.String("listen_addr", ln.Addr().String()))
+	if onListen != nil {
+		onListen(ln.Addr())
+	}
+
+	opts := shutdownOpts{timeout: cfg.ShutdownTimeout, drainDelay: cfg.ShutdownDrainDelay}
+	if err := serve(ctx, srv, ln, readiness, cl, opts, logger); err != nil {
+		logger.Error("shutdown failed", slog.Any("err", err))
+		return 1
+	}
+	logger.Info("stopped")
+	return 0
+}
+
+// shutdownOpts tune graceful shutdown.
+type shutdownOpts struct {
+	// timeout bounds draining in-flight requests and running the closers.
+	timeout time.Duration
+	// drainDelay is how long to keep serving, reporting not ready, before
+	// the listener closes.
+	drainDelay time.Duration
+}
+
+// serve runs srv on ln until ctx is done or the server fails. On a signal it
+// marks the service not ready and keeps serving for opts.drainDelay (so
+// /readyz answers 503 and load balancers stop routing to it), then stops
+// accepting connections, drains in-flight requests and runs the closers
+// within opts.timeout. It returns nil only for a clean, timely shutdown.
+func serve(
+	ctx context.Context,
+	srv *http.Server,
+	ln net.Listener,
+	readiness *httpapi.Readiness,
+	cl closers,
+	opts shutdownOpts,
+	logger *slog.Logger,
+) error {
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ln) }()
+
+	var errs []error
+	served := false // whether serveErr has been received
+	select {
+	case err := <-serveErr:
+		// The server stopped on its own (e.g. the listener failed); still
+		// release resources below.
+		served = true
+		errs = append(errs, fmt.Errorf("serving: %w", err))
+	case <-ctx.Done():
+		logger.Info("shutting down",
+			slog.Duration("drain_delay", opts.drainDelay), slog.Duration("timeout", opts.timeout))
+	}
+
+	readiness.SetShuttingDown()
+	if !served && opts.drainDelay > 0 {
+		drain := time.NewTimer(opts.drainDelay)
+		select {
+		case <-drain.C:
+		case err := <-serveErr:
+			served = true
+			errs = append(errs, fmt.Errorf("serving: %w", err))
+		}
+		drain.Stop()
+	}
+	// The parent context is already canceled; the drain gets its own deadline.
+	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), opts.timeout)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		errs = append(errs, fmt.Errorf("draining HTTP server: %w", err))
+		// Shutdown gave up on active connections; cut them.
+		_ = srv.Close()
+	}
+	if !served {
+		// Serve returns ErrServerClosed as soon as Shutdown closes the listener.
+		if err := <-serveErr; !errors.Is(err, http.ErrServerClosed) {
+			errs = append(errs, fmt.Errorf("serving: %w", err))
+		}
+	}
+	if err := cl.closeAll(shutdownCtx, logger); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// closer releases one resource on shutdown.
+type closer struct {
+	name  string
+	close func(context.Context) error
+}
+
+// closers are run in reverse order of registration, like defers.
+type closers []closer
+
+// add registers a closer; used by the DB (#4) and ingestion (#7) wiring.
+func (cs *closers) add(name string, fn func(context.Context) error) {
+	*cs = append(*cs, closer{name: name, close: fn})
+}
+
+// closeAll runs every closer, last registered first, even if earlier ones
+// fail, and joins their errors.
+func (cs closers) closeAll(ctx context.Context, logger *slog.Logger) error {
+	var errs []error
+	for i := len(cs) - 1; i >= 0; i-- {
+		c := cs[i]
+		if err := c.close(ctx); err != nil {
+			logger.ErrorContext(ctx, "closing failed", slog.String("closer", c.name), slog.Any("err", err))
+			errs = append(errs, fmt.Errorf("closing %s: %w", c.name, err))
+		}
+	}
+	return errors.Join(errs...)
 }
