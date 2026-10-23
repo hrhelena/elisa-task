@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -200,32 +201,53 @@ func TestStartHandlerIgnoresBody(t *testing.T) {
 	}
 }
 
+// skipReasons and fieldErrors return the maps the adapter in main serves for
+// a run: every known key, 0 unless overridden.
+func skipReasons(set map[string]int64) map[string]int64 {
+	m := map[string]int64{
+		"empty_file": 0, "not_an_email": 0, "header_too_large": 0, "read_error": 0,
+		"outside_mailbox": 0, "not_regular_file": 0, "parse_panic": 0, "parse_error": 0,
+	}
+	maps.Copy(m, set)
+	return m
+}
+
+func fieldErrors(set map[string]int64) map[string]int64 {
+	m := map[string]int64{
+		"invalid_sender": 0, "missing_sender": 0, "invalid_date": 0, "missing_date": 0,
+		"invalid_encoding": 0, "invalid_recipient": 0,
+	}
+	maps.Copy(m, set)
+	return m
+}
+
 // statusFixtures are the four states of GET /status, served from golden files.
 func statusFixtures() map[string]IngestionStatus {
 	updated := t0.Add(65 * time.Second).In(helsinki)
 	finished := t0.Add(90 * time.Second)
 	return map[string]IngestionStatus{
-		// Scenario: Status before any ingestion (maps from the ingester are nil).
+		// Scenario: Status before any ingestion (maps from the ingester are
+		// nil; the ticket's idle response has empty maps).
 		"idle": {State: StateIdle},
 		// Scenario: Status while running.
 		"running": {
 			State: StateRunning, RunID: ptr(int64(3)), StartedAt: &t0, UpdatedAt: &updated,
 			FilesSeen: 120347, MessagesProcessed: 120345, MessagesSkipped: 2, TotalMessages: 120345,
-			SkipReasons: map[string]int64{"empty_file": 1, "not_an_email": 1},
-			FieldErrors: map[string]int64{"invalid_sender": 1, "invalid_date": 0},
+			SkipReasons: skipReasons(map[string]int64{"empty_file": 1, "not_an_email": 1}),
+			FieldErrors: fieldErrors(map[string]int64{"invalid_sender": 1}),
 		},
 		// Scenario: Status after completion; Malformed files are reported.
 		"completed": {
 			State: StateCompleted, RunID: ptr(int64(3)), StartedAt: &t0, UpdatedAt: &finished, FinishedAt: &finished,
 			FilesSeen: 8, MessagesProcessed: 6, MessagesSkipped: 2, TotalMessages: 6,
-			SkipReasons: map[string]int64{"empty_file": 1, "not_an_email": 1},
-			FieldErrors: map[string]int64{"invalid_sender": 1, "invalid_date": 1},
+			SkipReasons: skipReasons(map[string]int64{"empty_file": 1, "not_an_email": 1}),
+			FieldErrors: fieldErrors(map[string]int64{"invalid_sender": 1, "invalid_date": 1}),
 		},
 		// Scenario: Failed run is not finished.
 		"failed": {
 			State: StateFailed, RunID: ptr(int64(2)), StartedAt: &t0, UpdatedAt: &finished, FinishedAt: &finished,
 			FilesSeen: 3, MessagesProcessed: 3, TotalMessages: 5,
-			SkipReasons: map[string]int64{}, FieldErrors: map[string]int64{},
+			SkipReasons: skipReasons(nil), FieldErrors: fieldErrors(nil),
 			Error: ptr("interrupted: shutdown"),
 		},
 	}
@@ -340,29 +362,38 @@ func TestStatusHandlerDatabaseDown(t *testing.T) {
 	}
 }
 
-// POST /start is in the mutating group (ADR 0005), GET /status is a read
-// route; without an Ingester neither is registered.
+// The production registration in routes puts POST /start and POST /fetch in
+// the mutating group (ADR 0005: where authorization goes) and GET /status in
+// the read group. The guard is installed before routes runs, so this checks
+// routes itself, not a re-registration; without an Ingester neither
+// ingestion route is registered.
 func TestIngestRoutes(t *testing.T) {
 	t.Parallel()
 	ing := &fakeIngester{run: IngestionRun{ID: 1, State: StateRunning, StartedAt: t0}}
-	api := newTestAPI(t, nil, func(rt *router) {
-		rt.mutating = append(rt.mutating, func(http.Handler) http.Handler {
-			return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				writeError(w, http.StatusForbidden, "forbidden", "admin only")
-			})
+	fetcher := &fakeFetcher{progress: fetch.Progress{State: fetch.StateReady}}
+	deps := Deps{Ingester: ing, Fetcher: fetcher}
+	logs := &syncBuffer{}
+	rt := newRouter(deps, slog.New(slog.NewJSONHandler(logs, nil)))
+	rt.mutating = append(rt.mutating, func(http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeError(w, http.StatusForbidden, "forbidden", "admin only")
 		})
-		rt.mutate("POST /start", startHandler(ing, rt.logger))
-		rt.read("GET /status", statusHandler(ing, nil, rt.logger))
 	})
-	if rec := api.do(t, http.MethodPost, "/start", nil); rec.Code != http.StatusForbidden || ing.starts != 0 {
-		t.Errorf("POST /start = %d (%d starts), want the mutating middleware to reject it", rec.Code, ing.starts)
+	rt.routes(deps)
+	guarded := &testAPI{handler: rt.handler(), logs: logs}
+
+	if rec := guarded.do(t, http.MethodPost, "/start", nil); rec.Code != http.StatusForbidden || ing.starts != 0 {
+		t.Errorf("POST /start = %d (%d starts), want 403 from the mutating middleware and no Start call", rec.Code, ing.starts)
 	}
-	if rec := api.do(t, http.MethodGet, "/status", nil); rec.Code != http.StatusOK {
+	if rec := guarded.do(t, http.MethodPost, "/fetch", nil); rec.Code != http.StatusForbidden || fetcher.calls.Load() != 0 {
+		t.Errorf("POST /fetch = %d (%d starts), want 403 from the mutating middleware and no Start call",
+			rec.Code, fetcher.calls.Load())
+	}
+	if rec := guarded.do(t, http.MethodGet, "/status", nil); rec.Code != http.StatusOK {
 		t.Errorf("GET /status = %d, want 200 (no mutating middleware)", rec.Code)
 	}
 
-	// The real registration in routes uses the same groups.
-	api = newIngestAPI(t, ing, nil)
+	api := newIngestAPI(t, ing, nil)
 	if rec := api.do(t, http.MethodGet, "/start", nil); rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("GET /start = %d, want 405", rec.Code)
 	}
