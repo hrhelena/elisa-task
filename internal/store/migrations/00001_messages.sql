@@ -1,15 +1,22 @@
 -- One row per maildir file (ADR 0003). Parsed headers only, no bodies (ADR 0002).
+--
+-- source_path and from_addr use COLLATE "C" (byte order). Their ordering is part
+-- of the contract: /top-senders breaks ties by address (ADR 0011), and the
+-- default collation differs by server (musl/alpine sorts bytes, glibc and ICU
+-- sort punctuation by locale rules), so ".ward@enron.com" (ADR 0012) would rank
+-- differently in kind and in a managed cloud database. "C" also makes the
+-- unique and sender index comparisons plain memcmp.
 
 -- +goose Up
 CREATE TABLE messages (
     id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    source_path    TEXT        NOT NULL UNIQUE,   -- relative to $DATA_DIR/maildir, e.g. "allen-p/_sent_mail/1."
+    source_path    TEXT        COLLATE "C" NOT NULL UNIQUE, -- relative to $DATA_DIR/maildir, e.g. "allen-p/_sent_mail/1."
     mailbox        TEXT        NOT NULL,          -- "allen-p"
     folder         TEXT        NOT NULL,          -- "_sent_mail", nested folders joined by "/", "" if none
     message_id     TEXT,
     sent_at        TIMESTAMPTZ,                   -- NULL when Date is missing or unparseable
     date_raw       TEXT,
-    from_addr      TEXT,                          -- normalized sender (ADR 0012); NULL when missing/invalid
+    from_addr      TEXT        COLLATE "C",       -- normalized sender (ADR 0012); NULL when missing/invalid
     from_raw       TEXT,
     x_from         TEXT,
     to_addrs       TEXT[]      NOT NULL DEFAULT '{}',

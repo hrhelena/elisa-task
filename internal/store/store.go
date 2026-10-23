@@ -25,7 +25,7 @@ type Message struct {
 
 	MessageID *string
 	DateRaw   *string
-	FromAddr  *string // normalized sender (ADR 0012); nil when missing or invalid
+	FromAddr  *string // normalized sender (ADR 0012); nil (or "") when missing or invalid, stored as NULL
 	FromRaw   *string
 	XFrom     *string
 	Subject   *string

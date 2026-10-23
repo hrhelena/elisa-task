@@ -153,6 +153,40 @@ func TestMessageRowNullables(t *testing.T) {
 	}
 }
 
+// An empty sender, including one that only becomes empty after sanitizing,
+// is stored as NULL so top senders excludes it (ADR 0011, 0012).
+func TestMessageRowEmptySenderIsNull(t *testing.T) {
+	t.Parallel()
+	fromAddr := slices.Index(messageColumns(), "from_addr")
+	tests := []struct {
+		name string
+		from *string
+		want *string
+	}{
+		{"nil", nil, nil},
+		{"empty", ptr(""), nil},
+		{"NUL only", ptr("\x00"), nil},
+		{"valid kept", ptr("a@enron.com"), ptr("a@enron.com")},
+		{"invalid UTF-8 is not empty", ptr("\xff"), ptr("�")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			row, err := messageRow(&Message{SourcePath: "a/b/1.", FromAddr: tt.from})
+			if err != nil {
+				t.Fatalf("messageRow: %v", err)
+			}
+			got := row[fromAddr].(*string)
+			switch {
+			case tt.want == nil && got != nil:
+				t.Errorf("from_addr = %q, want nil (NULL)", *got)
+			case tt.want != nil && (got == nil || *got != *tt.want):
+				t.Errorf("from_addr = %v, want %q", got, *tt.want)
+			}
+		})
+	}
+}
+
 func TestMessageRowRejectsInvalidMessages(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -161,6 +195,7 @@ func TestMessageRowRejectsInvalidMessages(t *testing.T) {
 		wantSub string
 	}{
 		{"empty source path", Message{Mailbox: "allen-p"}, "empty source path"},
+		{"source path empty after sanitizing", Message{SourcePath: "\x00\x00"}, "empty source path"},
 		{"short hash", Message{SourcePath: "a/b/1.", ContentSHA256: []byte{1, 2, 3}}, "3 bytes"},
 		{"long hash", Message{SourcePath: "a/b/1.", ContentSHA256: make([]byte, 33)}, "33 bytes"},
 	}

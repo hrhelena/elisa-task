@@ -84,11 +84,19 @@ func startPostgres(ctx context.Context) (*tcpostgres.PostgresContainer, error) {
 }
 
 // newDatabase creates an empty database for one test and returns its URL.
+//
+// The database uses the ICU en-US collation, not the image's default. The
+// alpine image (musl) sorts text in byte order, which would hide any query
+// whose result depends on the database collation; glibc servers (Debian,
+// RDS, Cloud SQL) and ICU sort punctuation by locale rules instead. Testing
+// under a locale-aware collation makes such dependencies fail here.
 func newDatabase(tb testing.TB) string {
 	tb.Helper()
 	name := fmt.Sprintf("test_%d", testEnv.dbSeq.Add(1))
 	ctx := context.Background()
-	if _, err := testEnv.admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
+	create := "CREATE DATABASE " + pgx.Identifier{name}.Sanitize() +
+		" TEMPLATE template0 ENCODING 'UTF8' LOCALE_PROVIDER icu ICU_LOCALE 'en-US' LOCALE 'C'"
+	if _, err := testEnv.admin.Exec(ctx, create); err != nil {
 		tb.Fatalf("creating database %s: %v", name, err)
 	}
 	tb.Cleanup(func() {
@@ -271,23 +279,33 @@ func TestDuplicatePathsWithinOneBatch(t *testing.T) {
 	}
 }
 
-// Concurrent writers with overlapping paths (parallel ingestion workers, or
-// two runs racing) must neither fail nor double-count.
+// Concurrent writers whose batches overlap, in opposite orders, must neither
+// fail nor double-count. Single-flight ingestion (ADR 0010) makes this rare,
+// but the merge inserts in source_path order, so overlapping batches take
+// their unique-index locks in the same order and cannot deadlock.
 func TestConcurrentInsertsWithOverlappingPaths(t *testing.T) {
 	t.Parallel()
 	s := openStore(t)
 	batch := make([]Message, 500)
 	for i := range batch {
-		batch[i] = msg(fmt.Sprintf("allen-p/inbox/%d.", i), "phillip.allen@enron.com")
+		batch[i] = msg(fmt.Sprintf("allen-p/inbox/%03d.", i), "phillip.allen@enron.com")
 	}
+	reversed := slices.Clone(batch)
+	slices.Reverse(reversed)
 
-	const writers = 4
+	const writers = 6
 	var total atomic.Int64
 	var wg sync.WaitGroup
 	errs := make(chan error, writers)
-	for range writers {
+	start := make(chan struct{})
+	for w := range writers {
+		mine := batch
+		if w%2 == 1 {
+			mine = reversed
+		}
 		wg.Go(func() {
-			n, err := s.InsertMessages(t.Context(), batch)
+			<-start
+			n, err := s.InsertMessages(t.Context(), mine)
 			if err != nil {
 				errs <- err
 				return
@@ -295,6 +313,7 @@ func TestConcurrentInsertsWithOverlappingPaths(t *testing.T) {
 			total.Add(n)
 		})
 	}
+	close(start)
 	wg.Wait()
 	close(errs)
 	for err := range errs {
@@ -444,6 +463,28 @@ func TestMissingSenderIsStoredAsNullAndExcludedFromTopSenders(t *testing.T) {
 	}
 }
 
+// An empty sender, or one that is empty after sanitizing, is "no sender":
+// stored as NULL and never ranked as "".
+func TestEmptySenderIsExcludedFromTopSenders(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+	empty, nul := msg("allen-p/inbox/1.", ""), msg("allen-p/inbox/2.", "")
+	empty.FromAddr, nul.FromAddr = ptr(""), ptr("\x00")
+	mustInsert(t, s, []Message{empty, nul, msg("allen-p/inbox/3.", "a@enron.com")})
+
+	want := []SenderCount{{Email: "a@enron.com", Count: 1}}
+	if got := mustTopSenders(t, s, 10); !slices.Equal(got, want) {
+		t.Errorf("TopSenders(10) = %v, want %v", got, want)
+	}
+	var nulls int
+	if err := s.pool.QueryRow(t.Context(), "SELECT count(*) FROM messages WHERE from_addr IS NULL").Scan(&nulls); err != nil {
+		t.Fatalf("counting NULL senders: %v", err)
+	}
+	if nulls != 2 {
+		t.Errorf("rows with NULL from_addr = %d, want 2", nulls)
+	}
+}
+
 // Scenario: Ties are ordered by address.
 func TestTopSendersTiesAreOrderedByAddress(t *testing.T) {
 	t.Parallel()
@@ -466,6 +507,44 @@ func TestTopSendersTiesAreOrderedByAddress(t *testing.T) {
 	want := []SenderCount{{"c@enron.com", 2}, {"a@enron.com", 1}, {"b@enron.com", 1}}
 	if got := mustTopSenders(t, s, 3); !slices.Equal(got, want) {
 		t.Errorf("TopSenders(3) = %v, want %v", got, want)
+	}
+}
+
+// Ties break in byte order (as Go's slices.Sort), whatever the database
+// collation: punctuation-leading addresses kept by ADR 0012 (".ward@") must
+// rank the same on alpine/musl, glibc and ICU servers. newDatabase uses ICU
+// en-US, under which locale-aware order would differ from byte order.
+func TestTopSendersTiesUseByteOrderRegardlessOfCollation(t *testing.T) {
+	t.Parallel()
+	s := openStore(t)
+
+	var provider string
+	if err := s.pool.QueryRow(t.Context(),
+		"SELECT datlocprovider::text FROM pg_database WHERE datname = current_database()").Scan(&provider); err != nil {
+		t.Fatalf("reading locale provider: %v", err)
+	}
+	if provider != "i" {
+		t.Fatalf("test database locale provider = %q, want ICU (i); the test could not detect collation dependence", provider)
+	}
+
+	addrs := []string{"ab@enron.com", "a_z@enron.com", "a@enron.com", ".ward@enron.com", "a.b@enron.com", "B@enron.com"}
+	msgs := make([]Message, len(addrs))
+	for i, a := range addrs {
+		msgs[i] = msg(fmt.Sprintf("x/inbox/%d.", i), a)
+	}
+	mustInsert(t, s, msgs)
+
+	sorted := slices.Clone(addrs)
+	slices.Sort(sorted) // byte order: ".ward@" < "B@" < "a.b@" < "a@" < "a_z@" < "ab@"
+	want := make([]SenderCount, len(sorted))
+	for i, a := range sorted {
+		want[i] = SenderCount{Email: a, Count: 1}
+	}
+	if got := mustTopSenders(t, s, 10); !slices.Equal(got, want) {
+		t.Errorf("TopSenders(10) =\n  %v\nwant byte order\n  %v", got, want)
+	}
+	if got := mustTopSenders(t, s, 1); !slices.Equal(got, want[:1]) {
+		t.Errorf("TopSenders(1) = %v, want %v", got, want[:1])
 	}
 }
 

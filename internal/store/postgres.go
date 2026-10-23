@@ -26,11 +26,15 @@ const (
 	// by the final INSERT. It lives for one transaction, in this session only.
 	createStagingSQL = "CREATE TEMP TABLE messages_staging ON COMMIT DROP AS SELECT " +
 		messageColumnList + " FROM messages WITH NO DATA"
+	// ORDER BY source_path makes every writer take unique-index locks in the
+	// same order, so concurrent batches with overlapping paths cannot
+	// deadlock (ON CONFLICT DO NOTHING waits on in-progress conflicting rows).
 	mergeStagingSQL = "INSERT INTO messages (" + messageColumnList + ") SELECT " + messageColumnList +
-		" FROM messages_staging ON CONFLICT (source_path) DO NOTHING"
+		" FROM messages_staging ORDER BY source_path ON CONFLICT (source_path) DO NOTHING"
 	countMessagesSQL = "SELECT count(*) FROM messages"
 	// Served by messages_from_addr_idx. Ties break on the address so the
-	// ranking is deterministic (ADR 0011).
+	// ranking is deterministic (ADR 0011); from_addr is COLLATE "C", so that
+	// order is byte order on every server, independent of its locale.
 	topSendersSQL = `SELECT from_addr, count(*) FROM messages WHERE from_addr IS NOT NULL
 GROUP BY from_addr ORDER BY count(*) DESC, from_addr ASC LIMIT $1`
 )
@@ -86,7 +90,9 @@ func (p *Postgres) Check(ctx context.Context) error {
 // staging table, then INSERT ... ON CONFLICT (source_path) DO NOTHING.
 // It returns the number of newly inserted rows. Paths that are already
 // stored, or repeated within msgs, are skipped without error, which makes
-// re-ingestion idempotent (ADR 0003, 0010). All text is sanitized first.
+// re-ingestion idempotent (ADR 0003, 0010). All text is sanitized first, so
+// two paths that differ only in invalid UTF-8 bytes map to the same key and
+// the second counts as already stored (maildir paths are ASCII in practice).
 func (p *Postgres) InsertMessages(ctx context.Context, msgs []Message) (inserted int64, err error) {
 	if len(msgs) == 0 {
 		return 0, nil
@@ -165,10 +171,12 @@ func messageColumns() []string {
 }
 
 // messageRow validates m and returns its sanitized column values in
-// messageColumnList order.
+// messageColumnList order. Validation runs on the sanitized values, which
+// are what gets stored.
 func messageRow(m *Message) ([]any, error) {
-	if m.SourcePath == "" {
-		return nil, fmt.Errorf("%w: empty source path", ErrInvalidMessage)
+	sourcePath := sanitizeString(m.SourcePath)
+	if sourcePath == "" {
+		return nil, fmt.Errorf("%w: empty source path (%q before sanitizing)", ErrInvalidMessage, m.SourcePath)
 	}
 	if n := len(m.ContentSHA256); n != 0 && n != 32 {
 		return nil, fmt.Errorf("%w: %q: content hash is %d bytes, want 32", ErrInvalidMessage, m.SourcePath, n)
@@ -181,14 +189,20 @@ func messageRow(m *Message) ([]any, error) {
 	if m.RunID != 0 {
 		runID = &m.RunID
 	}
+	// An empty sender is no sender: NULL, so it is excluded from top senders
+	// rather than ranked as "" (ADR 0011, 0012).
+	fromAddr := sanitizeOptional(m.FromAddr)
+	if fromAddr != nil && *fromAddr == "" {
+		fromAddr = nil
+	}
 	return []any{
-		sanitizeString(m.SourcePath),
+		sourcePath,
 		sanitizeString(m.Mailbox),
 		sanitizeString(m.Folder),
 		sanitizeOptional(m.MessageID),
 		m.SentAt,
 		sanitizeOptional(m.DateRaw),
-		sanitizeOptional(m.FromAddr),
+		fromAddr,
 		sanitizeOptional(m.FromRaw),
 		sanitizeOptional(m.XFrom),
 		sanitizeList(m.To),
