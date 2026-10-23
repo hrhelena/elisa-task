@@ -15,7 +15,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/signal"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -48,11 +47,10 @@ const (
 )
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	// Restore default signal handling as soon as the first signal arrives, so
-	// a second SIGINT/SIGTERM kills the process at once instead of waiting
-	// for the graceful shutdown.
-	context.AfterFunc(ctx, stop)
+	// The first SIGINT/SIGTERM starts the graceful shutdown; default handling
+	// is restored before ctx is canceled, so a second one kills the process
+	// at once instead of waiting for the graceful shutdown.
+	ctx, stop := notifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	code := run(ctx, os.LookupEnv, os.Stdout, openPostgres, nil)
 	stop()
 	os.Exit(code)
