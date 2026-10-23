@@ -18,4 +18,5 @@ supersedes it (see `.claude/skills/adr/SKILL.md`).
 | [0011](0011-http-api-contract-and-start-semantics.md) | HTTP API contract and /start semantics | Accepted | 2026-10-23 |
 | [0012](0012-lenient-sender-normalization.md) | Lenient sender normalization | Accepted | 2026-10-23 |
 | [0013](0013-goose-for-database-migrations.md) | Use goose v3 for database migrations | Accepted | 2026-10-23 |
-| [0014](0014-kubernetes-deployment-topology.md) | Kubernetes deployment topology: one replica, RWO dataset volume, Postgres StatefulSet in kind | Accepted | 2026-10-23 |
+| [0014](0014-kubernetes-deployment-topology.md) | Kubernetes deployment topology: one replica, RWO dataset volume, Postgres StatefulSet in kind | Accepted (amended by [0015](0015-dataset-volume-sized-for-inodes.md)) | 2026-10-23 |
+| [0015](0015-dataset-volume-sized-for-inodes.md) | Size the dataset volume at 10Gi for inode capacity | Accepted | 2026-10-23 |

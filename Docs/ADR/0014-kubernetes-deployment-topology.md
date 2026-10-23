@@ -1,6 +1,6 @@
 # 0014. Kubernetes deployment topology: one replica, RWO dataset volume, Postgres StatefulSet in kind
 
-- **Status:** Accepted
+- **Status:** Accepted. Amended by [0015](0015-dataset-volume-sized-for-inodes.md) (dataset PVC size only)
 - **Date:** 2026-10-23
 - **Author:** Helena Rivas (with product-owner agent)
 - **Deciders:** Helena Rivas
