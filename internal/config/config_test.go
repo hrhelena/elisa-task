@@ -35,7 +35,7 @@ func TestLoadDefaults(t *testing.T) {
 		LogLevel:               slog.LevelInfo,
 		ShutdownTimeout:        20 * time.Second,
 		ShutdownDrainDelay:     0,
-		IngestWorkers:          runtime.NumCPU(),
+		IngestWorkers:          min(runtime.NumCPU(), config.MaxIngestWorkers),
 		IngestBatchSize:        2000,
 		IngestProgressInterval: 5 * time.Second,
 	}
@@ -92,7 +92,7 @@ func TestLoadEmptyValueUsesDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadFrom: %v", err)
 	}
-	if cfg.HTTPAddr != ":8080" || cfg.IngestWorkers != runtime.NumCPU() {
+	if cfg.HTTPAddr != ":8080" || cfg.IngestWorkers != min(runtime.NumCPU(), config.MaxIngestWorkers) {
 		t.Errorf("empty values should fall back to defaults, got %+v", cfg)
 	}
 }
@@ -108,6 +108,13 @@ func TestLoadInvalid(t *testing.T) {
 		{"INGEST_WORKERS", "zero"},
 		{"INGEST_WORKERS", "0"},
 		{"INGEST_WORKERS", "-2"},
+		{"INGEST_WORKERS", "257"},
+		{"INGEST_WORKERS", "1000000"},
+		{"HTTP_ADDR", "8080"},
+		{"HTTP_ADDR", "localhost"},
+		{"HTTP_ADDR", ":http"},
+		{"HTTP_ADDR", ":70000"},
+		{"HTTP_ADDR", ":-1"},
 		{"INGEST_BATCH_SIZE", "0"},
 		{"INGEST_BATCH_SIZE", "50001"},
 		{"INGEST_BATCH_SIZE", "lots"},
@@ -135,6 +142,29 @@ func TestLoadInvalid(t *testing.T) {
 				t.Errorf("error %q does not name %s", err, tt.key)
 			}
 		})
+	}
+}
+
+func TestLoadAcceptedEdgeValues(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]string{
+		"HTTP_ADDR":      "127.0.0.1:0",
+		"INGEST_WORKERS": "256",
+	}
+	for key, value := range tests {
+		t.Run(key+"="+value, func(t *testing.T) {
+			t.Parallel()
+			if _, err := config.LoadFrom(lookupMap(map[string]string{key: value})); err != nil {
+				t.Errorf("%s=%q rejected: %v", key, value, err)
+			}
+		})
+	}
+	for _, addr := range []string{"[::1]:8080", "0.0.0.0:65535", ":8080"} {
+		cfg, err := config.LoadFrom(lookupMap(map[string]string{"HTTP_ADDR": addr}))
+		if err != nil || cfg.HTTPAddr != addr {
+			t.Errorf("HTTP_ADDR=%q: got %q, %v", addr, cfg.HTTPAddr, err)
+		}
 	}
 }
 

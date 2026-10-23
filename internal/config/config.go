@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -42,6 +43,8 @@ const (
 
 	// MaxIngestBatchSize is the upper bound for INGEST_BATCH_SIZE.
 	MaxIngestBatchSize = 50000
+	// MaxIngestWorkers is the upper bound for INGEST_WORKERS.
+	MaxIngestWorkers = 256
 )
 
 // Config holds every service setting. Later tickets only consume fields.
@@ -62,7 +65,7 @@ type Config struct {
 	// reporting not ready, after a shutdown signal and before it stops
 	// accepting connections (so load balancers can take it out of rotation).
 	ShutdownDrainDelay time.Duration
-	// IngestWorkers is the number of parallel ingestion workers (>= 1).
+	// IngestWorkers is the number of parallel ingestion workers (1..256).
 	IngestWorkers int
 	// IngestBatchSize is the number of rows per insert batch (1..50000).
 	IngestBatchSize int
@@ -92,14 +95,14 @@ func Load() (Config, error) {
 func LoadFrom(lookup LookupFunc) (Config, error) {
 	p := parser{lookup: lookup}
 	cfg := Config{
-		HTTPAddr:               p.str(EnvHTTPAddr, DefaultHTTPAddr),
+		HTTPAddr:               p.listenAddr(EnvHTTPAddr, DefaultHTTPAddr),
 		DatabaseURL:            p.str(EnvDatabaseURL, DefaultDatabaseURL),
 		DataDir:                p.str(EnvDataDir, DefaultDataDir),
 		DatasetURL:             p.httpURL(EnvDatasetURL, DefaultDatasetURL),
 		LogLevel:               p.level(EnvLogLevel, DefaultLogLevel),
 		ShutdownTimeout:        p.duration(EnvShutdownTimeout, DefaultShutdownTimeout),
 		ShutdownDrainDelay:     p.nonNegDuration(EnvShutdownDrainDelay, DefaultShutdownDrainDelay),
-		IngestWorkers:          p.intRange(EnvIngestWorkers, runtime.NumCPU(), 1, 0),
+		IngestWorkers:          p.intRange(EnvIngestWorkers, min(runtime.NumCPU(), MaxIngestWorkers), 1, MaxIngestWorkers),
 		IngestBatchSize:        p.intRange(EnvIngestBatchSize, DefaultIngestBatchSize, 1, MaxIngestBatchSize),
 		IngestProgressInterval: p.duration(EnvIngestProgressInterval, DefaultIngestProgressInterval),
 	}
@@ -130,6 +133,25 @@ func (p *parser) str(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// listenAddr accepts host:port with an optional host and a numeric port
+// (0 picks a free port), e.g. ":8080" or "127.0.0.1:0".
+func (p *parser) listenAddr(key, def string) string {
+	v, ok := p.get(key)
+	if !ok {
+		return def
+	}
+	_, port, err := net.SplitHostPort(v)
+	if err != nil {
+		p.fail(key, v, "must be host:port, e.g. :8080")
+		return def
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 0 || n > 65535 {
+		p.fail(key, v, "port must be a number from 0 to 65535")
+		return def
+	}
+	return v
 }
 
 func (p *parser) httpURL(key, def string) string {
@@ -191,7 +213,7 @@ func (p *parser) nonNegDuration(key string, def time.Duration) time.Duration {
 	return d
 }
 
-// intRange parses an integer in [lo, hi]; hi <= 0 means no upper bound.
+// intRange parses an integer in [lo, hi].
 func (p *parser) intRange(key string, def, lo, hi int) int {
 	v, ok := p.get(key)
 	if !ok {
@@ -203,7 +225,7 @@ func (p *parser) intRange(key string, def, lo, hi int) int {
 		p.fail(key, v, "must be an integer")
 	case n < lo:
 		p.fail(key, v, fmt.Sprintf("must be >= %d", lo))
-	case hi > 0 && n > hi:
+	case n > hi:
 		p.fail(key, v, fmt.Sprintf("must be <= %d", hi))
 	default:
 		return n
