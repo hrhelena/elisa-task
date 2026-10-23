@@ -120,6 +120,36 @@ func TestMaildirSourceAvailableUnreadableRoot(t *testing.T) {
 	}
 }
 
+// #45 review: a root swapped for a symlink between the Available check and
+// the walk fails the walk instead of completing with 0 files.
+func TestMaildirSourceWalkRootReplacedBySymlink(t *testing.T) {
+	t.Parallel()
+	root := filepath.Join(t.TempDir(), "maildir")
+	if err := os.Rename(smallMaildir(t), root); err != nil {
+		t.Fatal(err)
+	}
+	target := smallMaildir(t)
+	src := &maildirSource{root: root, afterCheck: func() {
+		if err := os.RemoveAll(root); err != nil {
+			t.Error(err)
+		}
+		if err := os.Symlink(target, root); err != nil {
+			t.Error(err)
+		}
+	}}
+	var visited int
+	err := src.Walk(t.Context(), func(string, OpenFunc) error { visited++; return nil })
+	if !errors.Is(err, ErrDatasetInvalid) || !errors.Is(err, ErrDatasetMissing) {
+		t.Fatalf("Walk = %v, want ErrDatasetInvalid", err)
+	}
+	if !strings.Contains(err.Error(), "dataset root is not usable: "+root+": it is a symlink") {
+		t.Errorf("Walk error = %q, want it to name the symlinked root", err)
+	}
+	if visited != 0 {
+		t.Errorf("visited %d entries, want 0", visited)
+	}
+}
+
 func mkdir(t *testing.T, path string) {
 	t.Helper()
 	if err := os.Mkdir(path, 0o755); err != nil { //nolint:gosec // test fixture.

@@ -208,7 +208,7 @@ Conventions for every endpoint:
 
 | Endpoint | Success | Errors |
 |---|---|---|
-| [`POST /fetch`](#post-fetch) | `200` dataset ready, `202` fetch running | `409 maildir_not_directory`, `500 data_dir_not_writable`, `500 internal`, `503 unavailable` |
+| [`POST /fetch`](#post-fetch) | `200` dataset ready, `202` fetch running | `409 maildir_not_directory`, `409 maildir_unreadable`, `500 data_dir_not_writable`, `500 internal`, `503 unavailable` |
 | [`POST /start`](#post-start) | `202` run started | `409 ingestion_running`, `409 dataset_missing`, `503 unavailable` |
 | [`GET /status`](#get-status) | `200` | `503 unavailable` |
 | [`GET /top-senders`](#get-top-senders) | `200` | `400 invalid_limit`, `503 unavailable` |

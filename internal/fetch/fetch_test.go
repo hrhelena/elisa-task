@@ -590,6 +590,47 @@ func TestFetch_SymlinkedMaildirRecovers(t *testing.T) {
 	}
 }
 
+// #45 review: an unreadable maildir is not ready (ingestion refuses it), so
+// /fetch and /status report it like a symlinked one; once readable, it is
+// ready.
+func TestFetch_UnreadableMaildir(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root reads any directory")
+	}
+	dataDir := t.TempDir()
+	maildir := filepath.Join(dataDir, MaildirName)
+	if err := os.Mkdir(maildir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(maildir, 0o700) }) //nolint:gosec // restore so TempDir cleanup works.
+	srv := newArchiveServer(t, serveBytes(sampleArchive(t)))
+	f, _ := newTestFetcher(t, dataDir, srv.URL, srv.Client())
+
+	const wantMsg = "maildir directory is not readable: "
+	if p := f.Progress(); p.State != StateAbsent || !strings.Contains(p.Error, wantMsg+maildir+": permission denied") {
+		t.Errorf("startup progress = %q %q, want absent with a permission error", p.State, p.Error)
+	}
+	p, err := f.Start()
+	if !errors.Is(err, ErrMaildirUnreadable) || errors.Is(err, ErrMaildirNotDirectory) {
+		t.Fatalf("Start error = %v, want ErrMaildirUnreadable", err)
+	}
+	if p.State != StateAbsent || p.Error != err.Error() {
+		t.Errorf("progress = %q %q, want absent with the error", p.State, p.Error)
+	}
+	if n := srv.requests.Load(); n != 0 {
+		t.Errorf("requests = %d, want 0", n)
+	}
+	assertNoTempDirs(t, dataDir)
+
+	if err := os.Chmod(maildir, 0o700); err != nil { //nolint:gosec // test fixture.
+		t.Fatal(err)
+	}
+	if p := f.Progress(); p.State != StateReady || p.Error != "" {
+		t.Errorf("after chmod: progress = %+v, want ready", p)
+	}
+}
+
 func symlink(t *testing.T, target, link string) {
 	t.Helper()
 	if err := os.Symlink(target, link); err != nil {

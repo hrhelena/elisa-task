@@ -13,6 +13,7 @@ import (
 const (
 	CodeDataDirNotWritable  = "data_dir_not_writable"
 	CodeMaildirNotDirectory = "maildir_not_directory"
+	CodeMaildirUnreadable   = "maildir_unreadable"
 )
 
 // Fetcher starts the dataset download (ADR 0004). Start must not block on the
@@ -65,6 +66,10 @@ func fetchHandler(f Fetcher, logger *slog.Logger) http.Handler {
 			// must remove the file before a fetch can succeed.
 			writeError(w, http.StatusConflict, CodeMaildirNotDirectory,
 				"$DATA_DIR/maildir exists but is not a directory (symlinks are not followed); remove it and retry")
+			return
+		case errors.Is(err, fetch.ErrMaildirUnreadable):
+			writeError(w, http.StatusConflict, CodeMaildirUnreadable,
+				"$DATA_DIR/maildir is a directory the service cannot read; fix its permissions or remove it and retry")
 			return
 		case errors.Is(err, fetch.ErrClosed):
 			writeError(w, http.StatusServiceUnavailable, CodeUnavailable, "the service is shutting down")

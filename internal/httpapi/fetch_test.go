@@ -103,6 +103,14 @@ func TestFetchHandler(t *testing.T) {
 			wantCode:   CodeMaildirNotDirectory,
 		},
 		{
+			// #45 review: an unreadable maildir is not ready either.
+			name:       "maildir is unreadable",
+			progress:   fetch.Progress{State: fetch.StateAbsent, Error: "maildir directory is not readable"},
+			err:        fmt.Errorf("%w: /data/maildir: permission denied", fetch.ErrMaildirUnreadable),
+			wantStatus: http.StatusConflict,
+			wantCode:   CodeMaildirUnreadable,
+		},
+		{
 			name:       "shutting down",
 			err:        fetch.ErrClosed,
 			wantStatus: http.StatusServiceUnavailable,

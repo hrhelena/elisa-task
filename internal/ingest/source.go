@@ -40,7 +40,7 @@ type InvalidRootError struct {
 }
 
 func (e *InvalidRootError) Error() string {
-	return fmt.Sprintf("%v: %s: %s", ErrDatasetInvalid, e.Path, e.Problem)
+	return fmt.Sprintf("dataset root is not usable: %s: %s", e.Path, e.Problem)
 }
 
 // Is reports whether target is ErrDatasetInvalid or ErrDatasetMissing.
@@ -71,6 +71,9 @@ type Source interface {
 // maildirSource walks a maildir tree on the local file system.
 type maildirSource struct {
 	root string
+	// afterCheck, if set, runs between Walk's Available check and the walk
+	// (tests use it to swap the root).
+	afterCheck func()
 }
 
 // NewMaildirSource returns a Source over the maildir at root
@@ -104,6 +107,17 @@ func (s *maildirSource) Available() error {
 	return nil
 }
 
+// rootReplaced is the error for a root that WalkDir found not to be a
+// directory after Available passed. Available is asked again for the precise
+// problem; if the root was swapped back meanwhile, the run still fails rather
+// than report a walk that never happened.
+func (s *maildirSource) rootReplaced(d fs.DirEntry) error {
+	if err := s.Available(); err != nil {
+		return err
+	}
+	return &InvalidRootError{Path: s.root, Problem: fmt.Sprintf("it changed during the walk (found %s)", d.Type())}
+}
+
 // pathErrText returns the cause of a *fs.PathError without the operation and
 // path, which the caller already names (for example "permission denied").
 func pathErrText(err error) string {
@@ -117,6 +131,9 @@ func (s *maildirSource) Walk(ctx context.Context, fn func(relPath string, open O
 	if err := s.Available(); err != nil {
 		return err
 	}
+	if s.afterCheck != nil {
+		s.afterCheck()
+	}
 	return filepath.WalkDir(s.root, func(path string, d fs.DirEntry, walkErr error) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -124,6 +141,12 @@ func (s *maildirSource) Walk(ctx context.Context, fn func(relPath string, open O
 		if path == s.root {
 			if walkErr != nil {
 				return fmt.Errorf("%w: %w", ErrDatasetMissing, walkErr)
+			}
+			if !d.IsDir() {
+				// Replaced (for example by a symlink) after the Available
+				// check: WalkDir would not descend, and the run would
+				// complete with 0 files.
+				return s.rootReplaced(d)
 			}
 			return nil
 		}
