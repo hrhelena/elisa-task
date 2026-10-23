@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -16,13 +17,30 @@ import (
 //go:embed migrations/*.sql
 var embeddedMigrations embed.FS
 
-// Migration session lock: retry every second for up to 5 minutes (goose's
-// default budget, polled more often so replicas that lose the race start
-// sooner once the winner is done).
+// Migration session lock: retry every second (polled more often than goose's
+// 5s default, so replicas that lose the race start sooner once the winner is
+// done). The number of attempts follows the caller's deadline, see
+// lockAttempts; without a deadline it is goose's default budget of 5 minutes.
 const (
-	migrationLockRetryPeriodSeconds = 1
-	migrationLockRetryAttempts      = 300
+	migrationLockRetryPeriod          = time.Second
+	migrationLockDefaultRetryAttempts = 300
 )
+
+// lockAttempts returns how many times to try the migration lock, one
+// migrationLockRetryPeriod apart, so that the wait ends with the caller's
+// deadline (the startup budget, DB_STARTUP_TIMEOUT) rather than being
+// configured for longer than the caller allows.
+func lockAttempts(ctx context.Context, now time.Time) uint64 {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return migrationLockDefaultRetryAttempts
+	}
+	remaining := deadline.Sub(now)
+	if remaining <= migrationLockRetryPeriod {
+		return 1
+	}
+	return uint64(remaining / migrationLockRetryPeriod)
+}
 
 // migrate applies all pending embedded migrations (ADR 0013). A Postgres
 // session-level advisory lock serializes concurrent callers, so replicas
@@ -33,7 +51,7 @@ func migrate(ctx context.Context, pool *pgxpool.Pool, logger *slog.Logger) error
 		return fmt.Errorf("opening embedded migrations: %w", err)
 	}
 	locker, err := lock.NewPostgresSessionLocker(
-		lock.WithLockTimeout(migrationLockRetryPeriodSeconds, migrationLockRetryAttempts),
+		lock.WithLockTimeout(uint64(migrationLockRetryPeriod/time.Second), lockAttempts(ctx, time.Now())),
 	)
 	if err != nil {
 		return fmt.Errorf("creating migration locker: %w", err)

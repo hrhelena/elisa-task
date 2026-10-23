@@ -28,10 +28,10 @@ import (
 	"github.com/hrhelena/elisa-task/internal/store"
 )
 
-// storeOpenTimeout bounds connecting to Postgres and applying migrations at
-// startup. Past it the process exits 1 and the orchestrator restarts it,
-// which also covers a database that is not up yet.
-const storeOpenTimeout = time.Minute
+// startupBackoff paces the database connection retries at startup (#27):
+// 250ms, 500ms, 1s, ... capped at 5s, each with jitter. DB_STARTUP_TIMEOUT
+// bounds the whole retry loop.
+var startupBackoff = backoff{initial: 250 * time.Millisecond, max: 5 * time.Second, jitter: randomJitter}
 
 // version is the build version, set at link time with
 // -ldflags "-X main.version=..." (the Dockerfile passes the VERSION build arg).
@@ -132,8 +132,10 @@ func newServer(handler http.Handler, logger *slog.Logger) *http.Server {
 // run is the testable body of main and returns the process exit code. It
 // serves until ctx is canceled (by SIGINT or SIGTERM in main), then shuts down
 // gracefully. openStore opens the database (connect and migrate) before the
-// server listens; failure exits 1. onListen, if not nil, is called with the
-// bound address once the listener is open.
+// server listens, retried while the database is unreachable for up to
+// DB_STARTUP_TIMEOUT; failure exits 1, and a signal during startup exits 0.
+// onListen, if not nil, is called with the bound address once the listener
+// is open.
 func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, openStore openStoreFunc, onListen func(net.Addr)) int {
 	cfg, err := config.LoadFrom(lookup)
 	if err != nil {
@@ -143,11 +145,18 @@ func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, openStore
 	logger := newLogger(out, cfg.LogLevel)
 	logger.InfoContext(ctx, "starting", slog.String("version", version))
 
-	openCtx, cancelOpen := context.WithTimeout(ctx, storeOpenTimeout)
-	st, err := openStore(openCtx, cfg.DatabaseURL, logger)
-	cancelOpen()
+	st, err := openDatabase(ctx, cfg, openStore, startupBackoff, logger)
+	if ctx.Err() != nil {
+		// A shutdown signal during startup is a clean stop, not a failure.
+		if err == nil {
+			st.Close()
+		}
+		logger.InfoContext(ctx, "stopped during startup")
+		return 0
+	}
 	if err != nil {
-		logger.ErrorContext(ctx, "opening database failed", slog.Any("err", err))
+		logger.ErrorContext(ctx, "opening database failed",
+			slog.Duration("timeout", cfg.DBStartupTimeout), slog.Any("err", err))
 		return 1
 	}
 

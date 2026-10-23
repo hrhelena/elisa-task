@@ -30,6 +30,7 @@ func TestLoadDefaults(t *testing.T) {
 	want := config.Config{
 		HTTPAddr:               ":8080",
 		DatabaseURL:            config.DefaultDatabaseURL,
+		DBStartupTimeout:       time.Minute,
 		DataDir:                "./Dataset",
 		DatasetURL:             "https://www.cs.cmu.edu/~enron/enron_mail_20150507.tar.gz",
 		LogLevel:               slog.LevelInfo,
@@ -56,6 +57,7 @@ func TestLoadOverrides(t *testing.T) {
 	cfg, err := config.LoadFrom(lookupMap(map[string]string{
 		"HTTP_ADDR":                "127.0.0.1:9000",
 		"DATABASE_URL":             "postgres://db.example:5432/x?sslmode=require",
+		"DB_STARTUP_TIMEOUT":       "3s",
 		"DATA_DIR":                 "/data",
 		"DATASET_URL":              "http://mirror.example/enron.tgz",
 		"LOG_LEVEL":                "DEBUG",
@@ -71,6 +73,7 @@ func TestLoadOverrides(t *testing.T) {
 	want := config.Config{
 		HTTPAddr:               "127.0.0.1:9000",
 		DatabaseURL:            "postgres://db.example:5432/x?sslmode=require",
+		DBStartupTimeout:       3 * time.Second,
 		DataDir:                "/data",
 		DatasetURL:             "http://mirror.example/enron.tgz",
 		LogLevel:               slog.LevelDebug,
@@ -124,6 +127,9 @@ func TestLoadInvalid(t *testing.T) {
 		{"SHUTDOWN_DRAIN_DELAY", "-1s"},
 		{"SHUTDOWN_DRAIN_DELAY", "soon"},
 		{"INGEST_PROGRESS_INTERVAL", "0s"},
+		{"DB_STARTUP_TIMEOUT", "0s"},
+		{"DB_STARTUP_TIMEOUT", "-5s"},
+		{"DB_STARTUP_TIMEOUT", "60"},
 		{"DATASET_URL", "ftp://example.com/x.tgz"},
 		{"DATASET_URL", "not a url"},
 	}
@@ -180,11 +186,13 @@ func TestLoadZeroDrainDelay(t *testing.T) {
 func TestLoadReportsEveryInvalidVariable(t *testing.T) {
 	t.Parallel()
 
-	_, err := config.LoadFrom(lookupMap(map[string]string{"INGEST_WORKERS": "zero", "LOG_LEVEL": "loud"}))
+	_, err := config.LoadFrom(lookupMap(map[string]string{
+		"INGEST_WORKERS": "zero", "LOG_LEVEL": "loud", "DB_STARTUP_TIMEOUT": "forever",
+	}))
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	for _, key := range []string{"INGEST_WORKERS", "LOG_LEVEL"} {
+	for _, key := range []string{"INGEST_WORKERS", "LOG_LEVEL", "DB_STARTUP_TIMEOUT"} {
 		if !strings.Contains(err.Error(), key) {
 			t.Errorf("error %q does not name %s", err, key)
 		}

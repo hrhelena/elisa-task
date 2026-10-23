@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -13,6 +14,11 @@ import (
 
 // checkerName is the readiness check name reported by /readyz (#3).
 const checkerName = "postgres"
+
+// pingTimeout bounds one connection attempt in Open, so a server that drops
+// packets (rather than refusing the connection) cannot use up the caller's
+// whole startup budget in a single attempt that the caller would retry.
+const pingTimeout = 5 * time.Second
 
 // messageColumnList is the single source of truth for the columns that
 // InsertMessages writes, in the order of the values built by messageRow.
@@ -49,8 +55,11 @@ var _ Store = (*Postgres)(nil)
 
 // Open connects to databaseURL and applies pending migrations before
 // returning, so a returned store always has the current schema. Pool
-// settings can be given in the URL (pool_max_conns and so on). Callers
-// should treat an error as fatal at startup.
+// settings can be given in the URL (pool_max_conns and so on).
+//
+// A connection failure wraps ErrUnreachable and may be retried; any other
+// error is permanent. ctx bounds the whole call, including the wait for the
+// migration lock (see migrate).
 func Open(ctx context.Context, databaseURL string, logger *slog.Logger) (*Postgres, error) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
@@ -60,9 +69,12 @@ func Open(ctx context.Context, databaseURL string, logger *slog.Logger) (*Postgr
 	if err != nil {
 		return nil, fmt.Errorf("creating connection pool: %w", err)
 	}
-	if err := pool.Ping(ctx); err != nil {
+	pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
+	err = pool.Ping(pingCtx)
+	cancel()
+	if err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("connecting to postgres: %w", err)
+		return nil, fmt.Errorf("connecting to postgres: %w: %w", ErrUnreachable, err)
 	}
 	if err := migrate(ctx, pool, logger); err != nil {
 		pool.Close()
