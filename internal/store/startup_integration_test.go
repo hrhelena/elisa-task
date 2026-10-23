@@ -42,6 +42,7 @@ func TestOpenRejectedConfigurationIsPermanent(t *testing.T) {
 		{"unknown role", with(func(u *url.URL) { u.User = url.UserPassword("nobody", "s3cret-typo") }), "28P01"},
 		{"missing database", with(func(u *url.URL) { u.Path = "/does_not_exist" }), "3D000"},
 		{"TLS required, server without TLS", with(func(u *url.URL) { u.RawQuery = "sslmode=require" }), "server refused TLS connection"},
+		{"no CONNECT privilege", noConnectURL(t), "42501"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -62,6 +63,17 @@ func TestOpenRejectedConfigurationIsPermanent(t *testing.T) {
 			}
 		})
 	}
+}
+
+// noConnectURL returns a URL for a role without CONNECT on its database
+// (#37): connecting fails with SQLSTATE 42501.
+func noConnectURL(t *testing.T) string {
+	t.Helper()
+	u, err := testEnv.pg.CreateDatabaseWithoutConnect(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
 }
 
 // The migration lock wait ends within the caller's budget (#27): while

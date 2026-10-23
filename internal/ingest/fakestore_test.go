@@ -32,10 +32,33 @@ type fakeStore struct {
 	acquireBlocks bool
 	// updateBlocks makes UpdateRunProgress wait for its context.
 	updateBlocks bool
+	// updateUntilLockEnds makes UpdateRunProgress ignore its context and
+	// wait until the lock ends, then return updateEndErr, or the lock's Err
+	// if that is nil: a write on a slow database that only the release (which
+	// closes the lock's connection) ends. updateStarted gets a value (if
+	// room) when such a write begins.
+	updateUntilLockEnds bool
+	updateEndErr        error
+	updateStarted       chan struct{}
+	// beginBlocks makes BeginRun wait for its context. beginStarted gets a
+	// value (if room) when BeginRun begins.
+	beginBlocks  bool
+	beginStarted chan struct{}
+	// releaseBlocks makes Release wait for its context, like a release
+	// stuck behind a slow write. releaseBudgets records the time each
+	// Release had left on its context (-1 without a deadline).
+	releaseBlocks  bool
+	releaseBudgets []time.Duration
 
 	closed   bool
 	acquires int            // successful AcquireIngestLock calls
 	finishes []finishRecord // every FinishRun call, accepted or not
+}
+
+func (f *fakeStore) releaseRecords() []time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]time.Duration(nil), f.releaseBudgets...)
 }
 
 type finishRecord struct {
@@ -77,7 +100,18 @@ func (l *fakeLock) end(err error) {
 }
 
 // Release ends the lock like store.Postgres: its Err wraps ErrLockReleased.
-func (l *fakeLock) Release(context.Context) error {
+func (l *fakeLock) Release(ctx context.Context) error {
+	budget := time.Duration(-1)
+	if deadline, ok := ctx.Deadline(); ok {
+		budget = time.Until(deadline)
+	}
+	l.fs.mu.Lock()
+	l.fs.releaseBudgets = append(l.fs.releaseBudgets, budget)
+	blocks := l.fs.releaseBlocks
+	l.fs.mu.Unlock()
+	if blocks {
+		<-ctx.Done()
+	}
 	l.end(fmt.Errorf("%w: %w", store.ErrLockNotHeld, store.ErrLockReleased))
 	return nil
 }
@@ -148,7 +182,15 @@ func (f *fakeStore) held(lock store.IngestLock) error {
 	return nil
 }
 
-func (f *fakeStore) BeginRun(_ context.Context, lock store.IngestLock) (store.Run, error) {
+func (f *fakeStore) BeginRun(ctx context.Context, lock store.IngestLock) (store.Run, error) {
+	if f.beginBlocks {
+		select {
+		case f.beginStarted <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return store.Run{}, ctx.Err()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.held(lock); err != nil {
@@ -177,6 +219,17 @@ func (f *fakeStore) run(id int64) (*store.Run, error) {
 func (f *fakeStore) UpdateRunProgress(ctx context.Context, lock store.IngestLock, id int64, c store.Counters) error {
 	if f.updateBlocks {
 		<-ctx.Done()
+	}
+	if l, ok := lock.(*fakeLock); ok && f.updateUntilLockEnds {
+		select {
+		case f.updateStarted <- struct{}{}:
+		default:
+		}
+		<-l.Done()
+		if f.updateEndErr != nil {
+			return f.updateEndErr
+		}
+		return l.Err()
 	}
 	if err := ctx.Err(); err != nil {
 		return err

@@ -100,7 +100,8 @@ The service connects to Postgres and applies the embedded migrations before it l
   logging each retry at `WARN` as `database not ready, retrying` with the attempt number and the error. The password
   is never logged.
 - A server that answers but rejects the configuration is not retried: a wrong password or other authorization
-  failure (SQLSTATE class `28`), a missing database (`3D000`), or a TLS failure (for example `sslmode=require`
+  failure (SQLSTATE class `28`), a missing database (`3D000`), a missing privilege such as `CONNECT` on the
+  database (`42501`), or a TLS failure (for example `sslmode=require`
   against a server without TLS, or a certificate that does not verify). When one connect makes several attempts
   (several hosts, or TLS then plaintext with `sslmode` unset, `prefer` or `allow`), it counts as permanent only if
   every attempt was rejected this way; a refused TLS attempt followed by "starting up" is retried.
@@ -127,8 +128,9 @@ requests, then closes its resources, and exits with status 0, or with 1 if drain
 A second signal exits immediately. The worst-case shutdown takes `SHUTDOWN_DRAIN_DELAY` + `SHUTDOWN_TIMEOUT` + 5s,
 which must fit in the pod's `terminationGracePeriodSeconds`. With the defaults that is 25s, within the 30s
 `stop_grace_period` in `compose.yaml` (the Kubernetes manifests of #12 should set at least that much). Of the final 5s, an ingestion
-run in progress takes at most 3s. Its workers stop at once, then it is recorded as failed with
-`interrupted: shutdown` and releases its lock.
+run in progress normally takes at most 3s: its workers stop at once, then it is recorded as failed with
+`interrupted: shutdown` and releases its lock. A slow database can extend this by up to 5s; in that case the final
+write is cut off, and the run is reported as `interrupted` by the crashed-owner path (ADR 0010).
 
 ## Getting the dataset: `POST /fetch`
 

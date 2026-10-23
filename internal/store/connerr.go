@@ -16,6 +16,9 @@ const (
 	sqlstateClassInvalidAuthorization = "28"
 	// sqlstateInvalidCatalogName (3D000): the database does not exist.
 	sqlstateInvalidCatalogName = "3D000"
+	// sqlstateInsufficientPrivilege (42501): the role may not use the
+	// database, for example it lacks CONNECT on it. A grant is needed.
+	sqlstateInsufficientPrivilege = "42501"
 )
 
 // pgconnRefusedTLS is the exact text of pgconn's error when the server
@@ -38,7 +41,7 @@ const pgconnRefusedTLS = "server refused TLS connection"
 // down (57P01, 57P02), out of connections (53300), unresolvable or slow are
 // transient. A server that was reached but rejects the configuration is
 // permanent: an authorization failure (class 28), a missing database
-// (3D000), or a TLS setup failure (refused, or the certificate does not
+// (3D000), a missing privilege such as CONNECT (42501), or a TLS setup failure (refused, or the certificate does not
 // verify). Anything else defaults to transient, so an unknown hiccup cannot
 // fail a start that a retry would have saved.
 func isTransientConnectError(err error) bool {
@@ -72,7 +75,8 @@ func isTransientConnectError(err error) bool {
 func classifyNode(err error) (permanent, decided bool) {
 	switch e := err.(type) { //nolint:errorlint // this node only; wrapped errors are walked by the caller.
 	case *pgconn.PgError:
-		return strings.HasPrefix(e.Code, sqlstateClassInvalidAuthorization) || e.Code == sqlstateInvalidCatalogName, true
+		return strings.HasPrefix(e.Code, sqlstateClassInvalidAuthorization) ||
+			e.Code == sqlstateInvalidCatalogName || e.Code == sqlstateInsufficientPrivilege, true
 	case *tls.CertificateVerificationError, x509.UnknownAuthorityError, x509.HostnameError,
 		x509.CertificateInvalidError:
 		return true, true

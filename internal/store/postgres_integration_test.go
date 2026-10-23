@@ -10,7 +10,6 @@ import (
 	"log"
 	"log/slog"
 	"net/url"
-	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -19,6 +18,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/goleak"
 
 	"github.com/hrhelena/elisa-task/internal/store/storetest"
 )
@@ -27,16 +27,22 @@ import (
 // test gets its own database in it (newDatabase), so tests run in parallel
 // and every test starts from an empty, unmigrated database.
 var testEnv struct {
+	pg      *storetest.Postgres
 	baseURL string        // connection string to the container's default database
 	admin   *pgxpool.Pool // used for CREATE/DROP DATABASE
 	dbSeq   atomic.Int64
 }
 
-func TestMain(m *testing.M) {
-	os.Exit(runWithPostgres(m))
-}
+// leakIgnores lists background goroutines allowed to outlive the
+// integration tests. It is empty: the leak check runs after runTests has
+// terminated the container, and by then testcontainers-go (v0.44) leaves no
+// goroutine behind, its reaper included. Add a targeted
+// goleak.IgnoreTopFunction here if a future version does.
+var leakIgnores []goleak.Option
 
-func runWithPostgres(m *testing.M) int {
+// runTests starts the shared Postgres container, runs the tests and
+// terminates the container; TestMain then checks for goroutine leaks.
+func runTests(m *testing.M) int {
 	ctx := context.Background()
 	pg, err := storetest.Start(ctx)
 	if err != nil {
@@ -49,6 +55,7 @@ func runWithPostgres(m *testing.M) int {
 		}
 	}()
 
+	testEnv.pg = pg
 	testEnv.baseURL = pg.URL
 	testEnv.admin, err = pgxpool.New(ctx, testEnv.baseURL)
 	if err != nil {
