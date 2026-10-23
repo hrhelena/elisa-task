@@ -94,6 +94,25 @@ func TestIngestionStart(t *testing.T) {
 				if !errors.As(err, &dm) || dm.Path != "/data/maildir" || !errors.Is(err, ingest.ErrDatasetMissing) {
 					t.Errorf("err = %v, want a DatasetMissingError for /data/maildir wrapping ErrDatasetMissing", err)
 				}
+				if dm != nil && dm.Problem != "" {
+					t.Errorf("Problem = %q, want empty for a maildir that does not exist", dm.Problem)
+				}
+			},
+		},
+		{
+			// #45: an existing but unusable maildir carries the problem, so
+			// the handler does not send the caller to POST /fetch.
+			name: "dataset invalid",
+			startErr: fmt.Errorf("checking the dataset: %w",
+				&ingest.InvalidRootError{Path: "/data/maildir", Problem: "it is a symlink, which is not followed"}),
+			wantStarts: 1,
+			check: func(t *testing.T, err error) {
+				t.Helper()
+				var dm *httpapi.DatasetMissingError
+				if !errors.As(err, &dm) || dm.Path != "/data/maildir" || dm.Problem != "it is a symlink, which is not followed" ||
+					!errors.Is(err, ingest.ErrDatasetInvalid) {
+					t.Errorf("err = %v, want a DatasetMissingError with the symlink problem wrapping ErrDatasetInvalid", err)
+				}
 			},
 		},
 		{

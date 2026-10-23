@@ -118,6 +118,20 @@ func TestStartHandler(t *testing.T) {
 				`"message":"maildir not found at /data/maildir; call POST /fetch first"}}`,
 		},
 		{
+			// Scenario: Start explains a symlinked maildir (#45): the
+			// message names the problem instead of sending the caller to
+			// POST /fetch, which would refuse the symlink too.
+			name: "maildir is a symlink",
+			err: fmt.Errorf("starting: %w", &DatasetMissingError{
+				Path:    "/data/maildir",
+				Problem: "it is a symlink, which is not followed; replace it with the directory itself",
+				Err:     errors.New("dataset not found: dataset root is not usable"),
+			}),
+			wantStatus: http.StatusConflict,
+			wantBody: `{"error":{"code":"dataset_missing","message":"the maildir at /data/maildir cannot be used: ` +
+				`it is a symlink, which is not followed; replace it with the directory itself"}}`,
+		},
+		{
 			name:       "shutting down",
 			err:        ErrIngesterClosed,
 			wantStatus: http.StatusServiceUnavailable,

@@ -26,7 +26,9 @@ type State string
 
 // Dataset states.
 const (
-	// StateAbsent means there is no dataset and no fetch has run.
+	// StateAbsent means there is no usable dataset and no fetch has run. If
+	// $DATA_DIR/maildir exists but cannot be used (a file, a symlink, which
+	// is never followed, or an unreadable directory), Error says so.
 	StateAbsent State = "absent"
 	// StateDownloading means the archive is being downloaded and, because
 	// extraction is streamed, extracted at the same time.
@@ -34,7 +36,7 @@ const (
 	// StateExtracting means the whole archive has been received and the
 	// fetch is finishing (gzip trailer check, atomic rename, marker).
 	StateExtracting State = "extracting"
-	// StateReady means $DATA_DIR/maildir exists.
+	// StateReady means $DATA_DIR/maildir is a readable directory (not a symlink).
 	StateReady State = "ready"
 	// StateFailed means the last fetch failed; Error says why.
 	StateFailed State = "failed"
@@ -76,8 +78,14 @@ var (
 	// cannot be created or written to.
 	ErrDataDirNotWritable = errors.New("data directory is not writable")
 	// ErrMaildirNotDirectory is returned by Start when $DATA_DIR/maildir
-	// exists but is not a directory, so a fetch could never install the dataset.
+	// exists but is not a directory, so a fetch could never install the
+	// dataset. A symlink counts as not a directory, whatever it points to:
+	// ingestion does not follow it either (#45).
 	ErrMaildirNotDirectory = errors.New("maildir path exists and is not a directory")
+	// ErrMaildirUnreadable is returned by Start when $DATA_DIR/maildir is a
+	// directory the service cannot open: it is not a usable dataset
+	// (ingestion refuses it too), and a fetch could not replace it.
+	ErrMaildirUnreadable = errors.New("maildir directory is not readable")
 	// errStalled is the cancel cause of a download that stopped receiving bytes.
 	errStalled = errors.New("download stalled")
 )
@@ -91,7 +99,8 @@ type Progress struct {
 	// BytesTotal comes from Content-Length; -1 if unknown.
 	BytesTotal     int64
 	FilesExtracted int64
-	// Error is set when State is StateFailed.
+	// Error is set when State is StateFailed, or when State is StateAbsent
+	// because $DATA_DIR/maildir exists but cannot be used.
 	Error      string
 	StartedAt  *time.Time
 	FinishedAt *time.Time
@@ -192,7 +201,7 @@ func New(dataDir, url string, client *http.Client, logger *slog.Logger, reg prom
 	f.metrics = newMetrics(reg, f.logger)
 	f.removeLeftovers()
 	f.progress = Progress{State: StateAbsent, Path: f.maildirPath(), BytesTotal: -1}
-	f.refreshLocked()
+	_ = f.refreshLocked()
 	return f
 }
 
@@ -200,7 +209,8 @@ func New(dataDir, url string, client *http.Client, logger *slog.Logger, reg prom
 // in progress, and returns the resulting progress. It never waits for the
 // download. It returns ErrDataDirNotWritable if the data directory cannot be
 // written, ErrMaildirNotDirectory if $DATA_DIR/maildir exists but is not a
-// directory, and ErrClosed after Close.
+// directory (including a symlink to one), ErrMaildirUnreadable if it is a
+// directory that cannot be opened, and ErrClosed after Close.
 func (f *Fetcher) Start() (Progress, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -211,13 +221,16 @@ func (f *Fetcher) Start() (Progress, error) {
 	if f.inFlightLocked() {
 		return f.snapshotLocked(), nil
 	}
-	if f.refreshLocked(); f.progress.State == StateReady {
+	// One check decides both the state and the answer, so a 409 always
+	// comes with a snapshot whose error matches it.
+	err := f.refreshLocked()
+	if err == nil {
 		return f.snapshotLocked(), nil
 	}
-	if fi, err := os.Lstat(f.maildirPath()); err == nil && !fi.IsDir() {
-		f.logger.Error("cannot fetch: maildir path is not a directory",
-			slog.String("path", f.maildirPath()), slog.String("mode", fi.Mode().String()))
-		return f.snapshotLocked(), fmt.Errorf("%w: %s (mode %s)", ErrMaildirNotDirectory, f.maildirPath(), fi.Mode())
+	if unusable(err) {
+		f.logger.Error("cannot fetch: maildir path exists and is not usable",
+			slog.String("path", f.maildirPath()), slog.Any("err", err))
+		return f.snapshotLocked(), err
 	}
 
 	tmp, err := f.makeTempDir()
@@ -247,7 +260,7 @@ func (f *Fetcher) Progress() Progress {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !f.inFlightLocked() {
-		f.refreshLocked()
+		_ = f.refreshLocked()
 	}
 	return f.snapshotLocked()
 }
@@ -279,21 +292,35 @@ func (f *Fetcher) inFlightLocked() bool {
 }
 
 // refreshLocked derives the state from the filesystem when no fetch runs:
-// a maildir directory means ready (this covers a pre-extracted local copy
-// without a marker); a vanished maildir turns ready back into absent. A
-// failed state is kept so its error stays visible.
-func (f *Fetcher) refreshLocked() {
-	present := isDir(f.maildirPath())
+// a readable maildir directory means ready (this covers a pre-extracted
+// local copy without a marker); a vanished maildir turns ready back into
+// absent; a maildir that exists but cannot be used (a file, a symlink to
+// anything, an unreadable directory) is absent with an error that says so.
+// A failed state is kept so its error stays visible. It returns the result
+// of checkMaildir.
+func (f *Fetcher) refreshLocked() error {
+	err := checkMaildir(f.maildirPath())
 	switch {
-	case present && f.progress.State != StateReady:
+	case err == nil:
+		if f.progress.State == StateReady {
+			return nil
+		}
 		f.progress.State = StateReady
 		f.progress.Error = ""
-	case !present && f.progress.State == StateReady:
-		f.progress = Progress{State: StateAbsent, Path: f.maildirPath(), BytesTotal: -1}
+	case f.progress.State == StateFailed:
+		return err
 	default:
-		return
+		want := Progress{State: StateAbsent, Path: f.maildirPath(), BytesTotal: -1}
+		if unusable(err) {
+			want.Error = err.Error()
+		}
+		if f.progress.State == StateAbsent && f.progress.Error == want.Error {
+			return err
+		}
+		f.progress = want
 	}
 	f.metrics.setState(f.progress.State)
+	return err
 }
 
 func (f *Fetcher) snapshotLocked() Progress {
@@ -310,9 +337,38 @@ func (f *Fetcher) setStateLocked(s State) {
 	f.metrics.setState(s)
 }
 
-func isDir(path string) bool {
-	fi, err := os.Stat(path)
-	return err == nil && fi.IsDir()
+// checkMaildir returns nil if path is a directory the service can open, an
+// error wrapping ErrMaildirNotDirectory if it exists but is something else,
+// one wrapping ErrMaildirUnreadable if it is a directory that cannot be
+// opened, and the Lstat error otherwise. It uses Lstat: a symlink is never
+// followed. Ingestion applies the same rules, so /fetch, /status and /start
+// agree (#45).
+func checkMaildir(path string) error {
+	fi, err := os.Lstat(path)
+	switch {
+	case err != nil:
+		return err //nolint:wrapcheck // *fs.PathError already names the path.
+	case fi.Mode()&fs.ModeSymlink != 0:
+		return fmt.Errorf("%w: %s is a symlink, which is not followed", ErrMaildirNotDirectory, path)
+	case !fi.IsDir():
+		return fmt.Errorf("%w: %s (mode %s)", ErrMaildirNotDirectory, path, fi.Mode())
+	}
+	d, err := os.Open(path) //nolint:gosec // the configured dataset path.
+	if err != nil {
+		cause := err
+		if pe, ok := errors.AsType[*fs.PathError](err); ok {
+			cause = pe.Err
+		}
+		return fmt.Errorf("%w: %s: %w", ErrMaildirUnreadable, path, cause)
+	}
+	_ = d.Close() // read-only directory handle
+	return nil
+}
+
+// unusable reports whether err from checkMaildir means the maildir exists
+// but cannot be used.
+func unusable(err error) bool {
+	return errors.Is(err, ErrMaildirNotDirectory) || errors.Is(err, ErrMaildirUnreadable)
 }
 
 // makeTempDir creates the data directory if needed and a fresh temporary

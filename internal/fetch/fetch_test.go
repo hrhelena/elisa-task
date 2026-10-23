@@ -470,46 +470,171 @@ func TestFetch_RealDiskChecksPass(t *testing.T) {
 	waitForState(t, f, StateReady)
 }
 
+// Scenario: Fetch rejects a symlinked maildir (#45). A symlink is never
+// followed, whatever it points to, so /fetch and /start agree.
 func TestFetch_MaildirIsNotADirectory(t *testing.T) {
 	t.Parallel()
-	for _, kind := range []string{"file", "symlink to a directory"} {
-		t.Run(kind, func(t *testing.T) {
-			t.Parallel()
-			dataDir := t.TempDir()
-			maildir := filepath.Join(dataDir, MaildirName)
-			if kind == "file" {
+	tests := []struct {
+		name string
+		make func(t *testing.T, maildir string)
+		// wantMsg is a substring of the error.
+		wantMsg string
+	}{
+		{
+			name: "file",
+			make: func(t *testing.T, maildir string) {
+				t.Helper()
 				if err := os.WriteFile(maildir, []byte("oops"), 0o600); err != nil {
 					t.Fatal(err)
 				}
-			} else if err := os.Symlink(t.TempDir(), maildir); err != nil {
+			},
+			wantMsg: "mode -rw-------",
+		},
+		{
+			name:    "symlink to a directory",
+			make:    func(t *testing.T, maildir string) { t.Helper(); symlink(t, t.TempDir(), maildir) },
+			wantMsg: "is a symlink",
+		},
+		{
+			name: "symlink to a file",
+			make: func(t *testing.T, maildir string) {
+				t.Helper()
+				target := filepath.Join(t.TempDir(), "file")
+				if err := os.WriteFile(target, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				symlink(t, target, maildir)
+			},
+			wantMsg: "is a symlink",
+		},
+		{
+			name:    "dangling symlink",
+			make:    func(t *testing.T, maildir string) { t.Helper(); symlink(t, "/nonexistent-target", maildir) },
+			wantMsg: "is a symlink",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dataDir := t.TempDir()
+			maildir := filepath.Join(dataDir, MaildirName)
+			tt.make(t, maildir)
+			before, err := os.Lstat(maildir)
+			if err != nil {
 				t.Fatal(err)
 			}
 			srv := newArchiveServer(t, serveBytes(sampleArchive(t)))
 			f, _ := newTestFetcher(t, dataDir, srv.URL, srv.Client())
-			if kind != "file" {
-				// A symlink to a directory is a usable dataset (os.Stat follows it).
-				if p, err := f.Start(); err != nil || p.State != StateReady {
-					t.Errorf("Start = %+v, %v; want ready", p, err)
-				}
-				return
+
+			// The startup state reports the problem, not ready.
+			if p := f.Progress(); p.State != StateAbsent || !strings.Contains(p.Error, tt.wantMsg) {
+				t.Errorf("startup progress = %q %q, want absent with an error containing %q", p.State, p.Error, tt.wantMsg)
 			}
 
 			p, err := f.Start()
 			if !errors.Is(err, ErrMaildirNotDirectory) {
 				t.Fatalf("Start error = %v, want ErrMaildirNotDirectory", err)
 			}
-			if !strings.Contains(err.Error(), maildir) {
-				t.Errorf("error %q does not name the path", err)
+			if !strings.Contains(err.Error(), maildir) || !strings.Contains(err.Error(), tt.wantMsg) {
+				t.Errorf("error %q does not name the path and %q", err, tt.wantMsg)
 			}
-			if p.State != StateAbsent {
-				t.Errorf("state = %q, want absent", p.State)
+			if p.State != StateAbsent || p.Error != err.Error() {
+				t.Errorf("progress = %q %q, want absent with the error", p.State, p.Error)
 			}
 			if n := srv.requests.Load(); n != 0 {
 				t.Errorf("requests = %d, want 0", n)
 			}
+			if got := testutil.ToFloat64(f.metrics.state.WithLabelValues(string(StateAbsent))); got != 1 {
+				t.Errorf("state metric absent = %v, want 1", got)
+			}
 			assertNoTempDirs(t, dataDir)
-			assertFile(t, maildir, "oops") // left untouched.
+			after, err := os.Lstat(maildir) // left untouched.
+			if err != nil || !os.SameFile(before, after) {
+				t.Errorf("maildir was replaced or removed: %v", err)
+			}
 		})
+	}
+}
+
+// Once the bad maildir is removed, the error clears; once it is replaced by
+// a real directory, the dataset is ready.
+func TestFetch_SymlinkedMaildirRecovers(t *testing.T) {
+	t.Parallel()
+	dataDir := t.TempDir()
+	maildir := filepath.Join(dataDir, MaildirName)
+	symlink(t, t.TempDir(), maildir)
+	f, _ := newTestFetcher(t, dataDir, "http://127.0.0.1:0/unused", nil)
+	if p := f.Progress(); p.State != StateAbsent || p.Error == "" {
+		t.Fatalf("progress = %+v, want absent with an error", p)
+	}
+
+	if err := os.Remove(maildir); err != nil {
+		t.Fatal(err)
+	}
+	if p := f.Progress(); p.State != StateAbsent || p.Error != "" {
+		t.Errorf("after removing the symlink: progress = %+v, want absent without an error", p)
+	}
+
+	symlink(t, t.TempDir(), maildir)
+	if p := f.Progress(); p.State != StateAbsent || p.Error == "" {
+		t.Errorf("after a new symlink: progress = %+v, want absent with an error", p)
+	}
+	if err := os.Remove(maildir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(maildir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if p := f.Progress(); p.State != StateReady || p.Error != "" {
+		t.Errorf("after a real directory: progress = %+v, want ready", p)
+	}
+}
+
+// #45 review: an unreadable maildir is not ready (ingestion refuses it), so
+// /fetch and /status report it like a symlinked one; once readable, it is
+// ready.
+func TestFetch_UnreadableMaildir(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root reads any directory")
+	}
+	dataDir := t.TempDir()
+	maildir := filepath.Join(dataDir, MaildirName)
+	if err := os.Mkdir(maildir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(maildir, 0o700) }) //nolint:gosec // restore so TempDir cleanup works.
+	srv := newArchiveServer(t, serveBytes(sampleArchive(t)))
+	f, _ := newTestFetcher(t, dataDir, srv.URL, srv.Client())
+
+	const wantMsg = "maildir directory is not readable: "
+	if p := f.Progress(); p.State != StateAbsent || !strings.Contains(p.Error, wantMsg+maildir+": permission denied") {
+		t.Errorf("startup progress = %q %q, want absent with a permission error", p.State, p.Error)
+	}
+	p, err := f.Start()
+	if !errors.Is(err, ErrMaildirUnreadable) || errors.Is(err, ErrMaildirNotDirectory) {
+		t.Fatalf("Start error = %v, want ErrMaildirUnreadable", err)
+	}
+	if p.State != StateAbsent || p.Error != err.Error() {
+		t.Errorf("progress = %q %q, want absent with the error", p.State, p.Error)
+	}
+	if n := srv.requests.Load(); n != 0 {
+		t.Errorf("requests = %d, want 0", n)
+	}
+	assertNoTempDirs(t, dataDir)
+
+	if err := os.Chmod(maildir, 0o700); err != nil { //nolint:gosec // test fixture.
+		t.Fatal(err)
+	}
+	if p := f.Progress(); p.State != StateReady || p.Error != "" {
+		t.Errorf("after chmod: progress = %+v, want ready", p)
+	}
+}
+
+func symlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
 	}
 }
 

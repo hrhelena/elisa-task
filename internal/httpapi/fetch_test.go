@@ -94,6 +94,23 @@ func TestFetchHandler(t *testing.T) {
 			wantCode:   CodeMaildirNotDirectory,
 		},
 		{
+			// Scenario: Fetch rejects a symlinked maildir (#45); the end to
+			// end case is TestFetchAndStartRejectASymlinkedMaildir.
+			name:       "maildir is a symlink",
+			progress:   fetch.Progress{State: fetch.StateAbsent, Error: "maildir path exists and is not a directory"},
+			err:        fmt.Errorf("%w: /data/maildir is a symlink, which is not followed", fetch.ErrMaildirNotDirectory),
+			wantStatus: http.StatusConflict,
+			wantCode:   CodeMaildirNotDirectory,
+		},
+		{
+			// #45 review: an unreadable maildir is not ready either.
+			name:       "maildir is unreadable",
+			progress:   fetch.Progress{State: fetch.StateAbsent, Error: "maildir directory is not readable"},
+			err:        fmt.Errorf("%w: /data/maildir: permission denied", fetch.ErrMaildirUnreadable),
+			wantStatus: http.StatusConflict,
+			wantCode:   CodeMaildirUnreadable,
+		},
+		{
 			name:       "shutting down",
 			err:        fetch.ErrClosed,
 			wantStatus: http.StatusServiceUnavailable,

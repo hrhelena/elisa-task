@@ -25,8 +25,12 @@ func TestSymlinkedDatasetRootIsRejected(t *testing.T) {
 	}
 	st := newFakeStore()
 	s := newTestService(t, NewMaildirSource(link), st)
-	if _, err := s.Start(t.Context()); !errors.Is(err, ErrDatasetMissing) {
-		t.Fatalf("Start = %v, want ErrDatasetMissing", err)
+	_, err := s.Start(t.Context())
+	if !errors.Is(err, ErrDatasetMissing) || !errors.Is(err, ErrDatasetInvalid) {
+		t.Fatalf("Start = %v, want ErrDatasetInvalid (wrapping ErrDatasetMissing)", err)
+	}
+	if inv, ok := errors.AsType[*InvalidRootError](err); !ok || !strings.Contains(inv.Problem, "symlink") {
+		t.Errorf("Start = %v, want an *InvalidRootError naming the symlink", err)
 	}
 	if run, _ := st.LatestRun(t.Context()); run != nil {
 		t.Errorf("a run was created: %+v", run)

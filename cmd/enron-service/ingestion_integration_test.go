@@ -39,8 +39,9 @@ type statusBody struct {
 	UpdatedAt         *time.Time       `json:"updated_at"`
 	Error             *string          `json:"error"`
 	Dataset           *struct {
-		State string `json:"state"`
-		Path  string `json:"path"`
+		State string  `json:"state"`
+		Path  string  `json:"path"`
+		Error *string `json:"error"`
 	} `json:"dataset"`
 }
 
@@ -305,6 +306,8 @@ func TestBinaryStartAfterFailedRun(t *testing.T) {
 }
 
 // Scenario: Dataset missing (no maildir, then a maildir that is a symlink).
+// Scenarios (#45): Fetch rejects a symlinked maildir; Start explains a
+// symlinked maildir.
 func TestBinaryStartDatasetMissing(t *testing.T) {
 	t.Parallel()
 	dataDir := t.TempDir()
@@ -312,25 +315,38 @@ func TestBinaryStartDatasetMissing(t *testing.T) {
 	client := newClient()
 	maildir := filepath.Join(dataDir, "maildir")
 
-	check := func(what string) {
+	check := func(what, wantMsg string) {
 		t.Helper()
 		code, _, body := postStart(t, client, base)
 		if code != http.StatusConflict || body.Error == nil || body.Error.Code != "dataset_missing" ||
-			body.Error.Message != "maildir not found at "+maildir+"; call POST /fetch first" {
-			t.Errorf("POST /start with %s = %d %+v, want 409 dataset_missing naming %s", what, code, body.Error, maildir)
+			body.Error.Message != wantMsg {
+			t.Errorf("POST /start with %s = %d %+v, want 409 dataset_missing %q", what, code, body.Error, wantMsg)
 		}
 	}
-	check("no maildir")
+	check("no maildir", "maildir not found at "+maildir+"; call POST /fetch first")
 
 	target := t.TempDir()
 	validMaildir(t, target, 1)
 	if err := os.Symlink(filepath.Join(target, "maildir"), maildir); err != nil {
 		t.Fatal(err)
 	}
-	check("a symlinked maildir")
+	// #45: the message names the problem, and /fetch and the /status
+	// dataset section agree that a symlinked maildir is not a dataset (the
+	// fetch is refused before any download, so DATASET_URL is never used).
+	check("a symlinked maildir", "the maildir at "+maildir+" cannot be used: "+
+		"it is a symlink, which is not followed; replace it with the directory itself")
+	if code, body := post(t, client, base+"/fetch"); code != http.StatusConflict ||
+		!strings.Contains(body, `"code":"maildir_not_directory"`) {
+		t.Errorf("POST /fetch with a symlinked maildir = %d %s, want 409 maildir_not_directory", code, body)
+	}
 
-	if st := getStatus(t, client, base); st.State != "idle" {
+	st := getStatus(t, client, base)
+	if st.State != "idle" {
 		t.Errorf("status after rejected starts = %+v, want idle", st)
+	}
+	wantErr := "maildir path exists and is not a directory: " + maildir + " is a symlink, which is not followed"
+	if d := st.Dataset; d == nil || d.State != "absent" || d.Path != maildir || d.Error == nil || *d.Error != wantErr {
+		t.Errorf("dataset section with a symlinked maildir = %+v, want absent with %q", d, wantErr)
 	}
 	b.signal(t)
 	b.waitExit0(t)
