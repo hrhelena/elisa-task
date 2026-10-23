@@ -101,7 +101,9 @@ The service connects to Postgres and applies the embedded migrations before it l
   is never logged.
 - A server that answers but rejects the configuration is not retried: a wrong password or other authorization
   failure (SQLSTATE class `28`), a missing database (`3D000`), or a TLS failure (for example `sslmode=require`
-  against a server without TLS, or a certificate that does not verify).
+  against a server without TLS, or a certificate that does not verify). When one connect makes several attempts
+  (several hosts, or TLS then plaintext with `sslmode` unset, `prefer` or `allow`), it counts as permanent only if
+  every attempt was rejected this way; a refused TLS attempt followed by "starting up" is retried.
 - Waiting for the migration lock held by another replica polls every second until the same budget ends.
 - Migrations run inside the budget too. Each one runs in a transaction, so a migration cut off by the deadline or a
   signal rolls back completely. A future `-- +goose NO TRANSACTION` migration (such as `CREATE INDEX CONCURRENTLY`)

@@ -33,6 +33,12 @@ func TestOpenRejectedConfigurationIsPermanent(t *testing.T) {
 		name, url, wantSub string
 	}{
 		{"wrong password", with(func(u *url.URL) { u.User = url.UserPassword("enron", "s3cret-typo") }), "28P01"},
+		// sslmode unset means prefer: the refused TLS attempt is joined with
+		// the plaintext attempt's 28P01, which still decides.
+		{"wrong password, default sslmode", with(func(u *url.URL) {
+			u.User = url.UserPassword("enron", "s3cret-typo")
+			u.RawQuery = ""
+		}), "28P01"},
 		{"unknown role", with(func(u *url.URL) { u.User = url.UserPassword("nobody", "s3cret-typo") }), "28P01"},
 		{"missing database", with(func(u *url.URL) { u.Path = "/does_not_exist" }), "3D000"},
 		{"TLS required, server without TLS", with(func(u *url.URL) { u.RawQuery = "sslmode=require" }), "server refused TLS connection"},

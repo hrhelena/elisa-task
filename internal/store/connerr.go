@@ -3,7 +3,6 @@ package store
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -19,35 +18,70 @@ const (
 	sqlstateInvalidCatalogName = "3D000"
 )
 
-// pgconnRefusedTLS is the text of pgconn's (unexported, unwrapped) error for
-// sslmode=require against a server without TLS.
+// pgconnRefusedTLS is the exact text of pgconn's error when the server
+// answers an SSLRequest with "N". pgconn creates it with errors.New in
+// startTLS and exports no type or sentinel for it, so the text is the only
+// handle; it is compared for equality on a single leaf error only.
 const pgconnRefusedTLS = "server refused TLS connection"
 
 // isTransientConnectError reports whether a failed connect or ping may
-// succeed if retried. The server being down, starting up (57P03), shutting
+// succeed if retried.
+//
+// pgx tries several connection attempts per connect (each host, and with
+// sslmode prefer or allow, TLS and plaintext) and joins their errors
+// (errors.Join of per-attempt errors inside *pgconn.ConnectError). The
+// failure is transient if any attempt failed transiently. With the default
+// sslmode=prefer against a server without TLS, the TLS attempt is always
+// refused; a "starting up" on the plaintext attempt must still be retried.
+//
+// For one attempt: the server being down, starting up (57P03), shutting
 // down (57P01, 57P02), out of connections (53300), unresolvable or slow are
 // transient. A server that was reached but rejects the configuration is
-// not: an authorization failure (class 28), a missing database (3D000), or
-// a TLS setup failure (refused, or the certificate does not verify). Any
-// other error defaults to transient, so an unknown hiccup cannot fail a
-// start that a retry would have saved.
+// permanent: an authorization failure (class 28), a missing database
+// (3D000), or a TLS setup failure (refused, or the certificate does not
+// verify). Anything else defaults to transient, so an unknown hiccup cannot
+// fail a start that a retry would have saved.
 func isTransientConnectError(err error) bool {
-	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
-		if strings.HasPrefix(pgErr.Code, sqlstateClassInvalidAuthorization) || pgErr.Code == sqlstateInvalidCatalogName {
-			return false
+	if err == nil {
+		return false
+	}
+	if permanent, decided := classifyNode(err); decided {
+		return !permanent
+	}
+	switch u := err.(type) { //nolint:errorlint // walks the tree by hand: errors.As would cross attempts.
+	case interface{ Unwrap() []error }:
+		// Separate attempts: transient if any of them is.
+		children := u.Unwrap()
+		for _, child := range children {
+			if isTransientConnectError(child) {
+				return true
+			}
+		}
+		return len(children) == 0
+	case interface{ Unwrap() error }:
+		if child := u.Unwrap(); child != nil {
+			return isTransientConnectError(child)
 		}
 	}
-	if _, ok := errors.AsType[*tls.CertificateVerificationError](err); ok {
-		return false
+	return true
+}
+
+// classifyNode classifies err by its own type only, without looking at what
+// it wraps (that would cross from one joined attempt into another).
+// decided is false when err says nothing by itself.
+func classifyNode(err error) (permanent, decided bool) {
+	switch e := err.(type) { //nolint:errorlint // this node only; wrapped errors are walked by the caller.
+	case *pgconn.PgError:
+		return strings.HasPrefix(e.Code, sqlstateClassInvalidAuthorization) || e.Code == sqlstateInvalidCatalogName, true
+	case *tls.CertificateVerificationError, x509.UnknownAuthorityError, x509.HostnameError,
+		x509.CertificateInvalidError:
+		return true, true
+	case interface{ Unwrap() error }, interface{ Unwrap() []error }:
+		return false, false // a wrapper: decided by what it wraps
 	}
-	if _, ok := errors.AsType[x509.UnknownAuthorityError](err); ok {
-		return false
+	// A leaf error: pgconn's TLS refusal is recognized by its exact text.
+	if err.Error() == pgconnRefusedTLS {
+		return true, true
 	}
-	if _, ok := errors.AsType[x509.HostnameError](err); ok {
-		return false
-	}
-	if _, ok := errors.AsType[x509.CertificateInvalidError](err); ok {
-		return false
-	}
-	return !strings.Contains(err.Error(), pgconnRefusedTLS)
+	return false, false
 }
