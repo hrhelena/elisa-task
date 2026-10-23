@@ -35,8 +35,9 @@ fail() {
 # expect <description> <rendered file> <yq expression over all documents> <expected output>
 expect() {
 	local got
-	if ! got=$(go tool yq eval-all "$3" "$2" 2>&1); then
-		fail "$1: yq error: $got"
+	# stderr is kept out of the value: on a cold module cache `go tool` prints "go: downloading ..." there.
+	if ! got=$(go tool yq eval-all "$3" "$2" 2>"$out/yq.stderr"); then
+		fail "$1: yq error: $(cat "$out/yq.stderr")"
 		return
 	fi
 	if [[ "$got" == "$4" ]]; then
@@ -55,6 +56,11 @@ seconds() {
 		return 1
 	fi
 }
+
+# Build the pinned tools up front, so module downloads happen (and fail) here rather than inside a check.
+for tool in kustomize kubeconform yq; do
+	go tool -n "$tool" >/dev/null
+done
 
 echo "== Render (kustomize $(go tool kustomize version))"
 for target in base overlays/kind overlays/cloud; do
