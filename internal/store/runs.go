@@ -29,6 +29,12 @@ var (
 	// is not held: it was released, the store was closed, its connection was
 	// lost, or it belongs to another store.
 	ErrLockNotHeld = errors.New("ingestion lock not held")
+	// ErrLockReleased is wrapped (with ErrLockNotHeld) by a lock's Err after
+	// Release: a normal ending, unlike a lost lock.
+	ErrLockReleased = errors.New("ingest lock released")
+	// ErrStoreClosed is wrapped (with ErrLockNotHeld) by a lock's Err after
+	// the store is closed, and returned by AcquireIngestLock on a closed store.
+	ErrStoreClosed = errors.New("store closed")
 	// ErrRunNotRunning is returned when updating or finishing a run that does
 	// not exist or is no longer running.
 	ErrRunNotRunning = errors.New("ingestion run is not running")

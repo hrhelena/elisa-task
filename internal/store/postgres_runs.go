@@ -68,9 +68,11 @@ WHERE id = $1 AND state = 'running'`
 	latestRunSQL = "SELECT " + runColumnList + " FROM ingestion_runs ORDER BY id DESC LIMIT 1"
 )
 
-// pgIngestLock is a held ingest lock. It owns its connection: the connection
-// is taken from the pool and hijacked, so the pool never waits for it and it
-// is never handed back while it may hold the lock. The run writes go through
+// pgIngestLock is a held ingest lock. It owns a dedicated connection, dialed
+// with the pool's settings but outside the pool, so the pool never waits for
+// it and it is never handed back while it may hold the lock. Only this
+// connection cancels a canceled query on the server rather than closing (see
+// Open), so a canceled run write keeps the lock. The run writes go through
 // this connection, so they prove that this session holds the lock, and they
 // keep the connection busy during a run. A watcher goroutine checks the
 // connection every p.lockCheckInterval while no write is in flight.
@@ -78,8 +80,8 @@ type pgIngestLock struct {
 	p    *Postgres
 	conn *pgx.Conn
 
-	mu       sync.Mutex // serializes use of conn; guards released
-	released bool
+	sem      chan struct{} // capacity 1: serializes use of conn, waitable with a context
+	released atomic.Bool
 	aborted  atomic.Bool // the store closed the connection
 
 	done          chan struct{} // closed by end
@@ -89,8 +91,36 @@ type pgIngestLock struct {
 }
 
 func newIngestLock(p *Postgres, conn *pgx.Conn) *pgIngestLock {
-	return &pgIngestLock{p: p, conn: conn, done: make(chan struct{}), watcherExited: make(chan struct{})}
+	return &pgIngestLock{p: p, conn: conn, sem: make(chan struct{}, 1),
+		done: make(chan struct{}), watcherExited: make(chan struct{})}
 }
+
+// acquireConn waits for exclusive use of the connection, or for ctx.
+func (l *pgIngestLock) acquireConn(ctx context.Context) error {
+	select {
+	case l.sem <- struct{}{}:
+		return nil
+	default:
+	}
+	select {
+	case l.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// tryAcquireConn takes the connection only if it is free.
+func (l *pgIngestLock) tryAcquireConn() bool {
+	select {
+	case l.sem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (l *pgIngestLock) releaseConn() { <-l.sem }
 
 // Done implements IngestLock.
 func (l *pgIngestLock) Done() <-chan struct{} { return l.done }
@@ -106,25 +136,37 @@ func (l *pgIngestLock) Err() error {
 }
 
 // end records why the lock is no longer held (err wraps ErrLockNotHeld) and
-// closes Done. Only the first call has an effect.
-func (l *pgIngestLock) end(err error) {
+// closes Done. Only the first call has an effect; it reports whether this
+// call was it.
+func (l *pgIngestLock) end(err error) (first bool) {
 	l.endOnce.Do(func() {
 		l.endErr = err
 		close(l.done)
+		first = true
 	})
+	return first
 }
 
 // lost ends the lock because its connection, and so its session, is gone.
-func (l *pgIngestLock) lost(cause error) error {
-	err := fmt.Errorf("%w: lock connection lost: %w", ErrLockNotHeld, cause)
-	l.end(err)
-	l.p.logger.Error("ingest lock lost", slog.Any("error", cause))
-	return err
+// It logs at ERROR only when that is news: when Release or Close ended the
+// lock first (and so closed the connection), the error is theirs.
+func (l *pgIngestLock) lost(ctx context.Context, cause error) error {
+	if l.end(fmt.Errorf("%w: lock connection lost: %w", ErrLockNotHeld, cause)) {
+		l.p.logger.ErrorContext(ctx, "ingest lock lost", slog.Any("error", cause))
+	} else {
+		l.p.logger.DebugContext(ctx, "ingest lock connection closed after the lock ended",
+			slog.Any("error", cause), slog.Any("reason", l.Err()))
+	}
+	return l.Err()
 }
 
-// watch checks the lock's connection periodically until the lock ends.
+// watch checks the lock's connection periodically until the lock ends. A
+// non-positive interval uses lockCheckEvery.
 func (l *pgIngestLock) watch(ctx context.Context, every time.Duration) {
 	defer close(l.watcherExited)
+	if every <= 0 {
+		every = lockCheckEvery
+	}
 	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
@@ -142,10 +184,10 @@ func (l *pgIngestLock) watch(ctx context.Context, every time.Duration) {
 // itself. A slow answer is canceled on the server and is not a loss; only a
 // dead connection or a session without the lock ends the lock.
 func (l *pgIngestLock) check(ctx context.Context) {
-	if !l.mu.TryLock() {
+	if !l.tryAcquireConn() {
 		return
 	}
-	defer l.mu.Unlock()
+	defer l.releaseConn()
 	if l.Err() != nil {
 		return
 	}
@@ -153,57 +195,67 @@ func (l *pgIngestLock) check(ctx context.Context) {
 	defer cancel()
 	held, err := queryLock(ctx, l.conn, lockHeldBySelfSQL)
 	switch {
-	case err != nil && l.conn.IsClosed():
-		_ = l.lost(err)
+	case err != nil && (l.aborted.Load() || l.conn.IsClosed()):
+		_ = l.lost(ctx, err)
 	case err == nil && !held:
-		l.end(fmt.Errorf("%w: no longer held by its session", ErrLockNotHeld))
+		if l.end(fmt.Errorf("%w: no longer held by its session", ErrLockNotHeld)) {
+			l.p.logger.ErrorContext(ctx, "ingest lock lost: no longer held by its session")
+		}
 	}
 }
 
 // AcquireIngestLock takes pg_try_advisory_lock(IngestLockKey) on a dedicated
-// connection taken from the pool, or returns ErrLockHeld if another session
-// holds it. The lock is held until Release, until Close (which closes the
-// connection), or until the process dies: Postgres releases it when the
-// session ends, which is how a crashed run is detected (ADR 0010).
+// connection (the pool's settings, outside the pool), or returns ErrLockHeld
+// if another session holds it. The lock is held until Release, until Close
+// (which closes the connection), or until the process dies: Postgres
+// releases it when the session ends, which is how a crashed run is detected
+// (ADR 0010).
 //
 // Session advisory locks need a session: DATABASE_URL must point to Postgres
 // or to a session-mode pooler, never to a transaction-mode pooler such as
 // pgbouncer in pool_mode=transaction.
 func (p *Postgres) AcquireIngestLock(ctx context.Context) (IngestLock, error) {
-	pc, err := p.pool.Acquire(ctx)
+	if p.lockConnConfig == nil {
+		return nil, errors.New("acquiring ingest lock: store not opened with Open")
+	}
+	if p.isClosed() {
+		return nil, fmt.Errorf("acquiring ingest lock: %w", ErrStoreClosed)
+	}
+	conn, err := pgx.ConnectConfig(ctx, p.lockConnConfig.Copy())
 	if err != nil {
-		return nil, fmt.Errorf("acquiring connection for ingest lock: %w", err)
+		return nil, fmt.Errorf("connecting for ingest lock: %w", err)
 	}
 	var locked bool
-	if err := pc.QueryRow(ctx, tryLockSQL, IngestLockKey).Scan(&locked); err != nil {
+	if err := conn.QueryRow(ctx, tryLockSQL, IngestLockKey).Scan(&locked); err != nil {
 		// The outcome is unknown (the lock may have been granted before the
-		// error), so the session must not go back to the pool.
-		closeConn(ctx, pc.Hijack())
+		// error); closing the session releases it in any case.
+		closeConn(ctx, conn)
 		return nil, fmt.Errorf("trying ingest lock: %w", err)
 	}
 	if !locked {
-		pc.Release()
+		closeConn(ctx, conn)
 		return nil, ErrLockHeld
 	}
 
-	l := newIngestLock(p, pc.Hijack())
+	l := newIngestLock(p, conn)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
 		closeConn(ctx, l.conn)
-		return nil, errors.New("acquiring ingest lock: store is closed")
+		return nil, fmt.Errorf("acquiring ingest lock: %w", ErrStoreClosed)
 	}
 	p.locks[l] = struct{}{}
 	go l.watch(context.WithoutCancel(ctx), p.lockCheckInterval) // outlives the acquiring request
 	return l, nil
 }
 
-// Release unlocks and closes the lock's connection, and closes Done. Later
-// calls return nil. It waits for an in-flight run write on the lock (Close
-// does not). If unlocking fails (for example ctx is already canceled at
-// shutdown), the connection is closed anyway, which releases the lock too.
-// It returns an error wrapping ErrLockNotHeld only if the session turns out
-// not to have held the lock.
+// Release unlocks and closes the lock's connection, and closes Done (Err then
+// wraps ErrLockReleased). Later calls return nil. It waits for an in-flight
+// run write on the lock, but not beyond ctx: then it closes the connection
+// under the write, which releases the lock as well. If unlocking fails (for
+// example ctx is already canceled at shutdown), the connection is closed
+// anyway. It returns an error wrapping ErrLockNotHeld only if the session
+// turns out not to have held the lock.
 func (l *pgIngestLock) Release(ctx context.Context) error {
 	err := l.release(ctx)
 	<-l.watcherExited
@@ -211,14 +263,19 @@ func (l *pgIngestLock) Release(ctx context.Context) error {
 }
 
 func (l *pgIngestLock) release(ctx context.Context) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.released {
+	if !l.released.CompareAndSwap(false, true) {
 		return nil
 	}
-	l.released = true
 	l.p.forget(l)
-	l.end(fmt.Errorf("%w: released", ErrLockNotHeld))
+	l.end(fmt.Errorf("%w: %w", ErrLockNotHeld, ErrLockReleased))
+	if err := l.acquireConn(ctx); err != nil {
+		// A write is still running and ctx is done: end the session under it.
+		l.closeSocket()
+		l.p.logger.WarnContext(ctx, "ingest lock released by closing its connection during a write",
+			slog.Any("error", err))
+		return nil
+	}
+	defer l.releaseConn()
 	if l.aborted.Load() {
 		closeConn(ctx, l.conn)
 		return nil
@@ -241,9 +298,15 @@ func (l *pgIngestLock) release(ctx context.Context) error {
 // in-flight query, which ends the session and releases the lock. Used by
 // Close; a later Release only cleans up.
 func (l *pgIngestLock) abort() {
+	l.end(fmt.Errorf("%w: %w", ErrLockNotHeld, ErrStoreClosed))
+	l.closeSocket()
+}
+
+// closeSocket closes the network connection without waiting for an in-flight
+// query (net.Conn.Close is safe during a read); the server ends the session.
+func (l *pgIngestLock) closeSocket() {
 	l.aborted.Store(true)
-	l.end(fmt.Errorf("%w: store closed", ErrLockNotHeld))
-	_ = l.conn.PgConn().Conn().Close() // net.Conn.Close is safe during a read
+	_ = l.conn.PgConn().Conn().Close()
 }
 
 func (p *Postgres) forget(l *pgIngestLock) {
@@ -262,16 +325,22 @@ func closeConn(ctx context.Context, conn *pgx.Conn) {
 // withLock runs fn on the lock's own connection. It returns an error
 // wrapping ErrLockNotHeld if lock is not a held lock of this store, and ends
 // the lock (closing Done) if fn finds the connection, and with it the lock,
-// lost. An already canceled ctx is returned as is, without touching the
-// connection; cancellation during fn cancels the query on the server and
+// lost. Waiting for the connection (behind another write or a liveness
+// check) is bounded by ctx. A done ctx is returned as is, without touching
+// the connection; cancellation during fn cancels the query on the server and
 // keeps the session (see Open).
 func (p *Postgres) withLock(ctx context.Context, lock IngestLock, fn func(*pgx.Conn) error) error {
 	l, ok := lock.(*pgIngestLock)
 	if !ok || l == nil || l.p != p {
 		return fmt.Errorf("%w: not an ingest lock of this store", ErrLockNotHeld)
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	if err := l.Err(); err != nil {
+		return err
+	}
+	if err := l.acquireConn(ctx); err != nil {
+		return err
+	}
+	defer l.releaseConn()
 	if err := l.Err(); err != nil {
 		return err
 	}
@@ -282,10 +351,10 @@ func (p *Postgres) withLock(ctx context.Context, lock IngestLock, fn func(*pgx.C
 	switch {
 	case err == nil:
 		return nil
-	case l.aborted.Load():
+	case l.Err() != nil: // Release or Close ended the lock meanwhile
 		return l.Err()
-	case l.conn.IsClosed():
-		return l.lost(err)
+	case l.aborted.Load() || l.conn.IsClosed():
+		return l.lost(ctx, err)
 	case errors.Is(err, ErrLockNotHeld):
 		l.end(err)
 	}

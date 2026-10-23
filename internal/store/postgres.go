@@ -68,6 +68,9 @@ type Postgres struct {
 	locks  map[*pgIngestLock]struct{} // outstanding ingest locks, dropped by Close
 	closed bool
 
+	// lockConnConfig dials ingest lock connections (see lockConnConfig).
+	lockConnConfig *pgx.ConnConfig
+
 	// lockCheckInterval is how often a held ingest lock checks its connection
 	// (lockCheckEvery; tests shorten it before acquiring).
 	lockCheckInterval time.Duration
@@ -94,15 +97,6 @@ func Open(ctx context.Context, databaseURL string, logger *slog.Logger) (*Postgr
 	if cfg.MaxConns < minPoolConns {
 		return nil, fmt.Errorf("database URL: pool_max_conns is %d, must be at least %d", cfg.MaxConns, minPoolConns)
 	}
-	// On context cancellation, pgx by default closes the connection. Ask the
-	// server to cancel the query instead, so the session survives: this is
-	// required for the ingest lock's connection, whose session holds the
-	// cluster-wide lock (ADR 0010), and also spares pool connections when a
-	// request is canceled. If the server does not stop the query within
-	// cancelDeadlineDelay, the connection is closed as before.
-	cfg.ConnConfig.BuildContextWatcherHandler = func(c *pgconn.PgConn) ctxwatch.Handler {
-		return &pgconn.CancelRequestContextWatcherHandler{Conn: c, DeadlineDelay: cancelDeadlineDelay}
-	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("creating connection pool: %w", err)
@@ -121,7 +115,30 @@ func Open(ctx context.Context, databaseURL string, logger *slog.Logger) (*Postgr
 		pool.Close()
 		return nil, err
 	}
-	return &Postgres{pool: pool, logger: logger, locks: map[*pgIngestLock]struct{}{}, lockCheckInterval: lockCheckEvery}, nil
+	return &Postgres{pool: pool, logger: logger, locks: map[*pgIngestLock]struct{}{},
+		lockConnConfig: lockConnConfig(cfg.ConnConfig), lockCheckInterval: lockCheckEvery}, nil
+}
+
+// lockConnConfig returns the settings for ingest lock connections: the
+// pool's, except that a canceled query is canceled on the server and the
+// connection kept. pgx's default closes the connection on cancellation,
+// which would drop the lock's session and so the cluster-wide lock (ADR
+// 0010) whenever a run write times out. If the server does not stop the
+// query within cancelDeadlineDelay, the connection is closed as before. Pool
+// connections keep the default, so their queries end at their own deadline
+// even when the server does not answer.
+func lockConnConfig(pool *pgx.ConnConfig) *pgx.ConnConfig {
+	cfg := pool.Copy()
+	cfg.BuildContextWatcherHandler = func(c *pgconn.PgConn) ctxwatch.Handler {
+		return &pgconn.CancelRequestContextWatcherHandler{Conn: c, DeadlineDelay: cancelDeadlineDelay}
+	}
+	return cfg
+}
+
+func (p *Postgres) isClosed() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.closed
 }
 
 // Close closes the connection pool. Outstanding ingest locks are dropped by
