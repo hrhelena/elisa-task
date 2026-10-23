@@ -589,7 +589,7 @@ The manifests live in `deploy/k8s` ([ADR 0006](Docs/ADR/0006-cloud-native-deploy
 | `base/` | Namespace `enron` (Pod Security `restricted` enforced), ConfigMap `enron-service-config`, PVC `enron-data` (10Gi, RWO), Deployment `enron-service` (1 replica, `Recreate`), Service `enron-service` (`ClusterIP` 80 to 8080) |
 | `overlays/kind/` | The base, plus Postgres as a plain StatefulSet `postgres` (`postgres:16-alpine`, 2Gi, headless Service, no operator), the generated Secret `enron-db`, and the locally built image |
 | `overlays/cloud/` | The base only: managed Postgres through an externally created Secret `enron-db`, image `REGISTRY/enron-service:VERSION` |
-<!-- #40 adds its overlay as a row here. -->
+| `overlays/kind-local-dataset/` | Opt-in (`LOCAL_DATASET`): `overlays/kind` with `/data` served read-only from your local `Dataset/` (a static `local` PersistentVolume) instead of the PVC `enron-data`; see [Local dataset (opt-in)](#local-dataset-opt-in) |
 
 There is one replica with the `Recreate` strategy, because the dataset volume is ReadWriteOnce, so a rollout has a
 short outage. There is no PodDisruptionBudget: with one replica it would either block node drains forever
@@ -624,8 +624,58 @@ make kind-down      # delete the cluster
 - The credentials in `overlays/kind` (`enron`/`enron`) are for the throwaway local cluster only.
 - The dataset gets into the cluster through `POST /fetch`, which downloads into the `enron-data` volume. kind's
   local-path provisioner backs it with a directory inside the node container, so neither the 10Gi request nor the
-  inode count limits it there.
-<!-- #40 (opt-in local Dataset mount for kind, skipping /fetch) adds its instructions here. -->
+  inode count limits it there. The download (about 443 MB) took about 12 minutes in kind; if you already have
+  `Dataset/maildir`, use the local dataset instead (next section).
+
+#### Local dataset (opt-in)
+
+Pass `LOCAL_DATASET` to both `kind-up` and `deploy` to serve your extracted `Dataset/` to the pod read-only, so no
+download is needed:
+
+```bash
+make kind-up deploy LOCAL_DATASET=1                    # Dataset/ of the main checkout, also from a git worktree
+make kind-up deploy LOCAL_DATASET=/path/to/Dataset     # or any directory that contains maildir/ (a relative
+                                                       # path is relative to where make runs, the repo root)
+curl -si -X POST localhost:8080/fetch                  # through the port-forward: 200 "ready", nothing to download
+curl -si -X POST localhost:8080/start                  # ingests straight from the mounted dataset
+```
+
+How it works, without a `hostPath` volume in the pod (the namespace enforces Pod Security `restricted`, which
+forbids them):
+
+1. `make kind-up LOCAL_DATASET=...` (`scripts/kind-up.sh`) creates the cluster from `deploy/kind/cluster.yaml` plus
+   a read-only kind `extraMounts` entry (your directory at `/var/local/enron-dataset` on the node) and the node label
+   `elisa-enron/local-dataset=true`. The absolute host path only goes into the generated
+   `.tools/kind/cluster-local-dataset.yaml` (gitignored), never into a tracked file.
+2. `make deploy LOCAL_DATASET=...` applies `overlays/kind-local-dataset`: a static `local` PersistentVolume
+   `enron-local-dataset` for that node path (`ReadOnlyMany`, `Retain`, no StorageClass, pinned to the labelled node)
+   and the PVC `enron-local-dataset`. Each names the other (`claimRef` on the volume, `volumeName` on the claim), so
+   no other claim can take the volume. The Deployment mounts that PVC read-only at `/data` in place of `enron-data`,
+   which this variant does not create. Everything else is identical to `overlays/kind` (`make k8s-validate` checks
+   it). Pod Security Admission only inspects the pod's volumes, and a PVC is allowed under `restricted`.
+
+Behaviour and limits:
+
+- `POST /fetch` answers `200` with `"state":"ready"`, because `/data/maildir` exists, and downloads and writes
+  nothing. On the full dataset, `POST /start` then completes with 517,401 messages processed.
+- If the host `Dataset/maildir` is moved, renamed or deleted while the cluster runs, `/data/maildir` disappears:
+  `POST /fetch` then tries to start a download but fails at once on the read-only mount (`500`,
+  `data_dir_not_writable`, before any network traffic), and `POST /start` returns `409 dataset_missing`. Put the
+  directory back, or recreate the cluster with the new path.
+- The dataset is read-only on three levels (kind mount, PVC, volume mount). Your files are never modified or
+  chowned: kubelet skips `fsGroup` ownership changes on a read-only volume. The pod sees the files with their host
+  permissions, so they must be readable by others (uid 65532); the extracted archive is (`0755`/`0644`).
+- A mount can only be added when the cluster is created. `make kind-up LOCAL_DATASET=1` on an existing cluster
+  without it fails with a hint, and so does `make deploy LOCAL_DATASET=1`; recreate the cluster with
+  `make kind-down kind-up LOCAL_DATASET=1`. To change the directory, recreate the cluster as well.
+- A cluster created with `LOCAL_DATASET` still deploys the default overlay with a plain `make deploy`. To switch
+  between the two on one cluster, run `make undeploy` first (otherwise the unused volume of the other variant stays).
+- `make undeploy` also deletes the PersistentVolume `enron-local-dataset`; with `Retain` and no deleter, that never
+  touches the host files. If only the namespace was deleted, the next `make deploy LOCAL_DATASET=1` recreates the
+  then `Released` volume.
+- On Docker Desktop (macOS, Windows) the directory must be in a shared location (`/Users` is shared by default).
+  Ingestion then reads through Docker Desktop's file sharing, which can be slower than a local-path volume.
+- Only for kind: the cloud overlay is unchanged.
 
 ### Cloud (EKS, GKE)
 
@@ -693,13 +743,19 @@ The pod template carries `prometheus.io/scrape`, `prometheus.io/port: "8080"` an
 
 ### Validating the manifests
 
-<!-- #40 updates "both overlays" and the list of checks below for its overlay. -->
-`make k8s-validate` renders the base and both overlays with the pinned kustomize, validates every resource with
-kubeconform (`-strict`, the Kubernetes schema of the kind node version, cached in `.tools/`), and checks the values
-above with yq. It checks probes, grace period, replicas, `Recreate`, the 10Gi RWO PVC, hardening, Postgres as the
+`make k8s-validate` renders the base and the three overlays (`kind`, `cloud`, `kind-local-dataset`) with the pinned
+kustomize, validates every resource with kubeconform (`-strict`, the Kubernetes schema of the kind node version,
+cached in `.tools/`), and checks the values above with yq. It checks probes, grace period, replicas, `Recreate`, the
+10Gi RWO PVC, hardening, Pod Security `restricted` on the namespace, no `hostPath` volume in any pod, Postgres as the
 only StatefulSet in kind, and that the cloud overlay has no StatefulSet and no Secret. It also checks that the grace
 period exceeds drain + shutdown + 5 s, and that the startup budget exceeds `DB_STARTUP_TIMEOUT`.
-`kubectl kustomize deploy/k8s/overlays/kind` renders the same output as the pinned kustomize.
+
+For the local dataset variant it checks that it equals `overlays/kind` except for the dataset volume, the
+PersistentVolume and claim fields (including the `claimRef`), and that the volume and mount are read-only. For the
+kind configs that `scripts/kind-up.sh` generates, it checks that the default is `deploy/kind/cluster.yaml` unchanged,
+and that the `LOCAL_DATASET` one only adds a read-only mount at the PersistentVolume's node path and the node label
+its node affinity selects. `kubectl kustomize` renders the same output as the pinned kustomize for every overlay (CI
+`manifests` job).
 <!-- #13 (kind end-to-end smoke test) adds its section here. -->
 
 ## Development
@@ -732,7 +788,7 @@ make help        # every target
 | `docker`, `docker-smoke` | Build the image `enron-service:dev` (`IMAGE`, `VERSION` overridable); build and smoke-test it with compose on ports 18080/15432 |
 | `compose-up`, `compose-down`, `compose-clean` | The [docker compose](#quick-start-docker-compose) stack |
 | `k8s-validate` | [Validate the manifests](#validating-the-manifests) |
-| `kind-up`, `deploy`, `undeploy`, `kind-down` | The [kind](#local-cluster-with-kind) workflow |
+| `kind-up`, `deploy`, `undeploy`, `kind-down` | The [kind](#local-cluster-with-kind) workflow (`LOCAL_DATASET=1` on `kind-up` and `deploy`: [local dataset](#local-dataset-opt-in)) |
 | `py-lock` | Re-resolve `requirements-dev.in` into the hashed lock |
 | `clean` | Remove build outputs (`bin/`) |
 <!-- #13 adds its `e2e-kind` target as a row here. -->
