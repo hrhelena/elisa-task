@@ -223,9 +223,10 @@ Downloads `DATASET_URL` and extracts it to `$DATA_DIR/maildir` in the background
 
 | Situation | Response |
 |---|---|
-| `$DATA_DIR/maildir` already exists (a completed fetch, or a pre-extracted copy such as the local `Dataset/maildir`) | `200` with `"state":"ready"`; nothing is downloaded |
+| `$DATA_DIR/maildir` is a readable directory, not a symlink (a completed fetch, or a pre-extracted copy such as the local `Dataset/maildir`) | `200` with `"state":"ready"`; nothing is downloaded |
 | Fetch started, already running, or retried after a failure | `202`, `Location: /status`, the current progress |
-| `$DATA_DIR/maildir` exists but is not a directory (a file, or a symlink that does not lead to a directory) | `409 maildir_not_directory`; nothing is downloaded |
+| `$DATA_DIR/maildir` exists but is not a directory: a file, or a symlink to anything (symlinks are never followed) | `409 maildir_not_directory`; nothing is downloaded |
+| `$DATA_DIR/maildir` is a directory the service cannot read (for example permissions, or a volume without a matching `fsGroup`) | `409 maildir_unreadable`; nothing is downloaded |
 | `DATA_DIR` is not writable | `500 data_dir_not_writable` |
 | Any other error while starting the fetch | `500 internal` |
 | The service is shutting down | `503 unavailable` |
@@ -238,7 +239,7 @@ The body (the same object as `dataset` in `GET /status`):
 | `path` | Where the maildir is expected (`$DATA_DIR/maildir`) |
 | `bytes_downloaded`, `bytes_total` | Download progress; `bytes_total` is `-1` until the server sends a length |
 | `files_extracted` | Files written so far |
-| `error` | Why the fetch failed, for example `download failed: HTTP 404`, `insufficient free inodes: need 530000, have N`, or `insufficient disk space`; otherwise `null` |
+| `error` | Why the fetch failed, for example `download failed: HTTP 404`, `insufficient free inodes: need 530000, have N`, or `insufficient disk space`. With `state: absent`, why an existing `$DATA_DIR/maildir` cannot be used, for example `maildir path exists and is not a directory: /data/maildir is a symlink, which is not followed`. Otherwise `null` |
 | `started_at`, `finished_at` | Times of the current or last fetch in this process, `null` if none |
 
 Calling `POST /fetch` while a fetch runs never starts a second download. Calling it after a failure retries from
@@ -255,7 +256,8 @@ Starts an ingestion of `$DATA_DIR/maildir` in the background
 |---|---|
 | No run in progress (never ran, or the last run `completed` or `failed`) | `202`, `Location: /status`, `{"run_id":4,"state":"running","started_at":"2026-10-23T10:00:00Z"}` |
 | A run is in progress on any replica | `409 ingestion_running` |
-| `$DATA_DIR/maildir` is missing, or is not a plain directory (a file, a symlink, unreadable) | `409 dataset_missing`, with the message `maildir not found at <path>; call POST /fetch first` |
+| `$DATA_DIR/maildir` is missing | `409 dataset_missing`, with the message `maildir not found at <path>; call POST /fetch first` |
+| `$DATA_DIR/maildir` exists but cannot be used (a symlink, a file, unreadable) | `409 dataset_missing`, with the message `the maildir at <path> cannot be used: <problem>`, for example `it is a symlink, which is not followed; replace it with the directory itself` (`POST /fetch` refuses it too) |
 | The database fails or the 10 s budget runs out | `503 unavailable` |
 | The service is shutting down | `503 unavailable` |
 
@@ -498,7 +500,8 @@ The engine walks `$DATA_DIR/maildir` in lexical order and parses files on `INGES
 stores rows in batches of `INGEST_BATCH_SIZE`, or every second, with `ON CONFLICT (source_path) DO NOTHING`. Counters
 are written to the run row every `INGEST_PROGRESS_INTERVAL` and at the end. At most one run is active in the cluster
 (a Postgres session advisory lock on a dedicated connection). The dataset root must be a directory, not a symlink.
-`POST /fetch` currently follows such a link (see [Known limitations](#known-limitations)).
+`POST /fetch` applies the same rule. To use a dataset stored elsewhere, mount it, or point `DATA_DIR` at the
+directory that contains the real `maildir` directory.
 
 ### Startup
 
@@ -843,9 +846,6 @@ The full records are in [`Docs/ADR`](Docs/ADR/README.md). In short:
 - **Close can time out during a failed start.** If a start failure has already begun releasing its lock with the
   10 s write timeout, a concurrent shutdown does not shorten it. Closing can then exceed its 5 s budget and the
   process exits with status 1. No data is lost, and the run is reported as `interrupted`.
-- **A symlinked maildir is a dead end** (tracked in #45). If `$DATA_DIR/maildir` is a symlink to a directory, `POST /fetch` reports
-  it `ready` (it follows the link), but `POST /start` refuses it with `409 dataset_missing` (the walker does not
-  follow links). Point `DATA_DIR` at the real parent directory, or mount the dataset, instead of linking it.
 - **Slow compose on macOS.** Through the Docker Desktop bind mount, an ingestion takes minutes instead of about
   23 s.
 

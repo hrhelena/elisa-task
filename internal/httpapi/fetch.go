@@ -64,7 +64,7 @@ func fetchHandler(f Fetcher, logger *slog.Logger) http.Handler {
 			// A state conflict, like ADR 0011's dataset_missing: the caller
 			// must remove the file before a fetch can succeed.
 			writeError(w, http.StatusConflict, CodeMaildirNotDirectory,
-				"$DATA_DIR/maildir exists but is not a directory; remove it and retry")
+				"$DATA_DIR/maildir exists but is not a directory (symlinks are not followed); remove it and retry")
 			return
 		case errors.Is(err, fetch.ErrClosed):
 			writeError(w, http.StatusServiceUnavailable, CodeUnavailable, "the service is shutting down")

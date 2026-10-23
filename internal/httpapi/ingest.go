@@ -43,11 +43,24 @@ var (
 type DatasetMissingError struct {
 	// Path is where the maildir is expected; it is shown to the caller.
 	Path string
-	Err  error
+	// Problem says why an existing maildir cannot be used, for example "it
+	// is a symlink, which is not followed; replace it with the directory
+	// itself". It is empty when the maildir does not exist, and the caller
+	// is then told to call POST /fetch (#45).
+	Problem string
+	Err     error
 }
 
 func (e *DatasetMissingError) Error() string {
 	return fmt.Sprintf("dataset missing at %s: %v", e.Path, e.Err)
+}
+
+// message is the dataset_missing message shown to the caller.
+func (e *DatasetMissingError) message() string {
+	if e.Problem != "" {
+		return fmt.Sprintf("the maildir at %s cannot be used: %s", e.Path, e.Problem)
+	}
+	return fmt.Sprintf("maildir not found at %s; call POST /fetch first", e.Path)
 }
 
 func (e *DatasetMissingError) Unwrap() error { return e.Err }
@@ -126,8 +139,7 @@ func startHandler(ing Ingester, logger *slog.Logger) http.Handler {
 			writeError(w, http.StatusConflict, CodeIngestionRunning, "an ingestion is already running")
 			return
 		case errors.As(err, &missing):
-			writeError(w, http.StatusConflict, CodeDatasetMissing,
-				fmt.Sprintf("maildir not found at %s; call POST /fetch first", missing.Path))
+			writeError(w, http.StatusConflict, CodeDatasetMissing, missing.message())
 			return
 		default:
 			logFailure(ctx, r, logger, "starting ingestion failed", err)

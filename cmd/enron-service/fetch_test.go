@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/rand"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -143,5 +145,68 @@ func TestRunShutdownDuringDownloadRemovesTempDir(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"msg":"fetch failed"`) || !strings.Contains(out.String(), "fetch canceled") {
 		t.Errorf("no canceled fetch log line in:\n%s", out.String())
+	}
+}
+
+// Scenarios: Fetch rejects a symlinked maildir; Start explains a symlinked
+// maildir (#45). Through the wired service, /fetch, /start and the dataset
+// section of /status agree that a symlinked maildir is not a dataset, and
+// /start names the problem instead of sending the caller to /fetch.
+func TestFetchAndStartRejectASymlinkedMaildir(t *testing.T) {
+	t.Parallel()
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	dataDir := t.TempDir()
+	maildir := filepath.Join(dataDir, "maildir")
+	target := filepath.Join(t.TempDir(), "maildir")
+	if err := os.MkdirAll(filepath.Join(target, "allen-p", "inbox"), 0o755); err != nil { //nolint:gosec // test fixture.
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, maildir); err != nil {
+		t.Fatal(err)
+	}
+
+	base, _, cancel, done, out := startRun(t, map[string]string{
+		"HTTP_ADDR": "127.0.0.1:0", "DATA_DIR": dataDir, "DATASET_URL": srv.URL,
+	})
+	client := newClient()
+
+	code, body := post(t, client, base+"/fetch")
+	if code != http.StatusConflict || !strings.Contains(body, `"code":"maildir_not_directory"`) {
+		t.Errorf("POST /fetch = %d %s, want 409 maildir_not_directory", code, body)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Errorf("download requests = %d, want 0", n)
+	}
+
+	code, body = post(t, client, base+"/start")
+	wantMsg := "the maildir at " + maildir + " cannot be used: it is a symlink, which is not followed; " +
+		"replace it with the directory itself"
+	if code != http.StatusConflict || !strings.Contains(body, `"code":"dataset_missing"`) ||
+		!strings.Contains(body, wantMsg) || strings.Contains(body, "POST /fetch") {
+		t.Errorf("POST /start = %d %s, want 409 dataset_missing with %q and no POST /fetch hint", code, body, wantMsg)
+	}
+
+	_, body = get(t, client, base+"/status")
+	var st struct {
+		Dataset struct {
+			State string  `json:"state"`
+			Error *string `json:"error"`
+		} `json:"dataset"`
+	}
+	if err := json.Unmarshal([]byte(body), &st); err != nil {
+		t.Fatalf("GET /status body %q: %v", body, err)
+	}
+	if st.Dataset.State != "absent" || st.Dataset.Error == nil || !strings.Contains(*st.Dataset.Error, "is a symlink") {
+		t.Errorf("GET /status dataset = %s, want absent with an error naming the symlink", body)
+	}
+
+	cancel()
+	if code := <-done; code != 0 {
+		t.Errorf("exit code = %d, want 0:\n%s", code, out.String())
 	}
 }

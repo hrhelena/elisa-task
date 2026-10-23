@@ -312,22 +312,24 @@ func TestBinaryStartDatasetMissing(t *testing.T) {
 	client := newClient()
 	maildir := filepath.Join(dataDir, "maildir")
 
-	check := func(what string) {
+	check := func(what, wantMsg string) {
 		t.Helper()
 		code, _, body := postStart(t, client, base)
 		if code != http.StatusConflict || body.Error == nil || body.Error.Code != "dataset_missing" ||
-			body.Error.Message != "maildir not found at "+maildir+"; call POST /fetch first" {
-			t.Errorf("POST /start with %s = %d %+v, want 409 dataset_missing naming %s", what, code, body.Error, maildir)
+			body.Error.Message != wantMsg {
+			t.Errorf("POST /start with %s = %d %+v, want 409 dataset_missing %q", what, code, body.Error, wantMsg)
 		}
 	}
-	check("no maildir")
+	check("no maildir", "maildir not found at "+maildir+"; call POST /fetch first")
 
 	target := t.TempDir()
 	validMaildir(t, target, 1)
 	if err := os.Symlink(filepath.Join(target, "maildir"), maildir); err != nil {
 		t.Fatal(err)
 	}
-	check("a symlinked maildir")
+	// #45: the message names the problem; POST /fetch would refuse it too.
+	check("a symlinked maildir", "the maildir at "+maildir+" cannot be used: "+
+		"it is a symlink, which is not followed; replace it with the directory itself")
 
 	if st := getStatus(t, client, base); st.State != "idle" {
 		t.Errorf("status after rejected starts = %+v, want idle", st)

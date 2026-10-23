@@ -14,6 +14,12 @@ var (
 	// ErrDatasetMissing is returned when the dataset root does not exist or
 	// is not a readable directory (ADR 0011: 409 dataset_missing).
 	ErrDatasetMissing = errors.New("dataset not found")
+	// ErrDatasetInvalid is returned when the dataset root exists but cannot
+	// be used: it is a symlink (never followed), not a directory, or not
+	// readable. It wraps ErrDatasetMissing, so ADR 0011's 409
+	// dataset_missing still applies; errors.As with *InvalidRootError gives
+	// the problem (#45).
+	ErrDatasetInvalid = fmt.Errorf("%w: dataset root is not usable", ErrDatasetMissing)
 	// ErrNotRegularFile is returned by a Source's open function for an entry
 	// that is not a regular file (symlink, device, socket, ...).
 	ErrNotRegularFile = errors.New("not a regular file")
@@ -21,6 +27,28 @@ var (
 	// directory the walk could not read. Its files are not visited.
 	ErrUnreadableDir = errors.New("directory not readable")
 )
+
+// InvalidRootError says why an existing dataset root cannot be used. It
+// matches ErrDatasetInvalid and ErrDatasetMissing with errors.Is.
+type InvalidRootError struct {
+	Path string
+	// Problem is a short explanation for an operator, for example "it is a
+	// symlink, which is not followed; replace it with the directory itself".
+	Problem string
+	// Err is the underlying error, if any (for example a permission error).
+	Err error
+}
+
+func (e *InvalidRootError) Error() string {
+	return fmt.Sprintf("%v: %s: %s", ErrDatasetInvalid, e.Path, e.Problem)
+}
+
+// Is reports whether target is ErrDatasetInvalid or ErrDatasetMissing.
+func (e *InvalidRootError) Is(target error) bool {
+	return target == ErrDatasetInvalid || target == ErrDatasetMissing
+}
+
+func (e *InvalidRootError) Unwrap() error { return e.Err }
 
 // OpenFunc opens one entry yielded by a Source.
 type OpenFunc func() (io.ReadCloser, error)
@@ -35,7 +63,8 @@ type Source interface {
 	// ErrDatasetMissing (wrapped) if the root is or becomes unavailable.
 	Walk(ctx context.Context, fn func(relPath string, open OpenFunc) error) error
 	// Available returns nil if the dataset root exists and is readable, else
-	// an error wrapping ErrDatasetMissing.
+	// an error wrapping ErrDatasetMissing (and ErrDatasetInvalid when the
+	// root exists but cannot be used).
 	Available() error
 }
 
@@ -52,21 +81,36 @@ func NewMaildirSource(root string) Source {
 
 // Available requires the root itself to be a directory, not a symlink to
 // one: the walk does not follow links, and POST /fetch treats a symlinked
-// maildir the same way (409 maildir_not_directory).
+// maildir the same way (409 maildir_not_directory, #45). A root that does not
+// exist wraps ErrDatasetMissing; one that exists but cannot be used is an
+// *InvalidRootError.
 func (s *maildirSource) Available() error {
 	fi, err := os.Lstat(s.root)
-	if err != nil {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
 		return fmt.Errorf("%w: %w", ErrDatasetMissing, err)
-	}
-	if !fi.IsDir() {
-		return fmt.Errorf("%w: %s is not a directory (%s)", ErrDatasetMissing, s.root, fi.Mode().Type())
+	case err != nil:
+		return &InvalidRootError{Path: s.root, Problem: "it cannot be checked: " + pathErrText(err), Err: err}
+	case fi.Mode()&fs.ModeSymlink != 0:
+		return &InvalidRootError{Path: s.root, Problem: "it is a symlink, which is not followed; replace it with the directory itself"}
+	case !fi.IsDir():
+		return &InvalidRootError{Path: s.root, Problem: fmt.Sprintf("it is not a directory (mode %s)", fi.Mode())}
 	}
 	f, err := os.Open(s.root)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrDatasetMissing, err)
+		return &InvalidRootError{Path: s.root, Problem: "it cannot be read: " + pathErrText(err), Err: err}
 	}
 	_ = f.Close() // read-only directory handle
 	return nil
+}
+
+// pathErrText returns the cause of a *fs.PathError without the operation and
+// path, which the caller already names (for example "permission denied").
+func pathErrText(err error) string {
+	if pe, ok := errors.AsType[*fs.PathError](err); ok {
+		return pe.Err.Error()
+	}
+	return err.Error()
 }
 
 func (s *maildirSource) Walk(ctx context.Context, fn func(relPath string, open OpenFunc) error) error {

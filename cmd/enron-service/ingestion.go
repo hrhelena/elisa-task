@@ -103,7 +103,13 @@ func mapStartErr(err error, maildir string) error {
 	case errors.Is(err, ingest.ErrAlreadyRunning):
 		return fmt.Errorf("%w: %w", httpapi.ErrIngestionRunning, err)
 	case errors.Is(err, ingest.ErrDatasetMissing):
-		return &httpapi.DatasetMissingError{Path: maildir, Err: err}
+		// An existing but unusable maildir (a symlink, a file) gets its own
+		// message: POST /fetch would refuse it too (#45).
+		dm := &httpapi.DatasetMissingError{Path: maildir, Err: err}
+		if inv, ok := errors.AsType[*ingest.InvalidRootError](err); ok {
+			dm.Problem = inv.Problem
+		}
+		return dm
 	default:
 		return err
 	}
