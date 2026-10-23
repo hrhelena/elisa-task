@@ -75,11 +75,16 @@ make undeploy       # delete the namespace and everything in it, including both 
 make kind-down      # delete the cluster
 ```
 
-Every command targets the context `kind-$(KIND_CLUSTER)` explicitly (`KIND_CLUSTER` defaults to `elisa-enron`), so
-other clusters and your current kube context are never touched. `make deploy` loads the image under a tag derived
-from its image ID (`enron-service:dev-<id>`), so a rebuilt image rolls out even though the pod uses
-`imagePullPolicy: IfNotPresent`. The credentials in `overlays/kind` (`enron`/`enron`) are for the throwaway local
-cluster only.
+Every `kubectl` call in these targets passes `--context kind-$(KIND_CLUSTER)` (`KIND_CLUSTER` defaults to
+`elisa-enron`), so no other cluster is ever targeted. `kind create cluster` adds the `kind-elisa-enron` context to
+your kubeconfig and makes it current. `make kind-up` then switches back to the context that was current before (or
+leaves none current if there was none), and `make kind-down` removes the context again.
+
+`make deploy` loads the image under a tag derived from its image ID (`enron-service:dev-<id>`), so a rebuilt image
+rolls out even though the pod uses `imagePullPolicy: IfNotPresent`. The image's timestamps come from the commit
+(`SOURCE_DATE_EPOCH` and the `created` label), so running `make deploy` again for the same commit yields the same image
+ID and leaves the running pod (and an in-flight `/fetch`) alone. A dirty tree changes `VERSION` and therefore the
+image. The credentials in `overlays/kind` (`enron`/`enron`) are for the throwaway local cluster only.
 
 To get the dataset into the cluster, call `POST /fetch` through the port-forward. It downloads into the
 `enron-data` volume, which kind's local-path provisioner backs with a directory inside the node container, so the
@@ -89,13 +94,35 @@ the pinned kustomize.
 
 ### Cloud (EKS, GKE)
 
+Set the real image in a local overlay on top of `overlays/cloud`, rather than editing the tracked overlay. Running
+`kustomize edit` there would dirty the repository and fail `make k8s-validate`, which expects the placeholder.
+Directories named `deploy/k8s/overlays/*-local/` are gitignored:
+
 ```bash
 kubectl create namespace enron   # the overlay also defines it; the Secret must exist before the pod starts
 kubectl -n enron create secret generic enron-db \
   --from-literal=DATABASE_URL='postgres://USER:PASSWORD@HOST:5432/enron?sslmode=require'
-(cd deploy/k8s/overlays/cloud && go tool kustomize edit set image enron-service=REGISTRY/enron-service:VERSION)
-kubectl apply -k deploy/k8s/overlays/cloud
+mkdir -p deploy/k8s/overlays/prod-local
+cat > deploy/k8s/overlays/prod-local/kustomization.yaml <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../cloud
+images:
+  - name: REGISTRY/enron-service     # the placeholder that overlays/cloud sets
+    newName: ghcr.io/you/enron-service
+    newTag: v1.2.3
+EOF
+kubectl apply -k deploy/k8s/overlays/prod-local
 ```
+
+The same local overlay is where a size patch for `enron-data` goes (see below).
+
+**Do not run `kubectl delete -k` on the cloud overlay** unless you mean to delete everything. The overlay contains
+the `enron` Namespace, so deleting it deletes the namespace and everything in it: the out-of-band Secret `enron-db`,
+and the PVC `enron-data` with the downloaded dataset (with the default `Delete` reclaim policy, the cloud disk is
+deleted too). To stop the service, scale it down instead: `kubectl -n enron scale deployment/enron-service --replicas=0`.
+To remove only the app, delete the Deployment and the Service by name.
 
 The cloud overlay contains no database resources. Postgres is managed (RDS or Cloud SQL), and use
 `sslmode=require` (or `verify-full`). On GKE, a Cloud SQL Auth Proxy sidecar is an alternative to a direct
@@ -107,7 +134,7 @@ The PVC `enron-data` requests **10Gi** even though the extracted dataset is abou
 about 521k files and directories (ADR 0015). ext4, the filesystem of the EKS gp3 and GKE standard-rwo defaults,
 allocates about one inode per 16 KiB: 5Gi gives about 327k inodes (too few), 10Gi about 655k. `POST /fetch` checks
 before downloading and fails fast with `insufficient free inodes: need 530000, have N` below 530,000 free inodes,
-or with `insufficient disk space` below 4 GiB free. To change the size, add a patch to the cloud overlay that keeps
+or with `insufficient disk space` below 4 GiB free. To change the size, add a patch to your local overlay on top of `overlays/cloud` that keeps
 at least 530,000 free inodes and 4 GiB free: at least 10Gi on ext4, and smaller only with a StorageClass whose
 filesystem allocates inodes dynamically (for example XFS via `csi.storage.k8s.io/fstype: xfs`).
 
@@ -121,7 +148,7 @@ filesystem allocates inodes dynamically (for example XFS via `csi.storage.k8s.io
 | `SHUTDOWN_DRAIN_DELAY` / `SHUTDOWN_TIMEOUT` | `5s` / `20s` (ConfigMap) | On `SIGTERM` the pod reports not-ready and keeps serving for 5s, so the Service drops its endpoint before connections close |
 | `terminationGracePeriodSeconds` | `40` | Above the worst-case shutdown: 5s drain + 20s `SHUTDOWN_TIMEOUT` + 5s for closers = 30s |
 | Resources | requests `cpu: 250m, memory: 256Mi`; limit `memory: 1Gi` | No CPU limit, to avoid throttling during ingestion |
-| Security | uid/gid `65532`, `fsGroup: 65532`, `readOnlyRootFilesystem`, no privilege escalation, all capabilities dropped, `RuntimeDefault` seccomp, no service account token | `/tmp` is an `emptyDir`; the dataset PVC is group-writable through `fsGroup` |
+| Security | uid/gid `65532`, `fsGroup: 65532`, `readOnlyRootFilesystem`, no privilege escalation, all capabilities dropped, `RuntimeDefault` seccomp, no service account token | `/tmp` is an `emptyDir`. How `/data` becomes writable depends on the volume: cloud CSI block volumes (EBS gp3, GCE PD) support `fsGroup`, so kubelet makes the volume root group `65532` and group-writable. kind's local-path volume is a hostPath directory created with mode `0777`, to which kubelet does not apply `fsGroup`. `fsGroupChangePolicy: OnRootMismatch` (also on Postgres) avoids a recursive chown of about 517k dataset files on every pod start |
 
 The pod template carries `prometheus.io/scrape`, `prometheus.io/port: "8080"` and `prometheus.io/path: /metrics`.
 There is one replica with the `Recreate` strategy, because the dataset volume is ReadWriteOnce (ADR 0014), so a
