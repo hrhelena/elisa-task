@@ -209,8 +209,15 @@ func TestBinaryStartAndStatus(t *testing.T) {
 		st.FilesSeen != 8 || st.TotalMessages != 6 || st.Error != nil || st.FinishedAt == nil {
 		t.Errorf("status after completion = %+v, want completed, 6 processed, 2 skipped, 8 seen, 6 stored", st)
 	}
-	if want := map[string]int64{"empty_file": 1, "not_an_email": 1}; !maps.Equal(st.SkipReasons, want) {
-		t.Errorf("skip_reasons = %v, want %v", st.SkipReasons, want)
+	// Every known reason is listed; only these two are non-zero.
+	nonZero := maps.Clone(st.SkipReasons)
+	maps.DeleteFunc(nonZero, func(_ string, n int64) bool { return n == 0 })
+	if want := map[string]int64{"empty_file": 1, "not_an_email": 1}; !maps.Equal(nonZero, want) ||
+		len(st.SkipReasons) != len(knownSkipReasons) {
+		t.Errorf("skip_reasons = %v, want %v and every other known reason at 0", st.SkipReasons, want)
+	}
+	if n, ok := st.FieldErrors["missing_date"]; !ok || n != 0 {
+		t.Errorf("field_errors = %v, want missing_date listed as 0", st.FieldErrors)
 	}
 	if st.FieldErrors["invalid_sender"] != 1 || st.FieldErrors["invalid_date"] != 1 {
 		t.Errorf("field_errors = %v, want invalid_sender 1 and invalid_date 1", st.FieldErrors)

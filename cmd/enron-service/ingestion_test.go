@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -174,8 +176,10 @@ func TestIngestionStatus(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// Idle keeps empty maps, as in the ticket's idle response.
 		if got.State != httpapi.StateIdle || got.RunID != nil || got.StartedAt != nil || got.UpdatedAt != nil ||
-			got.TotalMessages != 7 || got.SkipReasons == nil || got.FieldErrors == nil {
+			got.TotalMessages != 7 || got.SkipReasons == nil || got.FieldErrors == nil ||
+			len(got.SkipReasons) != 0 || len(got.FieldErrors) != 0 {
 			t.Errorf("Status = %+v, want idle, no run fields, total 7, empty maps", got)
 		}
 	})
@@ -200,18 +204,45 @@ func TestIngestionStatus(t *testing.T) {
 		}
 		if got.State != "failed" || *got.RunID != 3 || !got.StartedAt.Equal(start) || !got.FinishedAt.Equal(end) ||
 			!got.UpdatedAt.Equal(end) || *got.Error != msg || got.FilesSeen != 8 || got.MessagesProcessed != 6 ||
-			got.MessagesSkipped != 2 || got.TotalMessages != 6 ||
-			!maps.Equal(got.SkipReasons, run.SkipReasons) || !maps.Equal(got.FieldErrors, run.FieldErrors) {
+			got.MessagesSkipped != 2 || got.TotalMessages != 6 {
 			t.Errorf("Status = %+v, want the run's fields", got)
+		}
+		// Every known key is listed, with 0 for those that did not occur.
+		wantSkips := map[string]int64{
+			"empty_file": 1, "not_an_email": 1, "header_too_large": 0, "read_error": 0,
+			"outside_mailbox": 0, "not_regular_file": 0, "parse_panic": 0, "parse_error": 0,
+		}
+		wantFields := map[string]int64{
+			"invalid_sender": 1, "missing_sender": 0, "invalid_date": 0, "missing_date": 0,
+			"invalid_encoding": 0, "invalid_recipient": 0,
+		}
+		if !maps.Equal(got.SkipReasons, wantSkips) || !maps.Equal(got.FieldErrors, wantFields) {
+			t.Errorf("skip_reasons = %v, field_errors = %v; want %v, %v", got.SkipReasons, got.FieldErrors, wantSkips, wantFields)
+		}
+		// The run's own maps are not modified.
+		if len(run.SkipReasons) != 2 || len(run.FieldErrors) != 1 {
+			t.Errorf("the store's maps were modified: %v, %v", run.SkipReasons, run.FieldErrors)
 		}
 	})
 
-	t.Run("nil maps from the store are empty", func(t *testing.T) {
+	t.Run("unknown keys from the engine are kept", func(t *testing.T) {
+		t.Parallel()
+		run := &store.Run{ID: 1, State: store.RunRunning, Counters: store.Counters{
+			SkipReasons: map[string]int64{"future_reason": 2}, FieldErrors: map[string]int64{"future_issue": 3},
+		}}
+		svc := &fakeIngestService{status: ingest.Status{State: ingest.StateRunning, Run: run}}
+		got, err := newTestIngestion(svc, fakeLockChecker{}).Status(t.Context())
+		if err != nil || got.SkipReasons["future_reason"] != 2 || got.FieldErrors["future_issue"] != 3 {
+			t.Errorf("Status = %+v, %v; want the unknown keys kept", got, err)
+		}
+	})
+
+	t.Run("nil maps from the store are pre-filled", func(t *testing.T) {
 		t.Parallel()
 		svc := &fakeIngestService{status: ingest.Status{State: ingest.StateRunning, Run: &store.Run{ID: 1, State: store.RunRunning}}}
 		got, err := newTestIngestion(svc, fakeLockChecker{}).Status(t.Context())
-		if err != nil || got.SkipReasons == nil || got.FieldErrors == nil {
-			t.Errorf("Status = %+v, %v; want empty non-nil maps", got, err)
+		if err != nil || len(got.SkipReasons) != len(knownSkipReasons) || len(got.FieldErrors) != len(knownFieldErrors) {
+			t.Errorf("Status = %+v, %v; want every known key at 0", got, err)
 		}
 	})
 
@@ -222,4 +253,74 @@ func TestIngestionStatus(t *testing.T) {
 			t.Errorf("err = %v, want context.DeadlineExceeded", err)
 		}
 	})
+}
+
+// funcLockChecker is a lockChecker backed by a function.
+type funcLockChecker func(ctx context.Context) (bool, error)
+
+func (f funcLockChecker) IngestLockHeld(ctx context.Context) (bool, error) { return f(ctx) }
+
+// The pre-check has its own short budget: a hung database must not use up
+// the request's whole budget before the engine can answer.
+func TestIngestionLockCheckTimeout(t *testing.T) {
+	t.Parallel()
+	var left time.Duration
+	check := funcLockChecker(func(ctx context.Context) (bool, error) {
+		d, ok := ctx.Deadline()
+		if !ok {
+			return false, errors.New("no deadline")
+		}
+		left = time.Until(d)
+		return false, context.DeadlineExceeded // as if the database hung
+	})
+	svc := &fakeIngestService{startErr: fmt.Errorf("%w: absent", ingest.ErrDatasetMissing)}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	_, err := newTestIngestion(svc, check).Start(ctx)
+	if left <= 0 || left > lockCheckTimeout {
+		t.Errorf("pre-check deadline in %v, want at most %v", left, lockCheckTimeout)
+	}
+	var dm *httpapi.DatasetMissingError
+	if svc.starts != 1 || !errors.As(err, &dm) {
+		t.Errorf("after a timed-out pre-check: %d engine starts, err %v; want the engine's dataset_missing", svc.starts, err)
+	}
+}
+
+// A failed pre-check is logged at WARN with the request ID, or at DEBUG when
+// the client went away.
+func TestIngestionLockCheckLogging(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name      string
+		cancel    bool
+		wantLevel string
+	}{
+		{"database error", false, "WARN"},
+		{"client went away", true, "DEBUG"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var logs syncBuffer
+			logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			check := funcLockChecker(func(context.Context) (bool, error) {
+				if tt.cancel {
+					cancel()
+					return false, context.Canceled
+				}
+				return false, errors.New("checking ingest lock: connection refused")
+			})
+			ing := ingestion{svc: &fakeIngestService{startErr: errors.New("boom")}, lock: check, maildir: "/m", logger: logger}
+			h := httpapi.New(httpapi.Deps{Ingester: ing}, logger)
+			req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/start", nil)
+			req.Header.Set(httpapi.HeaderRequestID, "req-123")
+			h.ServeHTTP(httptest.NewRecorder(), req)
+
+			rec := findLog(decodeLogLines(t, []byte(logs.String())), "checking the ingest lock failed; trying to start anyway")
+			if rec == nil || rec["level"] != tt.wantLevel || rec["request_id"] != "req-123" {
+				t.Errorf("log record = %v, want level %s with request_id req-123", rec, tt.wantLevel)
+			}
+		})
+	}
 }
