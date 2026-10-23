@@ -150,6 +150,9 @@ func TestBinaryServesAndExitsCleanlyOnSIGTERM(t *testing.T) {
 
 // TestBinarySecondSignalForcesExit: during a long drain, a second SIGTERM
 // kills the process at once instead of waiting for the graceful shutdown.
+// The "shutting down" log line is the handover point: the binary restores
+// default signal handling before it logs that line (notifyContext), so no
+// sleep is needed and a second signal sent after it cannot be swallowed (#25).
 func TestBinarySecondSignalForcesExit(t *testing.T) {
 	t.Parallel()
 
