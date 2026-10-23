@@ -68,7 +68,8 @@ error naming the variable and exit with status 1.
 | Variable | Default | Meaning |
 |---|---|---|
 | `HTTP_ADDR` | `:8080` | HTTP listen address, `[host]:port` with a numeric port |
-| `DATABASE_URL` | `postgres://enron:enron@localhost:5432/enron?sslmode=disable` | Postgres connection string; pgxpool options such as `pool_max_conns` may be added as query parameters. At startup the service connects and applies the embedded migrations before it listens; if that fails within 1 minute, it exits with status 1 |
+| `DATABASE_URL` | `postgres://enron:enron@localhost:5432/enron?sslmode=disable` | Postgres connection string; pgxpool options such as `pool_max_conns` may be added as query parameters. See [Startup](#startup) |
+| `DB_STARTUP_TIMEOUT` | `60s` | Budget for opening the database at startup: connection retries, the migration lock wait and the migrations (positive duration) |
 | `DATA_DIR` | `./Dataset` | Dataset root; the maildir is expected at `$DATA_DIR/maildir` |
 | `DATASET_URL` | `https://www.cs.cmu.edu/~enron/enron_mail_20150507.tar.gz` | Archive downloaded by `POST /fetch` (http or https) |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` (JSON logs on stdout) |
@@ -87,6 +88,29 @@ error naming the variable and exit with status 1.
 ```sh
 curl -s 'localhost:8080/top-senders?limit=3'
 ```
+
+## Startup
+
+The service connects to Postgres and applies the embedded migrations before it listens. `DB_STARTUP_TIMEOUT`
+(default `60s`) bounds all of it:
+
+- While the database is not reachable yet (connection refused, DNS failure, no answer within 5s or within a longer
+  `connect_timeout` from `DATABASE_URL`, or the server reports that it is starting up, shutting down or out of
+  connections), the service retries with capped exponential backoff and jitter (250ms, 500ms, 1s, ... up to 5s),
+  logging each retry at `WARN` as `database not ready, retrying` with the attempt number and the error. The password
+  is never logged.
+- A server that answers but rejects the configuration is not retried: a wrong password or other authorization
+  failure (SQLSTATE class `28`), a missing database (`3D000`), or a TLS failure (for example `sslmode=require`
+  against a server without TLS, or a certificate that does not verify). When one connect makes several attempts
+  (several hosts, or TLS then plaintext with `sslmode` unset, `prefer` or `allow`), it counts as permanent only if
+  every attempt was rejected this way; a refused TLS attempt followed by "starting up" is retried.
+- Waiting for the migration lock held by another replica polls every second until the same budget ends.
+- Migrations run inside the budget too. Each one runs in a transaction, so a migration cut off by the deadline or a
+  signal rolls back completely. A future `-- +goose NO TRANSACTION` migration (such as `CREATE INDEX CONCURRENTLY`)
+  could be cut off halfway, so it must be written to be safe to run again.
+- When the budget runs out, or on a permanent error (a malformed `DATABASE_URL`, one of the rejections above, a
+  failed migration), it logs `opening database failed` and exits with status 1; the orchestrator then restarts it.
+- `SIGINT`/`SIGTERM` during startup stops the retries and exits with status 0.
 
 ## Operational endpoints
 

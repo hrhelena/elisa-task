@@ -19,6 +19,7 @@ import (
 const (
 	EnvHTTPAddr               = "HTTP_ADDR"
 	EnvDatabaseURL            = "DATABASE_URL"
+	EnvDBStartupTimeout       = "DB_STARTUP_TIMEOUT"
 	EnvDataDir                = "DATA_DIR"
 	EnvDatasetURL             = "DATASET_URL"
 	EnvLogLevel               = "LOG_LEVEL"
@@ -33,6 +34,7 @@ const (
 const (
 	DefaultHTTPAddr               = ":8080"
 	DefaultDatabaseURL            = "postgres://enron:enron@localhost:5432/enron?sslmode=disable" //nolint:gosec // local dev default, not a secret.
+	DefaultDBStartupTimeout       = time.Minute
 	DefaultDataDir                = "./Dataset"
 	DefaultDatasetURL             = "https://www.cs.cmu.edu/~enron/enron_mail_20150507.tar.gz"
 	DefaultLogLevel               = slog.LevelInfo
@@ -53,6 +55,9 @@ type Config struct {
 	HTTPAddr string
 	// DatabaseURL is the Postgres connection string.
 	DatabaseURL string
+	// DBStartupTimeout bounds opening the database at startup: connection
+	// retries, the migration lock wait and the migrations themselves.
+	DBStartupTimeout time.Duration
 	// DataDir is the dataset root; the maildir is expected at DataDir/maildir.
 	DataDir string
 	// DatasetURL is where POST /fetch downloads the dataset archive from.
@@ -97,6 +102,7 @@ func LoadFrom(lookup LookupFunc) (Config, error) {
 	cfg := Config{
 		HTTPAddr:               p.listenAddr(EnvHTTPAddr, DefaultHTTPAddr),
 		DatabaseURL:            p.str(EnvDatabaseURL, DefaultDatabaseURL),
+		DBStartupTimeout:       p.duration(EnvDBStartupTimeout, DefaultDBStartupTimeout),
 		DataDir:                p.str(EnvDataDir, DefaultDataDir),
 		DatasetURL:             p.httpURL(EnvDatasetURL, DefaultDatasetURL),
 		LogLevel:               p.level(EnvLogLevel, DefaultLogLevel),

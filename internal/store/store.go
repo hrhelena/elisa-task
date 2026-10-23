@@ -14,6 +14,12 @@ var (
 	// It signals a programming error, not malformed dataset content: that is
 	// sanitized or stored as NULL instead (ADR 0007).
 	ErrInvalidMessage = errors.New("invalid message")
+	// ErrUnreachable is wrapped by Open when connecting failed for a reason
+	// that may pass: the server is down, starting up, out of connections,
+	// unresolvable or slow. The caller may retry. Every other Open error is
+	// permanent: a malformed URL, a rejected password (SQLSTATE class 28), a
+	// missing database (3D000), a TLS failure, or a failed migration.
+	ErrUnreachable = errors.New("database unreachable")
 )
 
 // Message is one parsed maildir file (ADR 0003). Optional header fields are

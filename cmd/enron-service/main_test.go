@@ -362,8 +362,9 @@ func TestCloseStoreHonorsContext(t *testing.T) {
 	}
 }
 
-// Process level: an unreachable database makes the real binary exit 1
-// before listening, with a JSON error log.
+// Scenario: Database never comes up (#27), process level: the real binary
+// retries an unreachable database for DB_STARTUP_TIMEOUT, then exits 1
+// before listening, with a JSON error log and no password in the logs.
 func TestBinaryDatabaseUnavailableExitsWithStatus1(t *testing.T) {
 	t.Parallel()
 	bin := hostBinary(t)
@@ -371,17 +372,26 @@ func TestBinaryDatabaseUnavailableExitsWithStatus1(t *testing.T) {
 	cmd := exec.CommandContext(t.Context(), bin) //nolint:gosec // bin is built by this test run.
 	cmd.Env = []string{                          // Minimal environment, like the other binary tests.
 		"HTTP_ADDR=127.0.0.1:0",
+		"DB_STARTUP_TIMEOUT=3s",
 		// Port 1 on loopback refuses connections immediately.
 		"DATABASE_URL=postgres://enron:s3cret@127.0.0.1:1/enron?sslmode=disable&connect_timeout=2",
 	}
+	start := time.Now()
 	out, err := cmd.Output()
+	elapsed := time.Since(start)
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
 		t.Fatalf("exit = %v, want status 1:\n%s", err, out)
 	}
+	if elapsed < 3*time.Second || elapsed > 8*time.Second {
+		t.Errorf("exited after %v, want about 3s", elapsed)
+	}
 	lines := decodeLogLines(t, out)
 	if findLog(lines, "listening") != nil {
 		t.Errorf("binary listened without a database:\n%s", out)
+	}
+	if attempts := retryWarnings(t, lines); len(attempts) < 2 || attempts[0] != 1 || attempts[1] != 2 {
+		t.Errorf("retry warnings for attempts %v, want 1, 2, ...:\n%s", attempts, out)
 	}
 	if rec := findLog(lines, "opening database failed"); rec == nil || rec["level"] != "ERROR" {
 		t.Errorf(`want an ERROR "opening database failed" log line, got:\n%s`, out)

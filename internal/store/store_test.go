@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"slices"
@@ -238,17 +239,19 @@ func TestTopSendersInvalidLimit(t *testing.T) {
 	}
 }
 
-// TestOpenFails covers the startup failure paths (main exits 1 on them).
-// Errors must not echo the password from the URL into logs.
+// TestOpenFails covers the startup failure paths. Only an unreachable
+// server wraps ErrUnreachable (main retries it, #27); the others are
+// permanent. Errors must not echo the password from the URL into logs.
 func TestOpenFails(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name, url, wantSub string
+		wantUnreachable    bool
 	}{
-		{"malformed URL", "postgres://enron:s3cret@localhost:notaport/enron", "parsing database URL"},
-		{"unknown pool option", "postgres://enron:s3cret@localhost/enron?pool_max_conns=many", "parsing database URL"},
+		{"malformed URL", "postgres://enron:s3cret@localhost:notaport/enron", "parsing database URL", false},
+		{"unknown pool option", "postgres://enron:s3cret@localhost/enron?pool_max_conns=many", "parsing database URL", false},
 		// Port 1 on loopback refuses connections immediately.
-		{"unreachable server", "postgres://enron:s3cret@127.0.0.1:1/enron?connect_timeout=2", "connecting to postgres"},
+		{"unreachable server", "postgres://enron:s3cret@127.0.0.1:1/enron?connect_timeout=2", "connecting to postgres", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -263,6 +266,41 @@ func TestOpenFails(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), "s3cret") {
 				t.Errorf("err leaks the password: %q", err)
+			}
+			if got := errors.Is(err, ErrUnreachable); got != tt.wantUnreachable {
+				t.Errorf("errors.Is(err, ErrUnreachable) = %v, want %v (err %q)", got, tt.wantUnreachable, err)
+			}
+		})
+	}
+}
+
+// The migration lock wait follows the startup budget (DB_STARTUP_TIMEOUT)
+// instead of goose's fixed 5 minutes (#27).
+func TestLockAttemptsFollowTheDeadline(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	tests := []struct {
+		name      string
+		remaining time.Duration // 0: no deadline
+		want      uint64
+	}{
+		{"no deadline", 0, migrationLockDefaultRetryAttempts},
+		{"default budget", time.Minute, 60},
+		{"partial second rounds down", 2500 * time.Millisecond, 2},
+		{"under a second", 300 * time.Millisecond, 1},
+		{"already past", -time.Second, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			if tt.remaining != 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithDeadline(ctx, now.Add(tt.remaining))
+				defer cancel()
+			}
+			if got := lockAttempts(ctx, now); got != tt.want {
+				t.Errorf("lockAttempts = %d, want %d", got, tt.want)
 			}
 		})
 	}
