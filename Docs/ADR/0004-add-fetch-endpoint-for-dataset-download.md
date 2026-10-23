@@ -43,5 +43,5 @@ from the configured data directory.
 
 - Positive: the service is self-contained in a fresh cluster; local runs skip the download.
 - Negative: the data directory must be writable and big enough (about 3 GB) in the cluster.
-- Follow-ups: fetch ticket; the k8s manifests provide a PVC for `DATA_DIR`. How a dataset volume is shared between
-  replicas is an open question (see the k8s ticket).
+- Follow-ups: fetch ticket; the k8s manifests provide a PVC for `DATA_DIR`. The dataset volume topology (one replica, RWO) is
+  decided in [0014](0014-kubernetes-deployment-topology.md).

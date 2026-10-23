@@ -51,4 +51,4 @@ make counts unexplainable. Counting and reporting gives both robustness and audi
 - Positive: ingestion completes on the real dataset; the `/status` numbers add up
   (`files_seen = messages_processed + messages_skipped`).
 - Negative: the parser must be tested with a fixture set of malformed files (`testdata/`).
-- Follow-ups: exact sender normalization rules are an open question (see the parser ticket).
+- Follow-ups: sender normalization rules are decided in [0012](0012-lenient-sender-normalization.md).

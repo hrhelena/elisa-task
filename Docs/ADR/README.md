@@ -14,4 +14,8 @@ supersedes it (see `.claude/skills/adr/SKILL.md`).
 | [0007](0007-tolerate-malformed-dataset-entries.md) | Tolerate malformed dataset entries | Accepted | 2026-10-23 |
 | [0008](0008-project-local-pinned-tooling-and-ci.md) | Project-local pinned tooling, pre-commit hooks and GitHub Actions CI | Accepted | 2026-10-23 |
 | [0009](0009-extensible-layered-architecture.md) | Extensible layered architecture | Accepted | 2026-10-23 |
-| [0010](0010-ingestion-state-in-postgres-with-advisory-lock.md) | Ingestion state in Postgres with advisory-lock single-flight | Proposed | 2026-10-23 |
+| [0010](0010-ingestion-state-in-postgres-with-advisory-lock.md) | Ingestion state in Postgres with advisory-lock single-flight | Accepted | 2026-10-23 |
+| [0011](0011-http-api-contract-and-start-semantics.md) | HTTP API contract and /start semantics | Accepted | 2026-10-23 |
+| [0012](0012-lenient-sender-normalization.md) | Lenient sender normalization | Accepted | 2026-10-23 |
+| [0013](0013-goose-for-database-migrations.md) | Use goose v3 for database migrations | Accepted | 2026-10-23 |
+| [0014](0014-kubernetes-deployment-topology.md) | Kubernetes deployment topology: one replica, RWO dataset volume, Postgres StatefulSet in kind | Accepted | 2026-10-23 |

@@ -47,4 +47,4 @@ with no cluster-wide coordination. Postgres costs one extra container locally, w
 
 - Positive: stateless app pods, consistent `/status` across replicas, cluster-wide single-flight ingestion, a clear growth path.
 - Negative: local development and integration tests need Docker. CI must run testcontainers.
-- Follow-ups: schema and migrations ticket; the migration tool (goose or golang-migrate) is still to be confirmed.
+- Follow-ups: schema and migrations ticket (#4); migration tool decided in [0013](0013-goose-for-database-migrations.md).

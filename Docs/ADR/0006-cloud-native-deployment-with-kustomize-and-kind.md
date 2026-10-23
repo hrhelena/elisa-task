@@ -28,8 +28,8 @@ EKS or GKE with managed Postgres.
 - **Manifests:** `deploy/k8s/base` (Deployment, Service `ClusterIP`, ConfigMap, PVC for `DATA_DIR`, probes, resource
   requests/limits, security context) and overlays `deploy/k8s/overlays/kind` (in-cluster Postgres, locally built image
   loaded with `kind load`) and `deploy/k8s/overlays/cloud` (external managed Postgres via Secret, no in-cluster DB).
-- **Postgres:** managed in the cloud (RDS or Cloud SQL). In kind, an in-cluster Postgres; whether this is a plain
-  StatefulSet or the CloudNativePG operator is an open question (recommendation: plain StatefulSet).
+- **Postgres:** managed in the cloud (RDS or Cloud SQL). In kind, an in-cluster Postgres as a plain
+  StatefulSet (see [0014](0014-kubernetes-deployment-topology.md)).
 - **Local:** `docker compose up` runs Postgres plus the service with the local `Dataset/` mounted. `make kind-up deploy`
   creates a kind cluster and deploys the kind overlay.
 

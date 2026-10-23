@@ -1,10 +1,10 @@
 # 0010. Ingestion state in Postgres with advisory-lock single-flight
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-10-23
 - **Author:** Helena Rivas (with product-owner agent)
 - **Deciders:** Helena Rivas
-- **Related:** [#5](https://github.com/hrhelena/elisa-task/issues/5), [#7](https://github.com/hrhelena/elisa-task/issues/7), [#8](https://github.com/hrhelena/elisa-task/issues/8), [0001](0001-use-postgres-as-the-datastore.md), [0006](0006-cloud-native-deployment-with-kustomize-and-kind.md)
+- **Related:** [#5](https://github.com/hrhelena/elisa-task/issues/5), [#7](https://github.com/hrhelena/elisa-task/issues/7), [#8](https://github.com/hrhelena/elisa-task/issues/8), [0001](0001-use-postgres-as-the-datastore.md), [0006](0006-cloud-native-deployment-with-kustomize-and-kind.md), [0011](0011-http-api-contract-and-start-semantics.md), [0014](0014-kubernetes-deployment-topology.md)
 
 ## Summary
 
@@ -41,11 +41,12 @@ The run executes asynchronously inside the API process that accepted `POST /star
 | In-memory state | Simplest | Wrong with more than one replica; lost on restart |
 | Separate Kubernetes Job for ingestion | Isolates heavy work; natural retries | `POST /start` must create a Job (RBAC to the k8s API); harder to run locally without k8s |
 
-This ADR is **Proposed**: it follows from the Postgres and cloud-native decisions, but the in-process vs Kubernetes Job
-choice and the re-run semantics after completion need the user's confirmation.
+The user confirmed in-process execution (a Kubernetes Job is a documented extension, see
+[0014](0014-kubernetes-deployment-topology.md)) and idempotent re-runs after completion
+([0011](0011-http-api-contract-and-start-semantics.md)).
 
 ## Consequences
 
 - Positive: `/status` is correct on any replica; double-start is impossible cluster-wide; crashed runs are detected.
 - Negative: the replica running the ingestion needs the dataset volume; a lock connection is held for the run.
-- Follow-ups: ingestion engine ticket, `/start` and `/status` ticket.
+- Follow-ups: #5 (run state and lock), #7 (ingestion engine), #8 (`/start` and `/status`).
