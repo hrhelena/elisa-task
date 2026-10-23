@@ -21,7 +21,8 @@ const (
 )
 
 // NewHTTPClient returns the HTTP client used for the download: a 10s connect
-// timeout and no overall timeout.
+// timeout and no overall timeout. Keep-alives are off: a fetch is one large
+// request, so an idle pooled connection would only linger after it.
 func NewHTTPClient() *http.Client {
 	tr := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -29,8 +30,7 @@ func NewHTTPClient() *http.Client {
 		ForceAttemptHTTP2:     true,
 		TLSHandshakeTimeout:   tlsHandshakeTimeout,
 		ResponseHeaderTimeout: responseHeaderTimeout,
-		MaxIdleConns:          2,
-		IdleConnTimeout:       90 * time.Second,
+		DisableKeepAlives:     true,
 	}
 	return &http.Client{Transport: tr}
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 
 	"github.com/hrhelena/elisa-task/internal/config"
+	"github.com/hrhelena/elisa-task/internal/fetch"
 	"github.com/hrhelena/elisa-task/internal/httpapi"
 	"github.com/hrhelena/elisa-task/internal/store"
 )
@@ -147,12 +148,20 @@ func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, openStore
 	}
 
 	// Closers run in reverse registration order after the server has drained:
-	// the DB pool first registered, so closed last; #7 adds the ingestion cancel.
+	// the DB pool first registered, so closed last; then the fetcher (#10),
+	// closed first; #7 adds the ingestion cancel.
 	var cl closers
 	cl.add("postgres", func(ctx context.Context) error { return closeStore(ctx, st) })
 
+	reg := newRegistry()
+	// The fetcher runs downloads under its own context; its closer cancels an
+	// in-flight fetch and waits for the temporary directory to be removed.
+	// New also removes temporary directories left by an interrupted fetch.
+	fetcher := fetch.New(cfg.DataDir, cfg.DatasetURL, nil, logger, reg)
+	cl.add("fetch", fetcher.Close)
+
 	readiness := httpapi.NewReadiness(st)
-	handler := httpapi.New(httpapi.Deps{Registry: newRegistry(), Readiness: readiness}, logger)
+	handler := httpapi.New(httpapi.Deps{Registry: reg, Readiness: readiness, Fetcher: fetcher}, logger)
 	srv := newServer(handler, logger)
 
 	var lc net.ListenConfig
