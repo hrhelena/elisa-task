@@ -11,6 +11,8 @@ const (
 	CodeNotFound         = "not_found"
 	CodeMethodNotAllowed = "method_not_allowed"
 	CodeInternal         = "internal"
+	// CodeUnavailable: a dependency (the database) failed; retry later.
+	CodeUnavailable = "unavailable"
 )
 
 const contentTypeJSON = "application/json; charset=utf-8"

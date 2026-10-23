@@ -19,9 +19,11 @@ type Deps struct {
 
 	// Fetcher backs POST /fetch (#10). Nil means the route is not registered.
 	Fetcher Fetcher
+	// Senders backs GET /top-senders (#9). Nil means the route is not registered.
+	Senders SenderStats
 
-	// Feature dependencies (#8 Ingester and StatsReader, #9 top senders)
-	// are added here and registered in routes.
+	// Feature dependencies (#8 Ingester and StatsReader) are added here and
+	// registered in routes.
 }
 
 // New returns the service's HTTP handler: every route, wrapped in the
@@ -81,6 +83,9 @@ func (rt *router) routes(deps Deps) {
 
 	if deps.Fetcher != nil {
 		rt.mutate("POST /fetch", fetchHandler(deps.Fetcher, rt.logger))
+	}
+	if deps.Senders != nil {
+		rt.read("GET /top-senders", topSendersHandler(deps.Senders, rt.logger))
 	}
 
 	// Feature routes follow this shape (nil dependency, no route):

@@ -47,6 +47,16 @@ error naming the variable and exit with status 1.
 | `INGEST_BATCH_SIZE` | `2000` | Rows per insert batch (1 to 50000) |
 | `INGEST_PROGRESS_INTERVAL` | `5s` | How often ingestion progress is persisted |
 
+## API
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /top-senders[?limit=N]` | Senders ranked by message count (every maildir file counts once, ADR 0003), ties by address in byte order; messages without a valid sender are excluded (ADR 0012). `limit` is 1 to 100, default 10. `200 {"senders":[{"email":"kay.mann@enron.com","count":16735}]}`, `{"senders":[]}` when nothing is stored; `400 invalid_limit` for any other `limit` (non-numeric, out of range, empty or repeated); `503 unavailable` when the database query fails or exceeds 5s |
+
+```sh
+curl -s 'localhost:8080/top-senders?limit=3'
+```
+
 ## Operational endpoints
 
 | Endpoint | Purpose |

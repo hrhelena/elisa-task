@@ -57,10 +57,12 @@ func main() {
 	os.Exit(code)
 }
 
-// dbStore is what run needs from the store so far: a readiness check and
-// Close. Later tickets widen it as handlers start using the store.
+// dbStore is what run needs from the store so far: a readiness check, the
+// top-senders ranking (#9) and Close. Later tickets widen it as handlers start
+// using the store.
 type dbStore interface {
 	httpapi.Checker
+	senderRanker
 	Close()
 }
 
@@ -159,7 +161,9 @@ func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, openStore
 	cl.add("fetch", fetcher.Close)
 
 	readiness := httpapi.NewReadiness(st)
-	handler := httpapi.New(httpapi.Deps{Registry: reg, Readiness: readiness, Fetcher: fetcher}, logger)
+	handler := httpapi.New(httpapi.Deps{
+		Registry: reg, Readiness: readiness, Fetcher: fetcher, Senders: senderStats{st},
+	}, logger)
 	srv := newServer(handler, logger)
 
 	var lc net.ListenConfig
