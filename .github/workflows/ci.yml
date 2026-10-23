@@ -252,8 +252,32 @@ jobs:
             REVISION=${{ github.event.pull_request.head.sha || github.sha }}
           cache-from: type=gha
 
+      # Bounded well below timeout-minutes, so that on a hang (a stalled image pull in kind create or kind load, for
+      # example) the script itself gets SIGTERM (timeout signals its whole process group) and its trap prints the
+      # diagnostics and FAIL before the runner kills the job. A normal run takes about 2.5 minutes after the build;
+      # 10m + 90s grace + about 2 minutes of setup stays below the 15-minute job timeout.
       - name: End-to-end on kind (scripts/kind-e2e.sh)
-        run: scripts/kind-e2e.sh
+        run: timeout --signal=TERM --kill-after=90s 10m scripts/kind-e2e.sh
         env:
           KIND_CLUSTER: elisa-enron-e2e
           IMAGE: enron-service:dev
+
+      # Normally the script deletes its cluster even on failure; one is left only if the script was killed. Then
+      # export the node and pod logs kind collects.
+      - name: Export kind logs if the cluster is still there
+        if: failure()
+        run: |
+          if kind get clusters 2>/dev/null | grep -x elisa-enron-e2e >/dev/null; then
+            kind export logs "$RUNNER_TEMP/kind-logs" --name elisa-enron-e2e
+          else
+            echo "no leftover cluster; the diagnostics are in the previous step's log"
+          fi
+
+      - name: Upload kind logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kind-logs
+          path: ${{ runner.temp }}/kind-logs
+          if-no-files-found: ignore
+          retention-days: 14

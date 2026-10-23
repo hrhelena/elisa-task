@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
 # End-to-end test on a throwaway kind cluster (#13); run by `make e2e-kind` after `make docker`, and by the CI job
 # e2e-kind. It exercises the real deployment path and the whole API against a small generated dataset:
-#   1. Generates a fixture maildir (46 files: 44 messages from 12 senders, 1 empty file, 1 binary file) and packs it
-#      as a tar.gz with the same layout as the real archive (maildir/<mailbox>/<folder>/<n>.).
-#   2. Creates the kind cluster $KIND_CLUSTER (`make kind-up`) and deploys with scripts/kind-deploy.sh, as
-#      `make deploy` does.
+#   1. Generates a fixture maildir (58 files: 54 messages from 14 senders, 2 stored messages without a usable sender,
+#      1 empty file, 1 binary file) and packs it as a tar.gz with the same layout as the real archive
+#      (maildir/<mailbox>/<folder>/<n>.).
+#   2. Creates the kind cluster $KIND_CLUSTER (`kind create cluster` with deploy/kind/cluster.yaml, as `make kind-up`
+#      does) and deploys with scripts/kind-deploy.sh, as `make deploy` does.
 #   3. Serves the tarball from an in-cluster busybox httpd (the tarball is a ConfigMap) and points the service's
 #      DATASET_URL at it, so POST /fetch downloads and extracts it like the real 443 MB archive, without the internet.
 #   4. Asserts, through a kubectl port-forward:
 #      - POST /fetch: 202, then GET /status .dataset.state reaches "ready" (an empty volume before);
 #      - POST /start: 202, then GET /status reaches finished=true with exact counts, skip reasons and field errors;
-#      - GET /top-senders: the expected top 10, in order (ties by address), and all 12 with ?limit=12;
+#      - GET /top-senders: the expected top 10, in order (ties by address in byte order), and all 14 with ?limit=14;
 #      - deleting the enron-service pod: once the new pod is ready, /status reports the same completed run and
 #        /top-senders is unchanged;
 #      - a second POST /start: a new run that completes with the same totals and the same /top-senders.
-# On failure it prints the namespace's resources, pod descriptions, container logs and events.
-# Always targets the context kind-$KIND_CLUSTER explicitly, never the current kube context. It refuses to run on an
-# existing cluster (the counts are exact, so the cluster must start empty) and deletes the cluster it created on
-# exit unless E2E_KEEP_CLUSTER=1.
+# On failure, including SIGINT/SIGTERM (Ctrl-C, or `timeout` in CI), it prints the namespace's resources, pod
+# descriptions, container logs and events, and reports FAIL.
+# Always targets the context kind-$KIND_CLUSTER explicitly, never the current kube context. By default it creates the
+# cluster itself and fails if one of that name already exists (the counts are exact, so the cluster must start
+# empty); it deletes only a cluster it created, on exit, unless E2E_KEEP_CLUSTER=1.
+# E2E_REUSE_CLUSTER=1 instead runs on an existing cluster of that name (faster iteration): it deletes the namespace
+# enron there first and never deletes the cluster. It refuses the development cluster elisa-enron.
+# The port-forward listens on a free local port chosen by kubectl, so parallel runs and other listeners never mix.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -27,8 +32,8 @@ KIND_CLUSTER=${KIND_CLUSTER:-elisa-enron-e2e}
 CONTEXT="kind-$KIND_CLUSTER"
 IMAGE=${IMAGE:-enron-service:dev}
 NAMESPACE=enron
-E2E_PORT=${E2E_PORT:-18090}
 E2E_KEEP_CLUSTER=${E2E_KEEP_CLUSTER:-0}
+E2E_REUSE_CLUSTER=${E2E_REUSE_CLUSTER:-0}
 # Upper bounds for each wait; the fixture fetches and ingests in seconds.
 WAIT_TIMEOUT=${WAIT_TIMEOUT:-120}
 ROLLOUT_TIMEOUT=${ROLLOUT_TIMEOUT:-180s}
@@ -37,7 +42,8 @@ FIXTURE_SERVER_IMAGE=busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1
 FIXTURE_NAME=enron-fixture.tar.gz
 FIXTURE_URL="http://e2e-fixture-server.$NAMESPACE.svc.cluster.local/$FIXTURE_NAME"
 APP_SELECTOR=app.kubernetes.io/name=enron-service
-BASE="http://127.0.0.1:$E2E_PORT"
+# Set by pf_start from the port kubectl picked.
+BASE=""
 
 kc() { kubectl --context "$CONTEXT" "$@"; }
 log() { printf '\n==> %s\n' "$*"; }
@@ -49,16 +55,28 @@ fail() {
 for bin in docker kind kubectl curl jq tar gzip; do
 	command -v "$bin" >/dev/null || fail "$bin not found on PATH (prerequisite, see README)"
 done
-if kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
+# Captured first, then matched: piping into `grep -q` could fail the pipeline with SIGPIPE under pipefail.
+clusters=$(kind get clusters 2>/dev/null || true)
+exists=0
+if grep -qx -- "$KIND_CLUSTER" <<<"$clusters"; then
+	exists=1
+fi
+if [ "$E2E_REUSE_CLUSTER" = 1 ]; then
+	[ "$KIND_CLUSTER" != elisa-enron ] ||
+		fail "E2E_REUSE_CLUSTER=1 would wipe the namespace $NAMESPACE of the development cluster elisa-enron; refusing"
+	[ "$exists" -eq 1 ] || fail "E2E_REUSE_CLUSTER=1 but kind cluster '$KIND_CLUSTER' does not exist"
+elif [ "$exists" -eq 1 ]; then
 	fail "kind cluster '$KIND_CLUSTER' already exists; the e2e needs an empty cluster. Delete it with" \
-		"'make kind-down KIND_CLUSTER=$KIND_CLUSTER' or pick another KIND_CLUSTER."
+		"'make kind-down KIND_CLUSTER=$KIND_CLUSTER', pick another KIND_CLUSTER, or set E2E_REUSE_CLUSTER=1."
 fi
 
-work=.tools/kind-e2e
+work=.tools/kind-e2e-$KIND_CLUSTER
 rm -rf "$work"
 mkdir -p "$work"
 pf_pid=""
-created=0
+# owned: this run created the cluster, so it may delete it. in_cluster: the cluster is ours to inspect on failure.
+owned=0
+in_cluster=0
 
 diagnostics() {
 	log "diagnostics (context $CONTEXT, namespace $NAMESPACE)"
@@ -73,8 +91,8 @@ diagnostics() {
 	done
 	echo "--- events"
 	kc -n "$NAMESPACE" get events --sort-by=.lastTimestamp || true
-	echo "--- port-forward log"
-	cat "$work/port-forward.log" 2>/dev/null || true
+	echo "--- port-forward logs"
+	cat "$work"/port-forward-*.log 2>/dev/null || true
 }
 
 cleanup() {
@@ -82,10 +100,10 @@ cleanup() {
 	if [ -n "$pf_pid" ]; then
 		kill "$pf_pid" 2>/dev/null || true
 	fi
-	if [ "$rc" -ne 0 ] && [ "$created" -eq 1 ]; then
+	if [ "$rc" -ne 0 ] && [ "$in_cluster" -eq 1 ]; then
 		diagnostics
 	fi
-	if [ "$created" -eq 1 ]; then
+	if [ "$owned" -eq 1 ]; then
 		if [ "$E2E_KEEP_CLUSTER" = 1 ]; then
 			echo "kind-e2e: keeping cluster $KIND_CLUSTER (delete it with: make kind-down KIND_CLUSTER=$KIND_CLUSTER)"
 		else
@@ -100,14 +118,24 @@ cleanup() {
 	exit "$rc"
 }
 trap cleanup EXIT
+# Without these, bash 5 runs the EXIT trap after a fatal signal with $? = 0: no diagnostics, and "PASS". With them,
+# the EXIT trap sees 128+signal. CI wraps the script in `timeout --signal=TERM`, which signals its whole process
+# group, so a foreground kubectl/kind child dies too and the trap runs at once.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # --- Fixture -------------------------------------------------------------------------------------------------------
-# Senders in the expected /top-senders order: count descending, then address ascending (ADR 0011). Every message
-# from a sender goes into that sender's mailbox; some From headers use a display name and mixed case, which the
-# lenient normalization (ADR 0012) lowercases into the same sender.
+# Senders in the expected /top-senders order: count descending, then address ascending in byte order (ADR 0011;
+# from_addr is COLLATE "C"). Every message from a sender goes into that sender's mailbox; some From headers use a
+# display name and an upper-case address, which the lenient normalization (ADR 0012) lowercases into the same sender.
+# The tie mark.taylor@ / mark_taylor@ only byte order resolves this way ('.' 0x2E < '_' 0x5F); a linguistic
+# collation sorts it the other way (checked in postgres:16: COLLATE "en-US-x-icu" puts mark_taylor@ first), so a
+# collation regression fails the order check. Every other tie differs in a letter and sorts the same either way.
 EXPECTED_SENDERS=(
 	"jeff.dasovich@enron.com 9 dasovich-j"
 	"phillip.allen@enron.com 7 allen-p"
+	"mark.taylor@enron.com 6 taylor-m"
+	"mark_taylor@enron.com 6 taylor_m"
 	"kay.mann@enron.com 5 mann-k"
 	"eric.bass@enron.com 4 bass-e"
 	"sean.crandell@enron.com 4 crandell-s"
@@ -119,10 +147,16 @@ EXPECTED_SENDERS=(
 	"debra.perlingiere@enron.com 1 perlingiere-d"
 	"john.arnold@enron.com 1 arnold-j"
 )
+SENDER_COUNT=${#EXPECTED_SENDERS[@]}
+SENDER_MESSAGES=0
+for line in "${EXPECTED_SENDERS[@]}"; do
+	read -r _ count _ <<<"$line"
+	SENDER_MESSAGES=$((SENDER_MESSAGES + count))
+done
 # Plus 2 stored messages without a usable sender (field errors, excluded from /top-senders) and 2 malformed files.
-EXPECTED_PROCESSED=44
+EXPECTED_PROCESSED=$((SENDER_MESSAGES + 2))
 EXPECTED_SKIPPED=2
-EXPECTED_FILES_SEEN=46
+EXPECTED_FILES_SEEN=$((EXPECTED_PROCESSED + EXPECTED_SKIPPED))
 
 # message <path> <from-header-line> <subject>: writes one Enron-style message.
 message() {
@@ -169,14 +203,32 @@ generate_fixture() {
 
 log "generating the fixture dataset"
 generate_fixture "$work/fixture"
+echo "fixture: $SENDER_MESSAGES messages from $SENDER_COUNT senders, 2 messages without a usable sender," \
+	"1 empty file, 1 binary file ($EXPECTED_FILES_SEEN files)"
 # ustar (no pax or xattr records) and COPYFILE_DISABLE (no macOS ._ files): the same archive from GNU and BSD tar.
 COPYFILE_DISABLE=1 tar --format ustar -C "$work/fixture" -cf - maildir | gzip -9n >"$work/$FIXTURE_NAME"
 ls -l "$work/$FIXTURE_NAME"
 
 # --- Cluster and deployment ----------------------------------------------------------------------------------------
-log "creating kind cluster $KIND_CLUSTER"
-created=1
-make --no-print-directory kind-up KIND_CLUSTER="$KIND_CLUSTER"
+if [ "$E2E_REUSE_CLUSTER" = 1 ]; then
+	log "reusing kind cluster $KIND_CLUSTER: deleting namespace $NAMESPACE for an empty start"
+	in_cluster=1
+	kc delete namespace "$NAMESPACE" --ignore-not-found --wait=true --timeout="$ROLLOUT_TIMEOUT"
+else
+	log "creating kind cluster $KIND_CLUSTER"
+	# Called directly rather than through `make kind-up`: kind create fails atomically when the name already exists
+	# (another run won the race), and only then may this run claim, and later delete, the cluster.
+	prev_context=$(kubectl config current-context 2>/dev/null || true)
+	kind create cluster --name "$KIND_CLUSTER" --config deploy/kind/cluster.yaml --wait 120s
+	owned=1
+	in_cluster=1
+	# Like make kind-up: restore the previous current context; every call here passes --context anyway.
+	if [ -n "$prev_context" ]; then
+		kubectl config use-context "$prev_context" >/dev/null
+	else
+		kubectl config unset current-context >/dev/null
+	fi
+fi
 
 log "deploying $IMAGE (scripts/kind-deploy.sh)"
 IMAGE="$IMAGE" KIND_CLUSTER="$KIND_CLUSTER" ROLLOUT_TIMEOUT="$ROLLOUT_TIMEOUT" scripts/kind-deploy.sh
@@ -256,19 +308,31 @@ kc -n "$NAMESPACE" set env deployment/enron-service DATASET_URL="$FIXTURE_URL"
 kc -n "$NAMESPACE" rollout status deployment/enron-service --timeout="$ROLLOUT_TIMEOUT"
 
 # --- HTTP helpers --------------------------------------------------------------------------------------------------
+pf_runs=0
+# pf_start: (re)starts the port-forward on a free local port that kubectl picks (":80") and sets $BASE. The port is
+# read from kubectl's own "Forwarding from" line, which it prints only after binding, and the process is checked to
+# be alive after the health check, so the listener answering is this run's port-forward and nothing else.
 pf_start() {
 	pf_stop
-	kc -n "$NAMESPACE" port-forward svc/enron-service "$E2E_PORT:80" >"$work/port-forward.log" 2>&1 &
+	pf_runs=$((pf_runs + 1))
+	local pf_log="$work/port-forward-$pf_runs.log" i port=""
+	kc -n "$NAMESPACE" port-forward --address 127.0.0.1 svc/enron-service :80 >"$pf_log" 2>&1 &
 	pf_pid=$!
-	local i
-	for ((i = 0; i < 30; i++)); do
-		if curl -fsS --max-time 2 "$BASE/healthz" >/dev/null 2>&1; then
+	for ((i = 0; i < 60; i++)); do
+		kill -0 "$pf_pid" 2>/dev/null || break
+		if [ -z "$port" ]; then
+			port=$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9][0-9]*\) -> .*/\1/p' "$pf_log")
+		fi
+		if [ -n "$port" ] && curl -fsS --max-time 2 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 &&
+			kill -0 "$pf_pid" 2>/dev/null; then
+			BASE="http://127.0.0.1:$port"
+			echo "port-forward #$pf_runs: $BASE (pid $pf_pid)"
 			return 0
 		fi
-		kill -0 "$pf_pid" 2>/dev/null || break
-		sleep 1
+		sleep 0.5
 	done
-	fail "port-forward to svc/enron-service on port $E2E_PORT did not become reachable"
+	cat "$pf_log" >&2
+	fail "port-forward #$pf_runs to svc/enron-service did not become reachable"
 }
 
 pf_stop() {
@@ -279,9 +343,23 @@ pf_stop() {
 	fi
 }
 
-# call <METHOD> <path>: sets $code and writes the body to $work/body.json.
+# call <METHOD> <path>: sets $code and writes the body to $work/body.json. A dead port-forward (a known kubectl
+# flake) is restarted before the request. A GET that gets no HTTP response is retried on a fresh port-forward, up
+# to 3 attempts; a POST is not retried, because it may have reached the service.
 call() {
-	code=$(curl -sS --max-time 10 -X "$1" -o "$work/body.json" -w '%{http_code}' "$BASE$2") || code=000
+	local attempt
+	for attempt in 1 2 3; do
+		if [ -z "$pf_pid" ] || ! kill -0 "$pf_pid" 2>/dev/null; then
+			echo "port-forward is not running; restarting it" >&2
+			pf_start
+		fi
+		code=$(curl -sS --max-time 10 -X "$1" -o "$work/body.json" -w '%{http_code}' "$BASE$2") || code=000
+		if [ "$code" != 000 ] || [ "$1" != GET ]; then
+			return 0
+		fi
+		echo "$1 $2: no response (attempt $attempt); restarting the port-forward" >&2
+		pf_start
+	done
 }
 
 # expect_code <METHOD> <path> <code>
@@ -347,16 +425,18 @@ assert_completed_run() {
 		 and ([.field_errors[]] | add) == 2'
 }
 
-# check_top_senders <tag>: asserts the default top 10 and ?limit=12, saving both as $work/top-<tag>-*.json.
+# check_top_senders <tag>: asserts the default top 10, and a limit above the sender count returning exactly the
+# $SENDER_COUNT senders (so the messages without a sender are excluded); saves $work/top-<tag>-{10,all}.json.
 check_top_senders() {
+	local limit=$((SENDER_COUNT + 5))
 	expect_code GET /top-senders 200
 	cp "$work/body.json" "$work/top-$1-10.json"
 	assert_json "/top-senders: the expected top 10 in order" "$work/top-$1-10.json" \
 		".senders == $(senders_json 10)"
-	expect_code GET '/top-senders?limit=12' 200
-	cp "$work/body.json" "$work/top-$1-12.json"
-	assert_json "/top-senders?limit=12: all 12 senders in order, none without a sender" "$work/top-$1-12.json" \
-		".senders == $(senders_json 12)"
+	expect_code GET "/top-senders?limit=$limit" 200
+	cp "$work/body.json" "$work/top-$1-all.json"
+	assert_json "/top-senders?limit=$limit: all $SENDER_COUNT senders in order, none without a sender" \
+		"$work/top-$1-all.json" ".senders == $(senders_json "$SENDER_COUNT")"
 }
 
 # --- Scenario: Fetch and ingest inside kind ------------------------------------------------------------------------
@@ -427,4 +507,4 @@ cp "$work/body.json" "$work/status-run2.json"
 jq . "$work/status-run2.json"
 assert_completed_run "$work/status-run2.json"
 check_top_senders run2
-assert_same "GET /top-senders is unchanged by the re-ingestion" "$work/top-run1-12.json" "$work/top-run2-12.json"
+assert_same "GET /top-senders is unchanged by the re-ingestion" "$work/top-run1-all.json" "$work/top-run2-all.json"
