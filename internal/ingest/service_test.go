@@ -554,18 +554,37 @@ func TestLostLockHeldByAnotherReplicaLeavesTheRunToIt(t *testing.T) {
 	run := mustStart(t, s)
 	waitFor(t, "the run to get going", func() bool { return st.progressWrites() > 0 })
 
-	st.heldLock().lose()
-	other, err := st.AcquireIngestLock(t.Context()) // another replica takes the free lock
-	if err != nil {
-		t.Fatal(err)
-	}
+	// The lock's session dies and another replica takes the freed lock before
+	// this one notices. This must be one atomic step: with lose followed by
+	// AcquireIngestLock, the engine can see the loss in between, take the
+	// free lock back and record lock_lost itself (correct, and covered by
+	// TestLockLossStopsTheRunAndRecordsLockLost), which made this test flaky
+	// (#44).
+	other := st.loseToAnotherHolder()
 	defer func() { _ = other.Release(context.Background()) }()
 	waitDone(t, s)
+
 	st.mu.Lock()
 	state := st.runs[run.ID-1].State
 	st.mu.Unlock()
 	if state != store.RunRunning {
 		t.Errorf("run state = %q; the engine must not write without the lock", state)
+	}
+	if st.heldLock() != other {
+		t.Error("the other replica's lock was released or replaced; the engine must leave it alone")
+	}
+	if n := st.acquireCount(); n != 2 { // this run's, then the other replica's
+		t.Errorf("successful lock acquisitions = %d, want 2; the engine must not take the lock back", n)
+	}
+	// The engine did try to record the outcome, and was refused.
+	finishes := st.finishRecords()
+	if len(finishes) == 0 {
+		t.Fatal("the engine never tried to record the outcome")
+	}
+	for _, f := range finishes {
+		if !errors.Is(f.err, store.ErrLockNotHeld) {
+			t.Errorf("FinishRun(%s, %q) = %v; want an error wrapping ErrLockNotHeld", f.state, f.msg, f.err)
+		}
 	}
 }
 
