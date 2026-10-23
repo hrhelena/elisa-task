@@ -77,7 +77,9 @@ func (r *Run) Finished() bool { return r.State == RunCompleted }
 //
 // A lock is safe for concurrent use. Its run writes are serialized on one
 // connection; canceling a write's context cancels the query on the server and
-// keeps the lock.
+// keeps the lock. A canceled write then returns only once the server has
+// acknowledged the cancel request (usually within milliseconds, at most 5s),
+// so that the request cannot cancel the next write on the connection.
 type IngestLock interface {
 	// Release releases the lock. It is safe to call more than once and after
 	// the store is closed. It waits for an in-flight run write on the lock to

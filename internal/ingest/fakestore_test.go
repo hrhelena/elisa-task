@@ -36,7 +36,8 @@ type fakeStore struct {
 	// wait until the lock ends, then return updateEndErr, or the lock's Err
 	// if that is nil: a write on a slow database that only the release (which
 	// closes the lock's connection) ends. updateStarted gets a value (if
-	// room) when such a write begins.
+	// room) when a blocking write (updateBlocks or updateUntilLockEnds)
+	// begins.
 	updateUntilLockEnds bool
 	updateEndErr        error
 	updateStarted       chan struct{}
@@ -243,14 +244,16 @@ func (f *fakeStore) run(id int64) (*store.Run, error) {
 }
 
 func (f *fakeStore) UpdateRunProgress(ctx context.Context, lock store.IngestLock, id int64, c store.Counters) error {
-	if f.updateBlocks {
-		<-ctx.Done()
-	}
-	if l, ok := lock.(*fakeLock); ok && f.updateUntilLockEnds {
+	if f.updateBlocks || f.updateUntilLockEnds {
 		select {
 		case f.updateStarted <- struct{}{}:
 		default:
 		}
+	}
+	if f.updateBlocks {
+		<-ctx.Done()
+	}
+	if l, ok := lock.(*fakeLock); ok && f.updateUntilLockEnds {
 		<-l.Done()
 		if f.updateEndErr != nil {
 			return f.updateEndErr
