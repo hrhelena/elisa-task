@@ -1,0 +1,653 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Enron email metrics service",
+    "description": "Ingests the Enron maildir dataset into Postgres and serves metrics about it.\n\n- There is no authentication (ADR 0005). \"Try it out\" sends real requests: `POST /fetch` and `POST /start` really start work.\n- Every error uses the envelope `{\"error\":{\"code\":\"\u003csnake_case\u003e\",\"message\":\"\u003ctext\u003e\"}}` (schema `Error`). Each response description lists the codes it can carry.\n- An unknown path gives `404` with code `not_found`; a known path with the wrong method gives `405` with code `method_not_allowed` and an `Allow` header.\n- Every response carries an `X-Request-ID` header (a well-formed incoming one is reused).",
+    "version": "v1.2.3"
+  },
+  "paths": {
+    "/fetch": {
+      "post": {
+        "tags": [
+          "dataset"
+        ],
+        "summary": "Download and extract the dataset",
+        "description": "Starts downloading and extracting the Enron maildir archive into the data directory, without waiting for it. Idempotent: 200 when the dataset is already there, 202 when a fetch was started or is already running. Progress is in the `dataset` section of `GET /status`. Any request body is ignored.",
+        "operationId": "fetchDataset",
+        "responses": {
+          "200": {
+            "description": "The dataset is ready (`state` is `ready`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Dataset"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "A fetch was started, or one is already running.",
+            "headers": {
+              "Location": {
+                "style": "simple",
+                "description": "Always `/status`, where progress is reported.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Dataset"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict. Error codes: `maildir_not_directory`, `maildir_unreadable`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error. Error codes: `data_dir_not_writable`, `internal`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable. Error code: `unavailable`. The service is shutting down, or the maildir could not be checked because of a temporary system error; retry later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": [
+          "operations"
+        ],
+        "summary": "Liveness probe",
+        "description": "Succeeds whenever the process serves HTTP; it checks no dependency.",
+        "operationId": "getHealthz",
+        "responses": {
+          "200": {
+            "description": "The process is alive.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": [
+          "operations"
+        ],
+        "summary": "Prometheus metrics",
+        "description": "HTTP, ingestion and fetch metrics, plus the Go runtime and process collectors.",
+        "operationId": "getMetrics",
+        "responses": {
+          "200": {
+            "description": "The Prometheus text exposition format.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "tags": [
+          "operations"
+        ],
+        "summary": "Readiness probe",
+        "description": "Checks the database; fails once shutdown has begun.",
+        "operationId": "getReadyz",
+        "responses": {
+          "200": {
+            "description": "Ready (`status` is `ready`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Not ready: `status` is `not_ready` (with the failed `checks`) or `shutting_down`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/start": {
+      "post": {
+        "tags": [
+          "ingestion"
+        ],
+        "summary": "Start an ingestion run",
+        "description": "Starts ingesting the maildir into the database in the background, unless a run is in progress on any replica. A new run replaces the data of the previous one. Any request body is ignored.",
+        "operationId": "startIngestion",
+        "responses": {
+          "202": {
+            "description": "The run was started.",
+            "headers": {
+              "Location": {
+                "style": "simple",
+                "description": "Always `/status`, where progress is reported.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartResponse"
+                },
+                "example": {
+                  "run_id": 4,
+                  "state": "running",
+                  "started_at": "2026-10-23T10:00:00Z"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict. Error codes: `ingestion_running`, `dataset_missing`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable. Error code: `unavailable`. The database is unavailable, the service is shutting down, or the dataset could not be checked because of a temporary system error; retry later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/status": {
+      "get": {
+        "tags": [
+          "ingestion"
+        ],
+        "summary": "Ingestion (and dataset) progress",
+        "description": "Reports the current or last ingestion run, the number of stored messages and, when the service can fetch the dataset, the dataset state.",
+        "operationId": "getStatus",
+        "responses": {
+          "200": {
+            "description": "The current or last run (`idle` when none has ever started).",
+            "headers": {
+              "Cache-Control": {
+                "style": "simple",
+                "description": "Always `no-store`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable. Error code: `unavailable`. The database is unavailable; retry later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/top-senders": {
+      "get": {
+        "tags": [
+          "metrics"
+        ],
+        "summary": "Top senders by message count",
+        "description": "Ranks sender addresses by the number of stored messages, count descending, then email ascending. Messages without a valid sender are not counted.",
+        "operationId": "getTopSenders",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Number of senders to return.",
+            "schema": {
+              "default": 10,
+              "description": "Number of senders to return.",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The ranking.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopSendersResponse"
+                },
+                "example": {
+                  "senders": [
+                    {
+                      "email": "kay.mann@enron.com",
+                      "count": 16735
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request. Error code: `invalid_limit`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable. Error code: `unavailable`. The database is unavailable; retry later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Dataset": {
+        "properties": {
+          "bytes_downloaded": {
+            "description": "Archive bytes downloaded so far.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bytes_total": {
+            "description": "Archive size from Content-Length; -1 until the server sends a length.",
+            "format": "int64",
+            "minimum": -1,
+            "type": "integer"
+          },
+          "error": {
+            "description": "Why the last fetch failed; null unless state is failed.",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "files_extracted": {
+            "description": "Files extracted from the archive so far.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "finished_at": {
+            "description": "When the last fetch ended; null while running or if none has.",
+            "format": "date-time",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "path": {
+            "description": "Where the maildir is (or will be) on the server.",
+            "type": "string"
+          },
+          "started_at": {
+            "description": "When the current or last fetch started; null if none has.",
+            "format": "date-time",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "state": {
+            "description": "Dataset lifecycle state.",
+            "enum": [
+              "absent",
+              "downloading",
+              "extracting",
+              "ready",
+              "failed"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "path",
+          "bytes_downloaded",
+          "bytes_total",
+          "files_extracted",
+          "error",
+          "started_at",
+          "finished_at"
+        ],
+        "type": "object"
+      },
+      "Error": {
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetail"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "type": "object"
+      },
+      "ErrorDetail": {
+        "properties": {
+          "code": {
+            "description": "Machine-readable snake_case error code.",
+            "type": "string"
+          },
+          "message": {
+            "description": "Human-readable explanation.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "HealthResponse": {
+        "properties": {
+          "status": {
+            "enum": [
+              "ok"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "ReadyResponse": {
+        "properties": {
+          "checks": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Error of each failed check, by check name; only with not_ready.",
+            "type": "object"
+          },
+          "status": {
+            "enum": [
+              "ready",
+              "not_ready",
+              "shutting_down"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "SenderCount": {
+        "properties": {
+          "count": {
+            "description": "Messages sent by this address.",
+            "format": "int64",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "email": {
+            "description": "Normalized sender address.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "email",
+          "count"
+        ],
+        "type": "object"
+      },
+      "StartResponse": {
+        "properties": {
+          "run_id": {
+            "description": "ID of the run that was started.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "started_at": {
+            "description": "When the run started (UTC).",
+            "format": "date-time",
+            "type": "string"
+          },
+          "state": {
+            "description": "Always running.",
+            "enum": [
+              "running"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "state",
+          "started_at"
+        ],
+        "type": "object"
+      },
+      "StatusResponse": {
+        "properties": {
+          "dataset": {
+            "$ref": "#/components/schemas/Dataset",
+            "description": "Dataset download state; absent when the service has no fetcher."
+          },
+          "error": {
+            "description": "Why the run failed; null unless state is failed.",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "field_errors": {
+            "additionalProperties": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "description": "Header fields that could not be parsed, by field (the message is still stored).",
+            "type": "object"
+          },
+          "files_seen": {
+            "description": "Files the current or last run has seen.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "finished": {
+            "description": "True only when the last run completed (a failed run has not finished).",
+            "type": "boolean"
+          },
+          "finished_at": {
+            "description": "When the run ended; null while running or when idle.",
+            "format": "date-time",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "messages_processed": {
+            "description": "Messages processed by the current or last run.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "messages_skipped": {
+            "description": "Files the current or last run skipped.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "run_id": {
+            "description": "ID of the current or last run; null when idle.",
+            "type": [
+              "null",
+              "integer"
+            ]
+          },
+          "skip_reasons": {
+            "additionalProperties": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "description": "Skipped files by reason.",
+            "type": "object"
+          },
+          "started_at": {
+            "description": "When the run started; null when idle.",
+            "format": "date-time",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "state": {
+            "description": "State of the current or last run; idle when no run has ever started.",
+            "enum": [
+              "idle",
+              "running",
+              "completed",
+              "failed"
+            ],
+            "type": "string"
+          },
+          "total_messages": {
+            "description": "Messages stored in the database.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "updated_at": {
+            "description": "When the run last reported progress; null when idle.",
+            "format": "date-time",
+            "type": [
+              "null",
+              "string"
+            ]
+          }
+        },
+        "required": [
+          "state",
+          "finished",
+          "messages_processed",
+          "total_messages",
+          "messages_skipped",
+          "files_seen",
+          "skip_reasons",
+          "field_errors",
+          "run_id",
+          "started_at",
+          "finished_at",
+          "updated_at",
+          "error"
+        ],
+        "type": "object"
+      },
+      "TopSendersResponse": {
+        "properties": {
+          "senders": {
+            "description": "Senders by count descending, then email ascending; empty, never null, when nothing is stored.",
+            "items": {
+              "$ref": "#/components/schemas/SenderCount"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "senders"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "dataset",
+      "description": "Download the Enron dataset."
+    },
+    {
+      "name": "ingestion",
+      "description": "Ingest the dataset into the database."
+    },
+    {
+      "name": "metrics",
+      "description": "Metrics computed from the ingested messages."
+    },
+    {
+      "name": "operations",
+      "description": "Probes and Prometheus metrics."
+    }
+  ]
+}

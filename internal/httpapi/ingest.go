@@ -125,9 +125,9 @@ const unavailableMessage = "the database is unavailable, retry later"
 const transientMessage = "the dataset cannot be checked right now (a temporary system error such as too many open files); retry later"
 
 type startResponse struct {
-	RunID     int64     `json:"run_id"`
-	State     string    `json:"state"`
-	StartedAt time.Time `json:"started_at"`
+	RunID     int64     `json:"run_id" required:"true" description:"ID of the run that was started."`
+	State     string    `json:"state" required:"true" enum:"running" description:"Always running."`
+	StartedAt time.Time `json:"started_at" required:"true" description:"When the run started (UTC)."`
 }
 
 // startHandler serves POST /start. Any request body is ignored.
@@ -165,21 +165,22 @@ func startHandler(ing Ingester, logger *slog.Logger) http.Handler {
 	})
 }
 
+// The struct tags other than json only describe the OpenAPI schema (ADR 0016).
 type statusResponse struct {
-	State             string           `json:"state"`
-	Finished          bool             `json:"finished"`
-	MessagesProcessed int64            `json:"messages_processed"`
-	TotalMessages     int64            `json:"total_messages"`
-	MessagesSkipped   int64            `json:"messages_skipped"`
-	FilesSeen         int64            `json:"files_seen"`
-	SkipReasons       map[string]int64 `json:"skip_reasons"`
-	FieldErrors       map[string]int64 `json:"field_errors"`
-	RunID             *int64           `json:"run_id"`
-	StartedAt         *time.Time       `json:"started_at"`
-	FinishedAt        *time.Time       `json:"finished_at"`
-	UpdatedAt         *time.Time       `json:"updated_at"`
-	Error             *string          `json:"error"`
-	Dataset           *datasetJSON     `json:"dataset,omitempty"`
+	State             string           `json:"state" required:"true" enum:"idle,running,completed,failed" description:"State of the current or last run; idle when no run has ever started."`
+	Finished          bool             `json:"finished" required:"true" description:"True only when the last run completed (a failed run has not finished)."`
+	MessagesProcessed int64            `json:"messages_processed" required:"true" minimum:"0" description:"Messages processed by the current or last run."`
+	TotalMessages     int64            `json:"total_messages" required:"true" minimum:"0" description:"Messages stored in the database."`
+	MessagesSkipped   int64            `json:"messages_skipped" required:"true" minimum:"0" description:"Files the current or last run skipped."`
+	FilesSeen         int64            `json:"files_seen" required:"true" minimum:"0" description:"Files the current or last run has seen."`
+	SkipReasons       map[string]int64 `json:"skip_reasons" required:"true" nullable:"false" description:"Skipped files by reason."`
+	FieldErrors       map[string]int64 `json:"field_errors" required:"true" nullable:"false" description:"Header fields that could not be parsed, by field (the message is still stored)."`
+	RunID             *int64           `json:"run_id" required:"true" description:"ID of the current or last run; null when idle."`
+	StartedAt         *time.Time       `json:"started_at" required:"true" description:"When the run started; null when idle."`
+	FinishedAt        *time.Time       `json:"finished_at" required:"true" description:"When the run ended; null while running or when idle."`
+	UpdatedAt         *time.Time       `json:"updated_at" required:"true" description:"When the run last reported progress; null when idle."`
+	Error             *string          `json:"error" required:"true" description:"Why the run failed; null unless state is failed."`
+	Dataset           *datasetJSON     `json:"dataset,omitempty" description:"Dataset download state; absent when the service has no fetcher."`
 }
 
 func newStatusResponse(s IngestionStatus) statusResponse {

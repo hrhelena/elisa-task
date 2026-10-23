@@ -42,6 +42,8 @@ type requestInfo struct {
 	// route is the registered pattern that matches, or "" if none does. Set by
 	// resolveRoute, right after requestID.
 	route string
+	// quiet: the matched route logs its access line at DEBUG.
+	quiet bool
 }
 
 func requestInfoFrom(ctx context.Context) *requestInfo {
@@ -117,7 +119,10 @@ func recoverer(logger *slog.Logger, panics interface{ Inc() }) Middleware {
 }
 
 // isQuietPath reports whether path is a probe or scrape endpoint, whose access
-// log lines are logged at DEBUG so that they do not drown the INFO log.
+// log lines are logged at DEBUG so that they do not drown the INFO log, even
+// when the mux rejects the request (wrong method). Matched routes are quiet
+// when their route table entry says so (route.quiet), which also covers the
+// docs routes.
 func isQuietPath(path string) bool {
 	switch path {
 	case "/healthz", "/readyz", "/metrics":
@@ -140,7 +145,7 @@ func accessLog(logger *slog.Logger) Middleware {
 			defer func(ctx context.Context) {
 				status, aborted := rec.outcome(completed)
 				level := slog.LevelInfo
-				if isQuietPath(r.URL.Path) {
+				if info.quiet || isQuietPath(r.URL.Path) {
 					level = slog.LevelDebug
 				}
 				attrs := []slog.Attr{

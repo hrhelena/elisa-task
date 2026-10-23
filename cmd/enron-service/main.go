@@ -201,6 +201,7 @@ func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, openStore
 		Datasets:  fetcher,
 		Senders:   senderStats{st},
 		Ingester:  ingestion{svc: ingester, lock: st, maildir: cfg.MaildirPath(), logger: logger},
+		Version:   version,
 	}, logger)
 	srv := newServer(handler, logger)
 
