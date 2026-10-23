@@ -17,8 +17,11 @@ type Deps struct {
 	// Readiness backs GET /readyz. Nil means no dependency checks.
 	Readiness *Readiness
 
-	// Feature dependencies (#8 Ingester and StatsReader, #9 top senders,
-	// #10 Fetcher) are added here and registered in routes.
+	// Fetcher backs POST /fetch (#10). Nil means the route is not registered.
+	Fetcher Fetcher
+
+	// Feature dependencies (#8 Ingester and StatsReader, #9 top senders)
+	// are added here and registered in routes.
 }
 
 // New returns the service's HTTP handler: every route, wrapped in the
@@ -71,10 +74,14 @@ func newRouter(deps Deps, logger *slog.Logger) *router {
 
 // routes registers every endpoint. Patterns always include the method, so the
 // mux answers other methods with 405 and an Allow header.
-func (rt *router) routes(_ Deps) {
+func (rt *router) routes(deps Deps) {
 	rt.read("GET /healthz", http.HandlerFunc(handleHealthz))
 	rt.read("GET /readyz", http.HandlerFunc(rt.readiness.handleReadyz))
 	rt.read("GET /metrics", metricsHandler(rt.registry, rt.logger))
+
+	if deps.Fetcher != nil {
+		rt.mutate("POST /fetch", fetchHandler(deps.Fetcher, rt.logger))
+	}
 
 	// Feature routes follow this shape (nil dependency, no route):
 	//

@@ -53,7 +53,7 @@ error naming the variable and exit with status 1.
 |---|---|
 | `GET /healthz` | Liveness: `200 {"status":"ok"}` while the process serves HTTP |
 | `GET /readyz` | Readiness: `200 {"status":"ready"}`; `503` with the failing `checks` when a dependency check fails (2s timeout each; currently `postgres`, a ping), or `{"status":"shutting_down"}` during shutdown |
-| `GET /metrics` | Prometheus metrics: `enron_http_requests_total`, `enron_http_request_duration_seconds`, `enron_http_panics_total`, Go runtime and process metrics |
+| `GET /metrics` | Prometheus metrics: `enron_http_requests_total`, `enron_http_request_duration_seconds`, `enron_http_panics_total`, the `enron_fetch_*` metrics below, Go runtime and process metrics |
 
 Every response carries an `X-Request-ID` header (a valid incoming one is reused). Errors from every endpoint use
 `{"error":{"code":"<snake_case>","message":"<text>"}}`; unknown routes return `404 not_found`, and a wrong method
@@ -61,3 +61,39 @@ returns `405 method_not_allowed` with an `Allow` header. On `SIGINT`/`SIGTERM` t
 requests, then closes its resources, and exits with status 0, or with 1 if draining exceeds `SHUTDOWN_TIMEOUT`.
 A second signal exits immediately. The worst-case shutdown takes `SHUTDOWN_DRAIN_DELAY` + `SHUTDOWN_TIMEOUT` + 5s,
 which must fit in the pod's `terminationGracePeriodSeconds`.
+
+## Getting the dataset: `POST /fetch`
+
+`POST /fetch` (ADR 0004) downloads `DATASET_URL` and extracts it to `$DATA_DIR/maildir` in the background.
+If `$DATA_DIR/maildir` already exists (for example the local `Dataset/maildir`), nothing is downloaded.
+
+```bash
+curl -si -X POST localhost:8080/fetch
+# 202 Accepted, Location: /status
+# {"state":"downloading","path":"Dataset/maildir","bytes_downloaded":0,"bytes_total":-1,"files_extracted":0,
+#  "error":null,"started_at":"2026-10-23T09:00:00Z","finished_at":null}
+```
+
+| Situation | Response |
+|---|---|
+| Dataset present | `200` with `"state":"ready"` |
+| Fetch started, already running, or retried after a failure | `202`, `Location: /status`, current progress |
+| `DATA_DIR` not writable | `500`, code `data_dir_not_writable` |
+| `$DATA_DIR/maildir` exists but is not a directory | `409`, code `maildir_not_directory` (nothing is downloaded) |
+| Service shutting down | `503`, code `unavailable` |
+
+States: `absent`, `downloading` (download and streamed extraction), `extracting` (archive fully received; verifying
+and moving into place), `ready`, `failed` (with `error`, for example `download failed: HTTP 404`). Calling
+`POST /fetch` while a fetch runs never starts a second download; calling it after a failure retries from scratch.
+
+How it works: the archive is streamed through gzip and tar into `$DATA_DIR/.fetch-tmp-*` (never buffered in memory),
+and renamed to `$DATA_DIR/maildir` only after the whole archive, including the gzip checksum, has been read. Then
+`$DATA_DIR/.fetch-complete` records the URL, SHA-256, size and file count. Entries that are absolute, escape the
+target (`..`), are links or devices, or lie outside `maildir/` are skipped and logged. Before downloading, a fetch
+fails if `DATA_DIR` has less than 4 GiB free, or fewer than 530,000 free inodes on filesystems that report them
+(the dataset has about 521k files and directories, more than a small ext4 volume may hold). It also fails if no
+data arrives for 60s, or if the archive extracts to more than 8 GiB. On failure or shutdown the temporary
+directory is removed; leftovers from a crash are removed at startup.
+
+Metrics: `enron_fetch_bytes_total`, `enron_fetch_state{state}`, `enron_fetch_duration_seconds{result}`,
+`enron_fetch_entries_skipped_total{reason}`.
