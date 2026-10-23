@@ -51,13 +51,98 @@ Compose variables:
 | `APP_USER` | `65532:65532` | Container user. On Linux, use `"$(id -u):$(id -g)"` so the app can write to the bind mount; this works when you own the dataset directory, which `make compose-up` ensures for a new one |
 | `LOG_LEVEL` | `info` | Passed to the service |
 
+## Kubernetes: kustomize, kind and the cloud
+
+Manifests (ADR 0006, ADR 0014, ADR 0015) live in `deploy/k8s`:
+
+| Path | Contents |
+|---|---|
+| `base/` | Namespace `enron` (Pod Security `restricted` enforced), ConfigMap `enron-service-config`, PVC `enron-data` (10Gi, RWO), Deployment `enron-service` (1 replica, `Recreate`), Service `enron-service` (`ClusterIP` 80 -> 8080) |
+| `overlays/kind/` | The base, plus Postgres as a plain StatefulSet `postgres` (`postgres:16-alpine`, 2Gi, headless Service, no operator), the generated Secret `enron-db`, and the locally built image |
+| `overlays/cloud/` | The base only: managed Postgres through an externally created Secret `enron-db`, image `REGISTRY/enron-service:VERSION` |
+
+### Local cluster with kind
+
+Prerequisites on the host: Docker, [kind](https://kind.sigs.k8s.io/) and `kubectl`. The Makefile never installs
+them. kustomize, kubeconform and yq are pinned in `go.mod` and run through `go tool`.
+
+```bash
+make kind-up        # kind cluster "elisa-enron" (node image pinned in deploy/kind/cluster.yaml); no-op if it exists
+make deploy         # make docker, kind load, apply overlays/kind, wait for postgres and enron-service
+kubectl --context kind-elisa-enron -n enron port-forward svc/enron-service 8080:80
+curl localhost:8080/readyz
+make undeploy       # delete the namespace and everything in it, including both volumes
+make kind-down      # delete the cluster
+```
+
+Every command targets the context `kind-$(KIND_CLUSTER)` explicitly (`KIND_CLUSTER` defaults to `elisa-enron`), so
+other clusters and your current kube context are never touched. `make deploy` loads the image under a tag derived
+from its image ID (`enron-service:dev-<id>`), so a rebuilt image rolls out even though the pod uses
+`imagePullPolicy: IfNotPresent`. The credentials in `overlays/kind` (`enron`/`enron`) are for the throwaway local
+cluster only.
+
+To get the dataset into the cluster, call `POST /fetch` through the port-forward. It downloads into the
+`enron-data` volume, which kind's local-path provisioner backs with a directory inside the node container, so the
+10Gi request and the inode count do not limit it there. Mounting the local `Dataset/` into kind (`extraMounts` plus
+a hostPath PersistentVolume) is not set up. `kubectl kustomize deploy/k8s/overlays/kind` renders the same output as
+the pinned kustomize.
+
+### Cloud (EKS, GKE)
+
+```bash
+kubectl create namespace enron   # the overlay also defines it; the Secret must exist before the pod starts
+kubectl -n enron create secret generic enron-db \
+  --from-literal=DATABASE_URL='postgres://USER:PASSWORD@HOST:5432/enron?sslmode=require'
+(cd deploy/k8s/overlays/cloud && go tool kustomize edit set image enron-service=REGISTRY/enron-service:VERSION)
+kubectl apply -k deploy/k8s/overlays/cloud
+```
+
+The cloud overlay contains no database resources. Postgres is managed (RDS or Cloud SQL), and use
+`sslmode=require` (or `verify-full`). On GKE, a Cloud SQL Auth Proxy sidecar is an alternative to a direct
+connection. The StorageClass is the cluster default (gp3 on EKS, standard-rwo on GKE).
+
+### Dataset volume and inodes
+
+The PVC `enron-data` requests **10Gi** even though the extracted dataset is about 2.5 GB, because the dataset has
+about 521k files and directories (ADR 0015). ext4, the filesystem of the EKS gp3 and GKE standard-rwo defaults,
+allocates about one inode per 16 KiB: 5Gi gives about 327k inodes (too few), 10Gi about 655k. `POST /fetch` checks
+before downloading and fails fast with `insufficient free inodes: need 530000, have N` below 530,000 free inodes,
+or with `insufficient disk space` below 4 GiB free. To change the size, add a patch to the cloud overlay that keeps
+at least 530,000 free inodes and 4 GiB free: at least 10Gi on ext4, and smaller only with a StorageClass whose
+filesystem allocates inodes dynamically (for example XFS via `csi.storage.k8s.io/fstype: xfs`).
+
+### Probes, shutdown and resources
+
+| Setting | Value | Why |
+|---|---|---|
+| `startupProbe` | `GET /healthz`, every 5s, `failureThreshold: 30` (150s) | The service only listens after it removes leftover `.fetch-tmp-*` trees and opens and migrates the database, which can take up to `DB_STARTUP_TIMEOUT` (60s, see [Startup](#startup)). Liveness and readiness start only after it succeeds, so a slow start or a database that is still down does not get the pod killed |
+| `livenessProbe` | `GET /healthz`, every 10s, `failureThreshold: 3` | Process only: a database outage never restarts the pod |
+| `readinessProbe` | `GET /readyz`, every 5s, `timeoutSeconds: 3` | `/readyz` pings Postgres with a 2s timeout, so the probe timeout must be longer than the Kubernetes default of 1s |
+| `SHUTDOWN_DRAIN_DELAY` / `SHUTDOWN_TIMEOUT` | `5s` / `20s` (ConfigMap) | On `SIGTERM` the pod reports not-ready and keeps serving for 5s, so the Service drops its endpoint before connections close |
+| `terminationGracePeriodSeconds` | `40` | Above the worst-case shutdown: 5s drain + 20s `SHUTDOWN_TIMEOUT` + 5s for closers = 30s |
+| Resources | requests `cpu: 250m, memory: 256Mi`; limit `memory: 1Gi` | No CPU limit, to avoid throttling during ingestion |
+| Security | uid/gid `65532`, `fsGroup: 65532`, `readOnlyRootFilesystem`, no privilege escalation, all capabilities dropped, `RuntimeDefault` seccomp, no service account token | `/tmp` is an `emptyDir`; the dataset PVC is group-writable through `fsGroup` |
+
+The pod template carries `prometheus.io/scrape`, `prometheus.io/port: "8080"` and `prometheus.io/path: /metrics`.
+There is one replica with the `Recreate` strategy, because the dataset volume is ReadWriteOnce (ADR 0014), so a
+rollout has a short outage. There is no PodDisruptionBudget, because with one replica it would either block node
+drains indefinitely (`minAvailable: 1`) or allow the eviction anyway. The scaling path is in ADR 0014.
+
+### Validating the manifests
+
+`make k8s-validate` renders the base and both overlays with the pinned kustomize, validates every resource with
+kubeconform (`-strict`, Kubernetes schema of the kind node version, cached in `.tools/`), and checks the values
+above with yq. It checks probes, grace period, replicas, `Recreate`, the 10Gi RWO PVC, hardening, Postgres as the
+only StatefulSet in kind, and that the cloud overlay has no StatefulSet and no Secret. It also checks that the grace
+period exceeds drain + shutdown + 5s and that the startup budget exceeds `DB_STARTUP_TIMEOUT`.
+
 ## CI
 
 GitHub Actions (`.github/workflows/ci.yml`) runs on every pull request and on pushes to `main`, using the same
 Makefile targets: `lint` (all pre-commit hooks, including the `go mod tidy` and formatting checks, then `make lint`),
 `test` (`make test` with `-race`; `coverage.out` is uploaded as an artifact), `itest` (`make itest` with
 testcontainers on the runner's Docker) and `docker` (builds the image with the GitHub Actions build cache, never
-pushes it, then runs `scripts/docker-smoke.sh`). A new push to a branch or PR cancels that ref's older run;
+pushes it, then runs `scripts/docker-smoke.sh`) and `manifests` (`make k8s-validate`). A new push to a branch or PR cancels that ref's older run;
 on `main` every commit gets its own full run, which is never cancelled.
 
 ## Configuration
