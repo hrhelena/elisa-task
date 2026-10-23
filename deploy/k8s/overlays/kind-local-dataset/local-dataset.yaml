@@ -18,6 +18,14 @@ spec:
   # "" matches only claims that also ask for no class, so the default local-path provisioner never takes part.
   storageClassName: ""
   volumeMode: Filesystem
+  # Pre-bound to its own claim, so no other claim without a StorageClass can take it (the claim also names the PV
+  # with volumeName). Once bound, the controller adds the claim's uid; scripts/kind-deploy.sh recreates the PV when
+  # it is left Released after the claim is deleted.
+  claimRef:
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    namespace: enron
+    name: enron-local-dataset
   local:
     path: /var/local/enron-dataset
   # Required for `local` volumes: only the node created with the dataset mount has the path.

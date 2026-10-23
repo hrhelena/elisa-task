@@ -11,10 +11,13 @@
 #   KIND_CLUSTER       cluster name (default elisa-enron)
 #   LOCAL_DATASET      unset (default): the cluster is created exactly as before.
 #                      1: mount Dataset/ of the main checkout (found through git, so this works from any worktree).
-#                      a path: mount that directory, which must contain maildir/.
+#                      a path: mount that directory, which must contain maildir/. A relative path is resolved
+#                      against the caller's working directory (with `make`, the directory make runs in).
 #   PRINT_CONFIG       1 to print the kind config that would be used and exit (used by make k8s-validate)
 set -euo pipefail
 
+# A relative LOCAL_DATASET is relative to the caller's directory (for `make kind-up`, where make runs: the repo root).
+caller_dir=$PWD
 cd "$(dirname "$0")/.."
 export CGO_ENABLED=0
 
@@ -40,6 +43,8 @@ else
 		common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
 			die "cannot locate the main checkout; set LOCAL_DATASET=/path/to/Dataset"
 		dir=$(dirname "$common")/Dataset
+	elif [[ "$dir" != /* ]]; then
+		dir=$caller_dir/$dir
 	fi
 	[[ -d "$dir/maildir" ]] ||
 		die "no maildir/ directory in $dir; set LOCAL_DATASET to the directory that contains maildir/"

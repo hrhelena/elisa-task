@@ -219,6 +219,11 @@ expect "kind-local-dataset: PV ReadOnlyMany, Retain, no StorageClass" "$local" \
 expect "kind-local-dataset: PV pinned to nodes labelled elisa-enron/local-dataset=true" "$local" \
 	"$pv | .spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0] | .key + \" \" + .operator + \" \" + (.values | join(\",\"))" \
 	"elisa-enron/local-dataset In true"
+expect "kind-local-dataset: PV is pre-bound (claimRef) to the PVC enron/enron-local-dataset" "$local" \
+	"$pv | .spec.claimRef | .kind + \" \" + .namespace + \"/\" + .name + \" \" + (has(\"uid\") | tostring)" \
+	"PersistentVolumeClaim enron/enron-local-dataset false"
+expect "kind-local-dataset: the claimRef names the rendered PVC" "$local" \
+	"[$lpvc | .metadata.namespace + \"/\" + .metadata.name] | join(\",\")" "enron/enron-local-dataset"
 expect "kind-local-dataset: PVC binds the PV by name, ReadOnlyMany, no StorageClass" "$local" \
 	"$lpvc | .spec.volumeName + \" \" + (.spec.accessModes | join(\",\")) + \" '\" + .spec.storageClassName + \"'\"" \
 	"enron-local-dataset ReadOnlyMany ''"
@@ -243,15 +248,17 @@ mkdir -p "$out/dataset/maildir"
 dataset=$(cd "$out/dataset" && pwd -P)
 if PRINT_CONFIG=1 LOCAL_DATASET="$out/dataset" scripts/kind-up.sh >"$out/kind-cluster-local.yaml"; then
 	cfg="$out/kind-cluster-local.yaml"
-	expect "kind config with LOCAL_DATASET: only extraMounts and labels added" "$cfg" \
-		'del(.nodes[0].extraMounts, .nodes[0].labels) | to_json(0)' \
+	label=$(go tool yq eval-all "$pv | .spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].key" "$local")
+	# Strip only what kind-up adds (the mount and that one label, then labels if nothing else is left), so any other
+	# change, including another label, makes the comparison fail.
+	expect "kind config with LOCAL_DATASET: only the extraMount and the $label label added" "$cfg" \
+		"del(.nodes[0].extraMounts) | del(.nodes[0].labels[\"$label\"]) | del(.nodes[0].labels | select(length == 0)) | to_json(0)" \
 		"$(go tool yq eval 'to_json(0)' deploy/kind/cluster.yaml)"
 	expect "kind config with LOCAL_DATASET: mounts the dataset read-only at the PV's node path" "$cfg" \
 		'.nodes[0].extraMounts | length as $n | .[0] | ($n | tostring) + " " + .hostPath + " " + .containerPath + " " + (.readOnly | tostring)' \
 		"1 $dataset $(go tool yq eval-all "$pv | .spec.local.path" "$local") true"
 	expect "kind config with LOCAL_DATASET: node label matches the PV's nodeAffinity" "$cfg" \
-		".nodes[0].labels[\"$(go tool yq eval-all "$pv | .spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].key" "$local")\"]" \
-		"true"
+		".nodes[0].labels[\"$label\"]" "true"
 else
 	fail "scripts/kind-up.sh cannot render the LOCAL_DATASET config"
 fi
