@@ -795,8 +795,15 @@ var (
 // sync.
 func buildBinary(t *testing.T, dir string, env ...string) (string, error) {
 	t.Helper()
+	return buildBinaryArgs(t, dir, nil, env...)
+}
+
+// buildBinaryArgs is buildBinary with extra `go build` flags.
+func buildBinaryArgs(t *testing.T, dir string, flags []string, env ...string) (string, error) {
+	t.Helper()
 	bin := filepath.Join(dir, "enron-service")
-	build := exec.CommandContext(t.Context(), "go", "build", "-trimpath", "-o", bin, ".") //nolint:gosec // fixed command; bin is a temp path.
+	args := append(append([]string{"build", "-trimpath"}, flags...), "-o", bin, ".")
+	build := exec.CommandContext(t.Context(), "go", args...) //nolint:gosec // fixed command and flags; bin is a temp path.
 	build.Env = append(append(os.Environ(), "CGO_ENABLED=0"), env...)
 	if out, err := build.CombinedOutput(); err != nil {
 		return "", errors.New("go build failed: " + err.Error() + "\n" + string(out))
@@ -870,5 +877,33 @@ func TestBinaryInvalidConfigurationExitsWithStatus1(t *testing.T) {
 	}
 	if !bytes.Contains(out, []byte("INGEST_WORKERS")) {
 		t.Errorf("output does not mention INGEST_WORKERS:\n%s", out)
+	}
+}
+
+// TestBinaryReportsLinkerVersion: the version injected at link time with
+// -ldflags "-X main.version=..." (as the Dockerfile does, #11) appears in the
+// "starting" log line. It needs no database: "starting" is logged before the
+// store is opened, so an unreachable DATABASE_URL makes the binary log it and
+// exit 1 quickly.
+func TestBinaryReportsLinkerVersion(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary; skipped in -short mode")
+	}
+	t.Parallel()
+
+	const want = "1.2.3-test"
+	bin, err := buildBinaryArgs(t, t.TempDir(), []string{"-ldflags=-s -w -X main.version=" + want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(t.Context(), bin) //nolint:gosec // bin is built by this test.
+	cmd.Env = []string{
+		"HTTP_ADDR=127.0.0.1:0",
+		"DATABASE_URL=postgres://enron:enron@127.0.0.1:1/enron?sslmode=disable&connect_timeout=2",
+	}
+	out, _ := cmd.Output() // exits 1: the database is unreachable on purpose.
+	rec := findLog(decodeLogLines(t, out), "starting")
+	if rec == nil || rec["version"] != want {
+		t.Errorf("starting record = %v, want version %q; logs:\n%s", rec, want, out)
 	}
 }

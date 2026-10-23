@@ -33,6 +33,10 @@ import (
 // which also covers a database that is not up yet.
 const storeOpenTimeout = time.Minute
 
+// version is the build version, set at link time with
+// -ldflags "-X main.version=..." (the Dockerfile passes the VERSION build arg).
+var version = "dev"
+
 // HTTP server timeouts (ticket #3).
 const (
 	// closeBudget is the fresh time budget for releasing resources after the
@@ -137,7 +141,7 @@ func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, openStore
 		return 1
 	}
 	logger := newLogger(out, cfg.LogLevel)
-	logger.InfoContext(ctx, "starting")
+	logger.InfoContext(ctx, "starting", slog.String("version", version))
 
 	openCtx, cancelOpen := context.WithTimeout(ctx, storeOpenTimeout)
 	st, err := openStore(openCtx, cfg.DatabaseURL, logger)
