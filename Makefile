@@ -28,12 +28,18 @@ TEST_FLAGS ?=
 IMAGE    ?= enron-service:dev
 VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 REVISION ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+# Image timestamps come from the commit, not the wall clock, so rebuilding the same commit yields the same image ID.
+# A wall-clock "created" label made every `make deploy` roll the pod (and kill an in-flight /fetch).
+# SOURCE_DATE_EPOCH is also passed to BuildKit, which uses it for the image config's own timestamps.
+SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct 2>/dev/null || echo 0)
+CREATED  ?= $(shell TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd 2>/dev/null || echo unknown)
 COMPOSE  ?= docker compose
 # Host directory compose mounts at /data. compose-up creates it as the invoking user first: if compose's
 # create_host_path made it, a rootful Linux daemon would create it root-owned and the app could not write to it.
 DATASET_DIR ?= ./Dataset
-# kind (#12): a dedicated cluster name, and its context passed explicitly to every kubectl call, so other local
-# clusters and the current kube context are never touched. kind and kubectl are host prerequisites.
+# kind (#12): a dedicated cluster name, and its context passed explicitly to every kubectl call, so no other cluster
+# is ever targeted. kind-up restores the previous current context after creating the cluster.
+# kind and kubectl are host prerequisites.
 KIND_CLUSTER ?= elisa-enron
 KIND_CONTEXT := kind-$(KIND_CLUSTER)
 
@@ -103,7 +109,8 @@ docker: ## Build the container image $(IMAGE) (IMAGE and VERSION overridable)
 	docker build \
 		--build-arg VERSION=$(VERSION) \
 		--build-arg REVISION=$(REVISION) \
-		--build-arg CREATED=$$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+		--build-arg CREATED=$(CREATED) \
+		--build-arg SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) \
 		-t $(IMAGE) .
 
 .PHONY: docker-smoke
@@ -113,7 +120,7 @@ docker-smoke: docker ## Build the image, then smoke-test it and the compose stac
 .PHONY: compose-up
 compose-up: ## Build the image and start Postgres plus the service (docker compose)
 	mkdir -p "$(DATASET_DIR)"
-	IMAGE=$(IMAGE) VERSION=$(VERSION) REVISION=$(REVISION) CREATED=$$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+	IMAGE=$(IMAGE) VERSION=$(VERSION) REVISION=$(REVISION) CREATED=$(CREATED) \
 		DATASET_DIR="$(DATASET_DIR)" $(COMPOSE) up -d --build
 
 .PHONY: compose-down
@@ -133,7 +140,15 @@ kind-up: ## Create the kind cluster $(KIND_CLUSTER) (no-op if it exists; needs k
 	@if kind get clusters 2>/dev/null | grep -qx "$(KIND_CLUSTER)"; then \
 		echo "kind cluster $(KIND_CLUSTER) already exists"; \
 	else \
+		prev=$$(kubectl config current-context 2>/dev/null || true); \
 		kind create cluster --name "$(KIND_CLUSTER)" --config deploy/kind/cluster.yaml --wait 120s; \
+		if [ -n "$$prev" ]; then \
+			kubectl config use-context "$$prev" >/dev/null; \
+			echo "restored current kube context to $$prev (use --context $(KIND_CONTEXT))"; \
+		else \
+			kubectl config unset current-context >/dev/null; \
+			echo "no current kube context before; left unset (use --context $(KIND_CONTEXT))"; \
+		fi; \
 	fi
 
 .PHONY: kind-down
