@@ -37,7 +37,7 @@ error naming the variable and exit with status 1.
 | Variable | Default | Meaning |
 |---|---|---|
 | `HTTP_ADDR` | `:8080` | HTTP listen address, `[host]:port` with a numeric port |
-| `DATABASE_URL` | `postgres://enron:enron@localhost:5432/enron?sslmode=disable` | Postgres connection string |
+| `DATABASE_URL` | `postgres://enron:enron@localhost:5432/enron?sslmode=disable` | Postgres connection string; pgxpool options such as `pool_max_conns` may be added as query parameters. At startup the service connects and applies the embedded migrations before it listens; if that fails within 1 minute, it exits with status 1 |
 | `DATA_DIR` | `./Dataset` | Dataset root; the maildir is expected at `$DATA_DIR/maildir` |
 | `DATASET_URL` | `https://www.cs.cmu.edu/~enron/enron_mail_20150507.tar.gz` | Archive downloaded by `POST /fetch` (http or https) |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` (JSON logs on stdout) |
@@ -52,7 +52,7 @@ error naming the variable and exit with status 1.
 | Endpoint | Purpose |
 |---|---|
 | `GET /healthz` | Liveness: `200 {"status":"ok"}` while the process serves HTTP |
-| `GET /readyz` | Readiness: `200 {"status":"ready"}`; `503` with the failing `checks` when a dependency check fails (2s timeout each), or `{"status":"shutting_down"}` during shutdown |
+| `GET /readyz` | Readiness: `200 {"status":"ready"}`; `503` with the failing `checks` when a dependency check fails (2s timeout each; currently `postgres`, a ping), or `{"status":"shutting_down"}` during shutdown |
 | `GET /metrics` | Prometheus metrics: `enron_http_requests_total`, `enron_http_request_duration_seconds`, `enron_http_panics_total`, Go runtime and process metrics |
 
 Every response carries an `X-Request-ID` header (a valid incoming one is reused). Errors from every endpoint use

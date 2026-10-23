@@ -25,7 +25,13 @@ import (
 
 	"github.com/hrhelena/elisa-task/internal/config"
 	"github.com/hrhelena/elisa-task/internal/httpapi"
+	"github.com/hrhelena/elisa-task/internal/store"
 )
+
+// storeOpenTimeout bounds connecting to Postgres and applying migrations at
+// startup. Past it the process exits 1 and the orchestrator restarts it,
+// which also covers a database that is not up yet.
+const storeOpenTimeout = time.Minute
 
 // HTTP server timeouts (ticket #3).
 const (
@@ -47,9 +53,46 @@ func main() {
 	// a second SIGINT/SIGTERM kills the process at once instead of waiting
 	// for the graceful shutdown.
 	context.AfterFunc(ctx, stop)
-	code := run(ctx, os.LookupEnv, os.Stdout, nil)
+	code := run(ctx, os.LookupEnv, os.Stdout, openPostgres, nil)
 	stop()
 	os.Exit(code)
+}
+
+// dbStore is what run needs from the store so far: a readiness check and
+// Close. Later tickets widen it as handlers start using the store.
+type dbStore interface {
+	httpapi.Checker
+	Close()
+}
+
+// openStoreFunc opens the store, applying migrations. Tests substitute it.
+type openStoreFunc func(ctx context.Context, databaseURL string, logger *slog.Logger) (dbStore, error)
+
+// openPostgres opens the Postgres store (ADR 0001, 0013).
+func openPostgres(ctx context.Context, databaseURL string, logger *slog.Logger) (dbStore, error) {
+	s, err := store.Open(ctx, databaseURL, logger)
+	if err != nil {
+		return nil, err // not a typed nil inside a non-nil interface
+	}
+	return s, nil
+}
+
+// closeStore closes st, giving up when ctx ends. Pool close waits for
+// acquired connections; by the time closers run no handler holds one, but a
+// stuck connection must not hold the exit beyond the close budget.
+func closeStore(ctx context.Context, st dbStore) error {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		st.Close()
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		// The goroutine ends with the process, which exits right after.
+		return fmt.Errorf("closing database pool: %w", ctx.Err())
+	}
 }
 
 // newLogger returns the service's structured JSON logger writing to w.
@@ -83,9 +126,10 @@ func newServer(handler http.Handler, logger *slog.Logger) *http.Server {
 
 // run is the testable body of main and returns the process exit code. It
 // serves until ctx is canceled (by SIGINT or SIGTERM in main), then shuts down
-// gracefully. onListen, if not nil, is called with the bound address once the
-// listener is open.
-func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, onListen func(net.Addr)) int {
+// gracefully. openStore opens the database (connect and migrate) before the
+// server listens; failure exits 1. onListen, if not nil, is called with the
+// bound address once the listener is open.
+func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, openStore openStoreFunc, onListen func(net.Addr)) int {
 	cfg, err := config.LoadFrom(lookup)
 	if err != nil {
 		newLogger(out, slog.LevelInfo).ErrorContext(ctx, "invalid configuration", slog.Any("err", err))
@@ -94,11 +138,20 @@ func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, onListen 
 	logger := newLogger(out, cfg.LogLevel)
 	logger.InfoContext(ctx, "starting")
 
-	// Closers run in reverse registration order after the server has drained:
-	// #4 registers the DB pool, #7 the ingestion cancel.
-	var cl closers
+	openCtx, cancelOpen := context.WithTimeout(ctx, storeOpenTimeout)
+	st, err := openStore(openCtx, cfg.DatabaseURL, logger)
+	cancelOpen()
+	if err != nil {
+		logger.ErrorContext(ctx, "opening database failed", slog.Any("err", err))
+		return 1
+	}
 
-	readiness := httpapi.NewReadiness() // #4 adds the Postgres checker.
+	// Closers run in reverse registration order after the server has drained:
+	// the DB pool first registered, so closed last; #7 adds the ingestion cancel.
+	var cl closers
+	cl.add("postgres", func(ctx context.Context) error { return closeStore(ctx, st) })
+
+	readiness := httpapi.NewReadiness(st)
 	handler := httpapi.New(httpapi.Deps{Registry: newRegistry(), Readiness: readiness}, logger)
 	srv := newServer(handler, logger)
 
@@ -106,6 +159,7 @@ func run(ctx context.Context, lookup config.LookupFunc, out io.Writer, onListen 
 	ln, err := lc.Listen(ctx, "tcp", cfg.HTTPAddr)
 	if err != nil {
 		logger.ErrorContext(ctx, "listen failed", slog.String("addr", cfg.HTTPAddr), slog.Any("err", err))
+		st.Close()
 		return 1
 	}
 	logger.InfoContext(ctx, "listening",

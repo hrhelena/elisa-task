@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"debug/elf"
@@ -18,7 +17,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -29,8 +27,21 @@ import (
 	"github.com/hrhelena/elisa-task/internal/httpapi"
 )
 
+// testEnvSetup, when set (by the integration-tagged file), prepares shared
+// test infrastructure before the tests and returns its teardown.
+var testEnvSetup func() (teardown func(), err error)
+
 func TestMain(m *testing.M) {
+	teardown := func() {}
+	if testEnvSetup != nil {
+		var err error
+		if teardown, err = testEnvSetup(); err != nil {
+			fmt.Fprintln(os.Stderr, "test setup:", err)
+			os.Exit(1)
+		}
+	}
 	code := m.Run()
+	teardown()
 	if buildDir != "" {
 		_ = os.RemoveAll(buildDir)
 	}
@@ -74,6 +85,50 @@ func envLookup(env map[string]string) config.LookupFunc {
 	}
 }
 
+// fakeStore stands in for Postgres in run-level tests.
+type fakeStore struct {
+	checkErr atomic.Pointer[error] // nil -> healthy
+	closed   atomic.Bool
+}
+
+func (*fakeStore) Name() string { return "postgres" }
+
+func (f *fakeStore) Check(context.Context) error {
+	if p := f.checkErr.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+func (f *fakeStore) Close() { f.closed.Store(true) }
+
+func (f *fakeStore) setCheckErr(err error) { f.checkErr.Store(&err) }
+
+// fakeOpener returns an openStoreFunc that hands out st (or fails with
+// openErr) and records the URL it was called with.
+type fakeOpener struct {
+	st      *fakeStore
+	openErr error
+	mu      sync.Mutex
+	url     string
+	calls   int
+}
+
+func newFakeOpener() *fakeOpener { return &fakeOpener{st: &fakeStore{}} }
+
+func (o *fakeOpener) open(ctx context.Context, url string, _ *slog.Logger) (dbStore, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.url, o.calls = url, o.calls+1
+	if _, ok := ctx.Deadline(); !ok {
+		return nil, errors.New("fake opener: open context has no deadline")
+	}
+	if o.openErr != nil {
+		return nil, o.openErr
+	}
+	return o.st, nil
+}
+
 // newClient returns an HTTP client without keep-alives, so no idle
 // connection goroutines outlive a test (goleak).
 func newClient() *http.Client {
@@ -105,9 +160,13 @@ func TestDefaultsAllowALocalRun(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	var out bytes.Buffer
-	code := run(ctx, envLookup(nil), &out, func(net.Addr) { cancel() })
+	opener := newFakeOpener()
+	code := run(ctx, envLookup(nil), &out, opener.open, func(net.Addr) { cancel() })
 
 	lines := decodeLogLines(t, out.Bytes())
+	if opener.url != config.DefaultDatabaseURL {
+		t.Errorf("store opened with %q, want the default DATABASE_URL %q", opener.url, config.DefaultDatabaseURL)
+	}
 	if code != 0 {
 		if rec := findLog(lines, "listen failed"); rec != nil && strings.Contains(rec["err"].(string), "address already in use") {
 			t.Skipf("port 8080 is busy on this host: %v", rec["err"])
@@ -133,10 +192,14 @@ func TestInvalidConfigurationFailsFast(t *testing.T) {
 
 	var out bytes.Buffer
 	listened := false
-	code := run(t.Context(), envLookup(map[string]string{"INGEST_WORKERS": "zero"}), &out,
+	opener := newFakeOpener()
+	code := run(t.Context(), envLookup(map[string]string{"INGEST_WORKERS": "zero"}), &out, opener.open,
 		func(net.Addr) { listened = true })
 	if code != 1 {
 		t.Errorf("exit code = %d, want 1", code)
+	}
+	if opener.calls != 0 {
+		t.Error("store was opened despite invalid configuration")
 	}
 	if listened {
 		t.Error("service started listening despite invalid configuration")
@@ -158,12 +221,144 @@ func TestRunListenFailureExitsWithStatus1(t *testing.T) {
 	defer func() { _ = busy.Close() }()
 
 	var out bytes.Buffer
-	code := run(t.Context(), envLookup(map[string]string{"HTTP_ADDR": busy.Addr().String()}), &out, nil)
+	opener := newFakeOpener()
+	code := run(t.Context(), envLookup(map[string]string{"HTTP_ADDR": busy.Addr().String()}), &out, opener.open, nil)
 	if code != 1 {
 		t.Errorf("exit code = %d, want 1", code)
 	}
 	if findLog(decodeLogLines(t, out.Bytes()), "listen failed") == nil {
 		t.Errorf(`no "listen failed" log line in:\n%s`, out.String())
+	}
+	if !opener.st.closed.Load() {
+		t.Error("store was not closed after the listen failure")
+	}
+}
+
+// A database that cannot be opened (unreachable, or a failed migration)
+// exits 1 before the server listens (#4).
+func TestRunStoreOpenFailureExitsWithStatus1(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	listened := false
+	opener := newFakeOpener()
+	opener.openErr = errors.New("connecting to postgres: connection refused")
+	code := run(t.Context(), envLookup(map[string]string{"HTTP_ADDR": "127.0.0.1:0", "DATABASE_URL": "postgres://db/x"}),
+		&out, opener.open, func(net.Addr) { listened = true })
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	if listened {
+		t.Error("service started listening without a database")
+	}
+	if opener.url != "postgres://db/x" {
+		t.Errorf("store opened with %q, want DATABASE_URL", opener.url)
+	}
+	rec := findLog(decodeLogLines(t, out.Bytes()), "opening database failed")
+	if rec == nil || rec["level"] != "ERROR" || !strings.Contains(rec["err"].(string), "connection refused") {
+		t.Errorf("want an ERROR log with the open error, got:\n%s", out.String())
+	}
+}
+
+// startRun runs run with a fake store in the background and returns the
+// base URL, the fake opener, a cancel func and run's exit code channel.
+func startRun(t *testing.T, env map[string]string) (base string, opener *fakeOpener, cancel context.CancelFunc, done <-chan int, out *syncBuffer) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	addrCh := make(chan net.Addr, 1)
+	exit := make(chan int, 1)
+	out = &syncBuffer{}
+	opener = newFakeOpener()
+	go func() { exit <- run(ctx, envLookup(env), out, opener.open, func(a net.Addr) { addrCh <- a }) }()
+	select {
+	case a := <-addrCh:
+		base = "http://" + a.String()
+	case code := <-exit:
+		t.Fatalf("run exited early with %d:\n%s", code, out.String())
+	}
+	return base, opener, cancel, exit, out
+}
+
+// Scenario: Readiness reflects the database (#4), at the wiring level: the
+// store is registered as the "postgres" readiness checker, and its failure
+// turns /readyz into 503 with the error under checks.postgres. The real
+// binary against a stopped container is TestBinaryReadinessReflectsDatabase
+// (integration).
+func TestRunReadinessReflectsDatabase(t *testing.T) {
+	t.Parallel()
+
+	base, opener, cancel, done, out := startRun(t, map[string]string{"HTTP_ADDR": "127.0.0.1:0"})
+	client := newClient()
+	if code, body := get(t, client, base+"/readyz"); code != http.StatusOK || strings.TrimSpace(body) != `{"status":"ready"}` {
+		t.Errorf("GET /readyz with database up = %d %q, want 200 ready", code, body)
+	}
+
+	opener.st.setCheckErr(errors.New("pinging postgres: connection refused"))
+	want := `{"status":"not_ready","checks":{"postgres":"pinging postgres: connection refused"}}`
+	if code, body := get(t, client, base+"/readyz"); code != http.StatusServiceUnavailable || strings.TrimSpace(body) != want {
+		t.Errorf("GET /readyz with database down = %d %q, want 503 %s", code, body, want)
+	}
+
+	cancel()
+	if code := <-done; code != 0 {
+		t.Errorf("exit code = %d, want 0:\n%s", code, out.String())
+	}
+	if !opener.st.closed.Load() {
+		t.Error("store was not closed on shutdown")
+	}
+}
+
+type blockingStore struct {
+	fakeStore
+	release chan struct{}
+}
+
+func (b *blockingStore) Close() { <-b.release }
+
+// A pool close that hangs gives up when the close budget ends instead of
+// holding the process.
+func TestCloseStoreHonorsContext(t *testing.T) {
+	t.Parallel()
+
+	if err := closeStore(t.Context(), &fakeStore{}); err != nil {
+		t.Errorf("closeStore = %v, want nil", err)
+	}
+	st := &blockingStore{release: make(chan struct{})}
+	defer close(st.release) // let the goroutine end (goleak)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if err := closeStore(ctx, st); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("closeStore with a hanging Close = %v, want a deadline error", err)
+	}
+}
+
+// Process level: an unreachable database makes the real binary exit 1
+// before listening, with a JSON error log.
+func TestBinaryDatabaseUnavailableExitsWithStatus1(t *testing.T) {
+	t.Parallel()
+	bin := hostBinary(t)
+
+	cmd := exec.CommandContext(t.Context(), bin) //nolint:gosec // bin is built by this test run.
+	cmd.Env = []string{                          // Minimal environment, like the other binary tests.
+		"HTTP_ADDR=127.0.0.1:0",
+		// Port 1 on loopback refuses connections immediately.
+		"DATABASE_URL=postgres://enron:s3cret@127.0.0.1:1/enron?sslmode=disable&connect_timeout=2",
+	}
+	out, err := cmd.Output()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("exit = %v, want status 1:\n%s", err, out)
+	}
+	lines := decodeLogLines(t, out)
+	if findLog(lines, "listening") != nil {
+		t.Errorf("binary listened without a database:\n%s", out)
+	}
+	if rec := findLog(lines, "opening database failed"); rec == nil || rec["level"] != "ERROR" {
+		t.Errorf(`want an ERROR "opening database failed" log line, got:\n%s`, out)
+	}
+	if bytes.Contains(out, []byte("s3cret")) {
+		t.Errorf("logs leak the database password:\n%s", out)
 	}
 }
 
@@ -175,9 +370,10 @@ func TestRunServesProbesAndMetrics(t *testing.T) {
 	addrCh := make(chan net.Addr, 1)
 	done := make(chan int, 1)
 	var out syncBuffer
+	opener := newFakeOpener()
 	go func() {
 		done <- run(ctx, envLookup(map[string]string{"HTTP_ADDR": "127.0.0.1:0", "LOG_LEVEL": "debug"}), &out,
-			func(a net.Addr) { addrCh <- a })
+			opener.open, func(a net.Addr) { addrCh <- a })
 	}()
 	var base string
 	select {
@@ -211,6 +407,9 @@ func TestRunServesProbesAndMetrics(t *testing.T) {
 	cancel()
 	if code := <-done; code != 0 {
 		t.Errorf("exit code = %d, want 0:\n%s", code, out.String())
+	}
+	if !opener.st.closed.Load() {
+		t.Error("store was not closed on shutdown")
 	}
 }
 
@@ -626,148 +825,6 @@ func TestBuildProducesStaticBinary(t *testing.T) {
 	}
 	if len(libs) != 0 {
 		t.Errorf("binary imports shared libraries: %v", libs)
-	}
-}
-
-// runningBinary is the service process started by startBinary.
-type runningBinary struct {
-	cmd      *exec.Cmd
-	logs     syncBuffer
-	listen   chan string   // listen_addr from the "listening" line
-	shutting chan struct{} // closed on the "shutting down" line
-	readDone chan struct{} // closed when stdout is closed
-}
-
-// startBinary starts the built service with a minimal environment (only env),
-// so settings from the developer's shell cannot change the outcome.
-func startBinary(t *testing.T, env ...string) *runningBinary {
-	t.Helper()
-	b := &runningBinary{
-		cmd:      exec.CommandContext(t.Context(), hostBinary(t)), //nolint:gosec // the binary is built by this test run.
-		listen:   make(chan string, 1),
-		shutting: make(chan struct{}),
-		readDone: make(chan struct{}),
-	}
-	b.cmd.Env = env
-	stdout, err := b.cmd.StdoutPipe()
-	if err != nil {
-		t.Fatalf("stdout pipe: %v", err)
-	}
-	if err := b.cmd.Start(); err != nil {
-		t.Fatalf("starting binary: %v", err)
-	}
-	go func() {
-		defer close(b.readDone)
-		var once sync.Once
-		sc := bufio.NewScanner(stdout)
-		for sc.Scan() {
-			line := sc.Bytes()
-			_, _ = b.logs.Write(append(line, '\n'))
-			var rec map[string]any
-			if json.Unmarshal(line, &rec) != nil {
-				continue
-			}
-			msg, _ := rec["msg"].(string)
-			switch {
-			case msg == "listening":
-				addr, _ := rec["listen_addr"].(string)
-				b.listen <- addr
-			case strings.HasPrefix(msg, "shutting down"):
-				once.Do(func() { close(b.shutting) })
-			}
-		}
-	}()
-	return b
-}
-
-// waitListening returns the bound address, failing if the binary does not
-// listen within 10s.
-func (b *runningBinary) waitListening(t *testing.T) string {
-	t.Helper()
-	select {
-	case addr := <-b.listen:
-		return addr
-	case <-b.readDone:
-		t.Fatalf("binary exited before listening:\n%s", b.logs.String())
-	case <-time.After(10 * time.Second):
-		t.Fatalf("binary did not log listening:\n%s", b.logs.String())
-	}
-	return ""
-}
-
-func (b *runningBinary) signal(t *testing.T) {
-	t.Helper()
-	if err := b.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatalf("sending SIGTERM: %v", err)
-	}
-}
-
-// TestBinaryServesAndExitsCleanlyOnSIGTERM runs the real binary: it logs
-// JSON ("starting", then "listening"), serves /healthz, and on a real SIGTERM
-// shuts down and exits 0. It also covers the run half of "Build produces a
-// static binary" (#1), which now serves until signaled.
-func TestBinaryServesAndExitsCleanlyOnSIGTERM(t *testing.T) {
-	t.Parallel()
-
-	b := startBinary(t, "HTTP_ADDR=127.0.0.1:0")
-	addr := b.waitListening(t)
-	if code, body := get(t, newClient(), "http://"+addr+"/healthz"); code != http.StatusOK || !strings.Contains(body, `"ok"`) {
-		t.Errorf("GET /healthz = %d %q", code, body)
-	}
-
-	b.signal(t)
-	<-b.readDone
-	if err := b.cmd.Wait(); err != nil {
-		t.Errorf("binary exited with %v, want status 0:\n%s", err, b.logs.String())
-	}
-	lines := decodeLogLines(t, []byte(b.logs.String()))
-	for _, msg := range []string{"starting", "listening", "stopped"} {
-		if findLog(lines, msg) == nil {
-			t.Errorf("no %q log line in:\n%s", msg, b.logs.String())
-		}
-	}
-	select {
-	case <-b.shutting:
-	default:
-		t.Errorf("no shutting down log line in:\n%s", b.logs.String())
-	}
-}
-
-// TestBinarySecondSignalForcesExit: during a long drain, a second SIGTERM
-// kills the process at once instead of waiting for the graceful shutdown.
-func TestBinarySecondSignalForcesExit(t *testing.T) {
-	t.Parallel()
-
-	b := startBinary(t, "HTTP_ADDR=127.0.0.1:0", "SHUTDOWN_DRAIN_DELAY=1m")
-	b.waitListening(t)
-
-	b.signal(t)
-	select {
-	case <-b.shutting:
-	case <-time.After(10 * time.Second):
-		t.Fatalf("binary did not start shutting down:\n%s", b.logs.String())
-	}
-	start := time.Now()
-	b.signal(t)
-
-	select {
-	case <-b.readDone:
-	case <-time.After(10 * time.Second):
-		t.Fatalf("second SIGTERM did not end the process:\n%s", b.logs.String())
-	}
-	err := b.cmd.Wait()
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) {
-		t.Fatalf("exit = %v, want termination by signal", err)
-	}
-	if ws, ok := exitErr.Sys().(syscall.WaitStatus); !ok || !ws.Signaled() || ws.Signal() != syscall.SIGTERM {
-		t.Errorf("exit = %v, want killed by SIGTERM", err)
-	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("exit took %v after the second signal", elapsed)
-	}
-	if findLog(decodeLogLines(t, []byte(b.logs.String())), "stopped") != nil {
-		t.Error(`forced exit logged "stopped" as if the shutdown were graceful`)
 	}
 }
 
