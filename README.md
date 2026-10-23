@@ -96,8 +96,9 @@ example, if it cannot reach the database at startup).
 
 ### 2. Walkthrough: fetch, start, status, top senders
 
-The examples assume port 8080. Responses are from a real run on the full dataset, with timestamps and request IDs
-shortened.
+The examples assume port 8080. Responses are from a real run on the full dataset, with timestamps shortened and
+`curl -si` headers trimmed to the relevant ones (every response also carries `X-Content-Type-Options`,
+`X-Request-Id`, `Date` and `Content-Length`).
 
 **Get the dataset.** With a local `Dataset/maildir`, `POST /fetch` returns `200` at once with `"state":"ready"`.
 Without one, it starts the download (443,254,787 bytes from CMU, then about 2.5 GB on disk) and returns `202`:
@@ -353,7 +354,7 @@ bad variable and exit with status 1.
 
 Durations use Go syntax (`500ms`, `5s`, `1m`). Docker compose sets `DATABASE_URL` to its Postgres, `DATA_DIR=/data`
 and `LOG_LEVEL`. In Kubernetes, the ConfigMap `enron-service-config` sets everything except `DATABASE_URL`, which
-comes from the Secret `enron-db`. The ConfigMap differs from the defaults in `DATA_DIR=/data`, `INGEST_WORKERS=4`,
+comes from the Secret `enron-db`, and `INGEST_PROGRESS_INTERVAL`, which keeps its default. The ConfigMap differs from the defaults in `DATA_DIR=/data`, `INGEST_WORKERS=4`,
 `SHUTDOWN_DRAIN_DELAY=5s`.
 
 ### Database connection
@@ -381,7 +382,8 @@ because about half of the files are copies of the same email in several folders 
 255,512 distinct content hashes. For example, `kay.mann@enron.com` sent 16,735 files but only 4,887 distinct emails.
 
 The relative path (for example `allen-p/_sent_mail/1.`) is the row key, which makes re-ingestion idempotent. Each
-row also stores `content_sha256`, a SHA-256 over the normalized From, To, Cc, Subject, Date and the raw body bytes
+row also stores `content_sha256`, a SHA-256 over the normalized From, To and Cc, the decoded Subject, the raw `Date`
+header and the raw body bytes
 (not `Message-ID` or the export's `X-Folder`/`X-FileName`), so deduplication can be added without a re-ingest (see
 [Possible extensions](#possible-extensions)). Bodies are hashed, not stored
 ([ADR 0002](Docs/ADR/0002-no-full-text-indexing-store-headers-only.md)).
@@ -483,8 +485,9 @@ Safety checks:
   holds (see [Dataset volume and inodes](#dataset-volume-and-inodes)).
 - It fails if no data arrives for 60 s, or if the archive extracts to more than 8 GiB.
 - On failure or shutdown, the temporary directory is removed. A partial tree with many files can take longer than
-  the 5 s close budget (for example about 140k files through a Docker Desktop bind mount), and the process then
-  exits first. Such leftovers, like those from a crash, are removed at the next startup.
+  the 5 s close budget (for example about 140k files through a Docker Desktop bind mount). The process then exits
+  with status 1 first (see [Shutdown](#shutdown)). Such leftovers, like those from a crash, are removed at the next
+  startup.
 
 The fetch state is held in memory in the pod that runs it. After a restart, a completed dataset is found on disk
 again, and an interrupted fetch must be started again with `POST /fetch`.
@@ -494,8 +497,8 @@ again, and an interrupted fetch must be started again with `POST /fetch`.
 The engine walks `$DATA_DIR/maildir` in lexical order and parses files on `INGEST_WORKERS` goroutines. One writer
 stores rows in batches of `INGEST_BATCH_SIZE`, or every second, with `ON CONFLICT (source_path) DO NOTHING`. Counters
 are written to the run row every `INGEST_PROGRESS_INTERVAL` and at the end. At most one run is active in the cluster
-(a Postgres session advisory lock on a dedicated connection). The dataset root must be a directory, not a symlink
-(the same rule as `POST /fetch`).
+(a Postgres session advisory lock on a dedicated connection). The dataset root must be a directory, not a symlink.
+`POST /fetch` currently follows such a link (see [Known limitations](#known-limitations)).
 
 ### Startup
 
@@ -535,7 +538,10 @@ On `SIGINT` or `SIGTERM` the service:
    can extend this by up to 5 s. In that case, the final write is cut off, and the run is reported as `interrupted`
    by the crashed-owner path ([ADR 0010](Docs/ADR/0010-ingestion-state-in-postgres-with-advisory-lock.md)). A
    running fetch is cancelled and its temporary directory removed (or, if that takes too long, at the next startup).
-4. Exits with status 0, or 1 if draining exceeded `SHUTDOWN_TIMEOUT`. A second signal exits at once.
+4. Exits with status 0 after a clean, timely shutdown. It exits with status 1 if draining exceeded
+   `SHUTDOWN_TIMEOUT`, or if the 5 s close budget ran out (handlers still running, or a closer such as the fetch
+   cleanup did not finish), or if a closer failed. Either way nothing stored is lost: an interrupted run is reported
+   as `interrupted`, and leftover fetch directories are removed at the next startup. A second signal exits at once.
 
 The worst case is `SHUTDOWN_DRAIN_DELAY + SHUTDOWN_TIMEOUT + 5s`, which must fit in the orchestrator's grace period:
 25 s with the defaults, within compose's 30 s `stop_grace_period`, and 30 s with the Kubernetes ConfigMap, within
@@ -583,6 +589,7 @@ The manifests live in `deploy/k8s` ([ADR 0006](Docs/ADR/0006-cloud-native-deploy
 | `base/` | Namespace `enron` (Pod Security `restricted` enforced), ConfigMap `enron-service-config`, PVC `enron-data` (10Gi, RWO), Deployment `enron-service` (1 replica, `Recreate`), Service `enron-service` (`ClusterIP` 80 to 8080) |
 | `overlays/kind/` | The base, plus Postgres as a plain StatefulSet `postgres` (`postgres:16-alpine`, 2Gi, headless Service, no operator), the generated Secret `enron-db`, and the locally built image |
 | `overlays/cloud/` | The base only: managed Postgres through an externally created Secret `enron-db`, image `REGISTRY/enron-service:VERSION` |
+<!-- #40 adds its overlay as a row here. -->
 
 There is one replica with the `Recreate` strategy, because the dataset volume is ReadWriteOnce, so a rollout has a
 short outage. There is no PodDisruptionBudget: with one replica it would either block node drains forever
@@ -686,6 +693,7 @@ The pod template carries `prometheus.io/scrape`, `prometheus.io/port: "8080"` an
 
 ### Validating the manifests
 
+<!-- #40 updates "both overlays" and the list of checks below for its overlay. -->
 `make k8s-validate` renders the base and both overlays with the pinned kustomize, validates every resource with
 kubeconform (`-strict`, the Kubernetes schema of the kind node version, cached in `.tools/`), and checks the values
 above with yq. It checks probes, grace period, replicas, `Recreate`, the 10Gi RWO PVC, hardening, Postgres as the
@@ -726,6 +734,8 @@ make help        # every target
 | `k8s-validate` | [Validate the manifests](#validating-the-manifests) |
 | `kind-up`, `deploy`, `undeploy`, `kind-down` | The [kind](#local-cluster-with-kind) workflow |
 | `py-lock` | Re-resolve `requirements-dev.in` into the hashed lock |
+| `clean` | Remove build outputs (`bin/`) |
+<!-- #13 adds its `e2e-kind` target as a row here. -->
 
 The image is built in two stages: a static binary (`CGO_ENABLED=0`, `-trimpath -s -w`, version from `VERSION`) on
 `gcr.io/distroless/static-debian12:nonroot`. It has no shell, runs as `65532:65532`, listens on 8080 and is about
@@ -833,7 +843,7 @@ The full records are in [`Docs/ADR`](Docs/ADR/README.md). In short:
 - **Close can time out during a failed start.** If a start failure has already begun releasing its lock with the
   10 s write timeout, a concurrent shutdown does not shorten it. Closing can then exceed its 5 s budget and the
   process exits with status 1. No data is lost, and the run is reported as `interrupted`.
-- **A symlinked maildir is a dead end.** If `$DATA_DIR/maildir` is a symlink to a directory, `POST /fetch` reports
+- **A symlinked maildir is a dead end** (tracked in #45). If `$DATA_DIR/maildir` is a symlink to a directory, `POST /fetch` reports
   it `ready` (it follows the link), but `POST /start` refuses it with `409 dataset_missing` (the walker does not
   follow links). Point `DATA_DIR` at the real parent directory, or mount the dataset, instead of linking it.
 - **Slow compose on macOS.** Through the Docker Desktop bind mount, an ingestion takes minutes instead of about
