@@ -354,7 +354,7 @@ bad variable and exit with status 1.
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` (case-insensitive) |
 | `SHUTDOWN_TIMEOUT` | `20s` | Upper bound for draining in-flight requests (positive duration). Resources are then closed within a separate fixed 5 s budget. |
 | `SHUTDOWN_DRAIN_DELAY` | `0s` | After `SIGTERM`, keep serving for this long while `/readyz` reports `503`, before the listener closes. Set a few seconds behind a load balancer. |
-| `INGEST_WORKERS` | number of CPUs, at most 256 | Parallel parsing workers (1 to 256) |
+| `INGEST_WORKERS` | number of CPUs, at most 256 | Parallel parsing workers (1 to 256). File descriptor use scales with workers × open directories (each queued file pins its directory's descriptor): up to about 5 per worker. A very high value under a low hard `nofile` limit can make subdirectories fail to open with `EMFILE`; each then becomes one `read_error` skip and its files are not ingested. Keep the default, or raise the limit (`ulimit -n`) along with this value. |
 | `INGEST_BATCH_SIZE` | `2000` | Rows per insert batch (1 to 50,000) |
 | `INGEST_PROGRESS_INTERVAL` | `5s` | How often a run's counters are written to Postgres (positive duration) |
 

@@ -292,6 +292,14 @@ func (w *walker) unreadableDir(rel string, err error) error {
 // has returned, so the directory is closed when the walk is done with it and
 // every open function yielded for its files has been called, or when the
 // walk's context is done, whichever comes first.
+//
+// Descriptor use therefore scales with the workers: the walk holds one per
+// directory on its current path, and every queued or in-flight job (the
+// pipeline buffers Workers*4) pins its directory, plus each worker's open
+// file. With many single-file folders that is up to about 5 descriptors per
+// worker. A very high INGEST_WORKERS under a low hard descriptor limit can
+// make a subdirectory's open fail with EMFILE; it then becomes one read_error
+// skip and its files are not visited (README, Configuration).
 type dirHandle struct {
 	r *os.Root
 	// refs counts the walk itself plus each open function not yet called.

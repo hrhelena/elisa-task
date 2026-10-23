@@ -17,9 +17,10 @@ import (
 // system call per file, made by the single walker goroutine, and it made the
 // walk the bottleneck of an ingestion (#49: the full-corpus walk took 1.5 to
 // 2 times as long on macOS). A plain File on the same open directory uses the
-// entry's type. Its name is path, so on a filesystem that reports no types,
-// the fallback lstat goes through the path; a wrong type there can only make
-// an open fail, because every open stays relative to a directory descriptor.
+// entry's type. On a filesystem that reports no types, its fallback is an
+// lstatat on the duplicated descriptor, so it stays relative to the opened
+// directory too. path is only the File's name: DirEntry.Info would resolve
+// it, but the walk never calls Info.
 //
 // If the descriptor cannot be duplicated (for example out of descriptors), d
 // is read directly.
