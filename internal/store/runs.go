@@ -1,0 +1,125 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+// RunState is the lifecycle state of an ingestion run (ADR 0010). There is no
+// "idle" state in storage: no run at all is reported as idle (ADR 0011).
+type RunState string
+
+// Run states, as stored in ingestion_runs.state.
+const (
+	RunRunning   RunState = "running"
+	RunCompleted RunState = "completed"
+	RunFailed    RunState = "failed"
+)
+
+// ErrorInterrupted is the error recorded for a run whose owner died while it
+// was running (ADR 0010).
+const ErrorInterrupted = "interrupted"
+
+var (
+	// ErrLockHeld is returned by AcquireIngestLock when another session holds
+	// the ingest lock, that is, a run is in progress somewhere in the cluster.
+	ErrLockHeld = errors.New("ingestion lock held by another session")
+	// ErrLockNotHeld is returned by the RunWriter methods when the given lock
+	// is not held: it was released, the store was closed, its connection was
+	// lost, or it belongs to another store.
+	ErrLockNotHeld = errors.New("ingestion lock not held")
+	// ErrLockReleased is wrapped (with ErrLockNotHeld) by a lock's Err after
+	// Release: a normal ending, unlike a lost lock.
+	ErrLockReleased = errors.New("ingest lock released")
+	// ErrStoreClosed is wrapped (with ErrLockNotHeld) by a lock's Err after
+	// the store is closed, and returned by AcquireIngestLock on a closed store.
+	ErrStoreClosed = errors.New("store closed")
+	// ErrRunNotRunning is returned when updating or finishing a run that does
+	// not exist or is no longer running.
+	ErrRunNotRunning = errors.New("ingestion run is not running")
+	// ErrInvalidRunState is returned by FinishRun for a state other than
+	// completed or failed.
+	ErrInvalidRunState = errors.New("invalid final run state")
+)
+
+// Counters are the progress counters of a run (ADR 0007). At the end of a run
+// FilesSeen = MessagesProcessed + MessagesSkipped. SkipReasons counts skipped
+// files per reason code and FieldErrors counts field-level problems per code;
+// nil maps are stored as empty objects, and maps read back are never nil.
+type Counters struct {
+	FilesSeen         int64
+	MessagesProcessed int64 // parsed OK and stored (inserted now or already present)
+	MessagesInserted  int64 // new rows written by this run
+	MessagesSkipped   int64 // file-level problems, not counted as messages
+	SkipReasons       map[string]int64
+	FieldErrors       map[string]int64
+}
+
+// Run is one ingestion run.
+type Run struct {
+	ID         int64
+	State      RunState
+	StartedAt  time.Time
+	FinishedAt *time.Time // nil while running
+	Counters
+	Error     *string
+	UpdatedAt time.Time
+}
+
+// Finished reports whether the run completed successfully. A failed run has
+// not finished its job (ADR 0011).
+func (r *Run) Finished() bool { return r.State == RunCompleted }
+
+// IngestLock is a held ingest lock. It is obtained from
+// IngestLocker.AcquireIngestLock and passed to the RunWriter methods, which
+// only act while it is held by its own session.
+//
+// A lock is safe for concurrent use. Its run writes are serialized on one
+// connection; canceling a write's context cancels the query on the server and
+// keeps the lock.
+type IngestLock interface {
+	// Release releases the lock. It is safe to call more than once and after
+	// the store is closed. It waits for an in-flight run write on the lock to
+	// finish (bound that write with a context); closing the store never
+	// waits and always ends the lock.
+	Release(ctx context.Context) error
+	// Done is closed when the lock is no longer held: after Release, after
+	// the store is closed, or when the lock's connection is found dead (it is
+	// checked periodically and on every run write). Workers should stop when
+	// it is closed.
+	Done() <-chan struct{}
+	// Err is nil while the lock is held. After Done is closed it returns an
+	// error wrapping ErrLockNotHeld that says why.
+	Err() error
+}
+
+// IngestLocker is the cluster-wide single-flight lock for ingestion (ADR 0010).
+type IngestLocker interface {
+	// AcquireIngestLock takes the lock or returns ErrLockHeld. The lock is
+	// held until it is released, the store is closed, or the process dies.
+	AcquireIngestLock(ctx context.Context) (IngestLock, error)
+	// IngestLockHeld reports whether any session holds the lock, without
+	// taking it.
+	IngestLockHeld(ctx context.Context) (bool, error)
+}
+
+// RunWriter records the lifecycle and progress of ingestion runs. Every
+// method needs the held ingest lock; it returns an error wrapping
+// ErrLockNotHeld when the lock is not (or no longer) held, for example after
+// its connection was lost. The caller should then stop the run.
+type RunWriter interface {
+	// BeginRun marks runs left running by a dead owner as failed
+	// ("interrupted") and starts a new running run.
+	BeginRun(ctx context.Context, lock IngestLock) (Run, error)
+	UpdateRunProgress(ctx context.Context, lock IngestLock, id int64, c Counters) error
+	// FinishRun sets the final state (completed or failed) and counters.
+	FinishRun(ctx context.Context, lock IngestLock, id int64, state RunState, c Counters, errMsg *string) error
+}
+
+// RunReader reads ingestion run state for GET /status.
+type RunReader interface {
+	// LatestRun returns the most recent run, or (nil, nil) if there has never
+	// been one (reported as idle, ADR 0011).
+	LatestRun(ctx context.Context) (*Run, error)
+}
