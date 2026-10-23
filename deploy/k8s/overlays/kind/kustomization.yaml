@@ -1,0 +1,36 @@
+# Local kind overlay (ADR 0006, ADR 0014): the base plus an in-cluster Postgres StatefulSet (no operator) and the
+# locally built image, which `make deploy` loads with `kind load docker-image`.
+# The credentials below are local-only development values, never used outside a throwaway kind cluster.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: enron
+
+resources:
+  - ../../base
+  - postgres.yaml
+
+images:
+  - name: enron-service
+    newName: enron-service
+    newTag: dev
+
+secretGenerator:
+  - name: enron-db
+    literals:
+      - DATABASE_URL=postgres://enron:enron@postgres:5432/enron?sslmode=disable
+  - name: postgres-credentials
+    literals:
+      - POSTGRES_USER=enron
+      - POSTGRES_PASSWORD=enron
+      - POSTGRES_DB=enron
+
+patches:
+  # The image only exists inside the kind node (loaded, never pushed), so never try to pull it.
+  - target:
+      kind: Deployment
+      name: enron-service
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent

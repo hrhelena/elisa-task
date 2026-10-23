@@ -12,6 +12,8 @@ coverage.*
 .env
 .venv/
 .tools/
+# Per-environment kustomize overlays (registry image, size patches) stay local; see README "Cloud (EKS, GKE)".
+/deploy/k8s/overlays/*-local/
 *.db
 *.sqlite
 
