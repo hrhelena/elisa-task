@@ -20,12 +20,12 @@ const contentTypeJSON = "application/json; charset=utf-8"
 // errorBody is the error envelope of every endpoint:
 // {"error":{"code":"<code>","message":"<message>"}}.
 type errorBody struct {
-	Error errorDetail `json:"error"`
+	Error errorDetail `json:"error" required:"true"`
 }
 
 type errorDetail struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code    string `json:"code" required:"true" description:"Machine-readable snake_case error code."`
+	Message string `json:"message" required:"true" description:"Human-readable explanation."`
 }
 
 // writeJSON writes v as a JSON response with the given status. If v cannot be

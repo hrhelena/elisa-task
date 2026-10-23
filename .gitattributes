@@ -1,0 +1,8 @@
+# Vendored Swagger UI (#54): byte-for-byte copies checked against SHA256SUMS. Never convert line endings, and keep
+# the minified bundle out of diffs and language statistics.
+internal/httpapi/swaggerui/swagger-ui-bundle.js -text -diff linguist-vendored
+internal/httpapi/swaggerui/swagger-ui.css -text -diff linguist-vendored
+internal/httpapi/swaggerui/swagger-ui-bundle.js.LICENSE.txt -text linguist-vendored
+internal/httpapi/swaggerui/LICENSE -text linguist-vendored
+internal/httpapi/swaggerui/NOTICE -text linguist-vendored
+internal/httpapi/swaggerui/*.png binary

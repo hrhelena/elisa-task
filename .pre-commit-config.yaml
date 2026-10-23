@@ -2,8 +2,10 @@
 # Every hook is local: Go tools are pinned in go.mod and run via `go tool`, and the generic
 # file checks come from the pre-commit-hooks package pinned in requirements-dev.txt.
 # Nothing is cloned into ~/.cache/pre-commit.
-# User-authored source documents are kept verbatim.
-exclude: ^(prompt\.md|Docs/task-description\.txt)$
+# User-authored source documents are kept verbatim, and so are the vendored Swagger UI files (#54): they are
+# byte-for-byte copies checked against swaggerui/SHA256SUMS, so no hook may rewrite them, and the 1.7 MB bundle
+# is above check-added-large-files' limit by design (ADR 0016). Our own index.html and init.js are still checked.
+exclude: ^(prompt\.md|Docs/task-description\.txt|internal/httpapi/swaggerui/(swagger-ui-bundle\.js|swagger-ui\.css|swagger-ui-bundle\.js\.LICENSE\.txt|LICENSE|NOTICE|favicon-(16x16|32x32)\.png))$
 
 repos:
   - repo: local

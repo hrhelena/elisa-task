@@ -27,8 +27,8 @@ const invalidLimitMessage = "limit must be an integer between 1 and 100"
 
 // SenderCount is one entry of the top-senders ranking.
 type SenderCount struct {
-	Email string `json:"email"`
-	Count int64  `json:"count"`
+	Email string `json:"email" required:"true" description:"Normalized sender address."`
+	Count int64  `json:"count" required:"true" minimum:"1" description:"Messages sent by this address."`
 }
 
 // SenderStats ranks senders by message count: count descending, then email
@@ -40,7 +40,14 @@ type SenderStats interface {
 }
 
 type topSendersResponse struct {
-	Senders []SenderCount `json:"senders"`
+	Senders []SenderCount `json:"senders" required:"true" nullable:"false" description:"Senders by count descending, then email ascending; empty, never null, when nothing is stored."`
+}
+
+// topSendersRequest only documents the query parameters of GET /top-senders
+// in the OpenAPI document; the handler parses them with parseLimit. A test
+// checks that the tag values equal the constants.
+type topSendersRequest struct {
+	Limit int `query:"limit" minimum:"1" maximum:"100" default:"10" description:"Number of senders to return."`
 }
 
 // topSendersHandler serves GET /top-senders[?limit=N].

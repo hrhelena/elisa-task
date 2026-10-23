@@ -217,6 +217,11 @@ Conventions for every endpoint:
 | [`GET /healthz`](#operational-endpoints) | `200` | none |
 | [`GET /readyz`](#operational-endpoints) | `200` | `503` (not ready or shutting down) |
 | [`GET /metrics`](#operational-endpoints) | `200` (Prometheus text format) | none |
+| [`GET /openapi.json`](#api-documentation-openapi-and-swagger-ui) | `200` OpenAPI 3.1 document | `500 internal` (only if generation failed) |
+| [`GET /docs`](#api-documentation-openapi-and-swagger-ui) | `301` to `/docs/`, which serves Swagger UI | `404 not_found` for unknown files under `/docs/` |
+
+The same contract is available as an OpenAPI 3.1 document generated from the code, browsable in Swagger UI; see
+[API documentation](#api-documentation-openapi-and-swagger-ui).
 
 ### `POST /fetch`
 
@@ -337,6 +342,34 @@ $ curl -s 'localhost:8080/top-senders?limit=0'
 | `GET /healthz` | Liveness: `200 {"status":"ok"}` whenever the process serves HTTP. It never checks the database. |
 | `GET /readyz` | Readiness: `200 {"status":"ready"}`. `503 {"status":"not_ready","checks":{"postgres":"<error>"}}` when a dependency check fails (each check has a 2 s timeout; currently one Postgres ping). `503 {"status":"shutting_down"}` once shutdown has begun. |
 | `GET /metrics` | Prometheus metrics (see [Metrics](#metrics)) |
+
+### API documentation (OpenAPI and Swagger UI)
+
+| URL | What |
+|---|---|
+| <http://localhost:8080/docs/> | Swagger UI, with "Try it out" on |
+| <http://localhost:8080/openapi.json> | The OpenAPI 3.1 document (JSON; `go tool yq -P` converts it to YAML) |
+
+- **Generated from the code at startup** ([ADR 0016](Docs/ADR/0016-openapi-spec-from-code-and-embedded-swagger-ui.md)).
+  `internal/httpapi` has one route table that registers the routes on the mux and describes them in the spec, and the
+  schemas are reflected (with `swaggest/openapi-go`) from the Go types the handlers encode. A route left out because
+  its dependency is not configured is neither served nor documented. Tests fail if the spec and the mux differ, if
+  the spec is not valid OpenAPI 3.1, if a real response does not match its documented schema, or if the document
+  differs from `internal/httpapi/testdata/openapi.golden.json` (after a deliberate API change, regenerate it with
+  `go test ./internal/httpapi -run TestSpecGolden -update`).
+- **Works offline.** Swagger UI is vendored under `internal/httpapi/swaggerui/` and embedded in the binary; nothing
+  is loaded from a CDN, and the online spec validator is off. The page is served with a strict
+  `Content-Security-Policy` (`default-src 'self'`).
+- **"Try it out" sends real requests.** There is no authentication
+  ([ADR 0005](Docs/ADR/0005-no-authentication-or-authorization.md)), so executing `POST /fetch` or `POST /start`
+  really starts a download or an ingestion.
+- **Swagger UI version.** Pinned by `SWAGGER_UI_VERSION` in the `Makefile` (currently 5.34.0) and recorded in
+  `internal/httpapi/swaggerui/VERSION` with a `SHA256SUMS` file; a test checks that they agree. To bump it, run
+  `make swagger-ui SWAGGER_UI_VERSION=x.y.z` (it downloads `swagger-ui-dist` from npm, checks the registry's
+  integrity hash, and copies only the files the UI needs), then commit the result. Builds and CI never download it.
+- **Served at the root only.** The spec has no `servers` entry, so "Try it out" calls `/<path>` on the page's own
+  origin. Behind a reverse proxy that serves the service under a path prefix (`/enron/docs/`), the UI loads but its
+  requests miss the prefix.
 
 ## Configuration
 
@@ -568,7 +601,9 @@ the pod's `terminationGracePeriodSeconds: 40`.
 
 JSON on stdout (`log/slog`), one object per line, with `time`, `level`, `msg` and `service`, plus fields per event.
 Each request is logged once as `http request` with `method`, `route` (the matched pattern, such as `GET /status`),
-`path`, `status`, `duration_ms`, `bytes` and `request_id`. Ingestion logs carry `component: ingest` and `run_id`.
+`path`, `status`, `duration_ms`, `bytes` and `request_id`. Requests to the probes, `/metrics`, `/openapi.json` and
+`/docs` are logged at `DEBUG`, so they do not drown the `INFO` log. Ingestion logs carry `component: ingest` and
+`run_id`.
 
 ```json
 {"time":"2026-10-23T11:29:22.7Z","level":"INFO","msg":"ingestion started","service":"enron-service","component":"ingest","run_id":1,"workers":10,"batch_size":2000}
@@ -580,7 +615,7 @@ Each request is logged once as `http request` with `method`, `route` (the matche
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `enron_http_requests_total{method,route,code}` | counter | Requests served. `route` is the matched pattern (`unmatched` otherwise), so the cardinality is bounded. |
+| `enron_http_requests_total{method,route,code}` | counter | Requests served. `route` is the matched pattern (`unmatched` otherwise), so the cardinality is bounded; any file under `/docs/` counts as `GET /docs/{file}`. |
 | `enron_http_request_duration_seconds{method,route}` | histogram | Request latency |
 | `enron_http_panics_total` | counter | Handler panics recovered by the middleware |
 | `enron_fetch_bytes_total` | counter | Bytes of the archive downloaded |
@@ -834,12 +869,13 @@ make help        # every target
 | `k8s-validate` | [Validate the manifests](#validating-the-manifests) |
 | `kind-up`, `deploy`, `undeploy`, `kind-down` | The [kind](#local-cluster-with-kind) workflow (`LOCAL_DATASET=1` on `kind-up` and `deploy`: [local dataset](#local-dataset-opt-in)) |
 | `py-lock` | Re-resolve `requirements-dev.in` into the hashed lock |
+| `swagger-ui` | Re-vendor Swagger UI at `SWAGGER_UI_VERSION` (needs network; see [API documentation](#api-documentation-openapi-and-swagger-ui)) |
 | `clean` | Remove build outputs (`bin/`) |
 | `e2e-kind` | Build the image, then run the [end-to-end test on kind](#end-to-end-test-on-kind) on a throwaway cluster |
 
 The image is built in two stages: a static binary (`CGO_ENABLED=0`, `-trimpath -s -w`, version from `VERSION`) on
 `gcr.io/distroless/static-debian12:nonroot`. It has no shell, runs as `65532:65532`, listens on 8080 and is about
-24 MB. Base images are pinned by digest in `Dockerfile` and `compose.yaml`.
+30 MB (of which about 1.9 MB is the embedded Swagger UI). Base images are pinned by digest in `Dockerfile` and `compose.yaml`.
 
 ### Pre-commit hooks
 
@@ -913,6 +949,7 @@ The full records are in [`Docs/ADR`](Docs/ADR/README.md). In short:
 | [0013](Docs/ADR/0013-goose-for-database-migrations.md) | goose v3 with SQL migrations embedded and applied at startup |
 | [0014](Docs/ADR/0014-kubernetes-deployment-topology.md) | One replica, RWO dataset volume, `Recreate`; Postgres StatefulSet in kind |
 | [0015](Docs/ADR/0015-dataset-volume-sized-for-inodes.md) | The dataset volume is 10Gi for its inode count, not its size |
+| [0016](Docs/ADR/0016-openapi-spec-from-code-and-embedded-swagger-ui.md) | OpenAPI 3.1 spec generated from the code at `/openapi.json`; vendored, embedded Swagger UI at `/docs` |
 
 ## Known limitations
 
@@ -943,6 +980,9 @@ The full records are in [`Docs/ADR`](Docs/ADR/README.md). In short:
 - **Close can time out during a failed start.** If a start failure has already begun releasing its lock with the
   10 s write timeout, a concurrent shutdown does not shorten it. Closing can then exceed its 5 s budget and the
   process exits with status 1. No data is lost, and the run is reported as `interrupted`.
+- **API docs assume the root path.** The OpenAPI document has no `servers` entry, so Swagger UI's "Try it out" does
+  not work behind a proxy that serves the service under a path prefix (see
+  [API documentation](#api-documentation-openapi-and-swagger-ui)).
 - **Slow compose on macOS.** Through the Docker Desktop bind mount, an ingestion takes minutes instead of about
   23 s.
 

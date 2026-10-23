@@ -38,6 +38,9 @@ COMPOSE  ?= docker compose
 # Host directory compose mounts at /data. compose-up creates it as the invoking user first: if compose's
 # create_host_path made it, a rootful Linux daemon would create it root-owned and the app could not write to it.
 DATASET_DIR ?= ./Dataset
+# Swagger UI served at /docs (#54, ADR 0016): the single place its version is pinned. A unit test checks that
+# internal/httpapi/swaggerui/VERSION matches. Bump with `make swagger-ui SWAGGER_UI_VERSION=x.y.z`.
+SWAGGER_UI_VERSION ?= 5.34.0
 # kind (#12): a dedicated cluster name, and its context passed explicitly to every kubectl call, so no other cluster
 # is ever targeted. kind-up restores the previous current context after creating the cluster.
 # kind and kubectl are host prerequisites.
@@ -98,6 +101,10 @@ itest: ## Run unit and integration tests (needs Docker for testcontainers)
 .PHONY: build
 build: ## Build a static binary into bin/enron-service
 	CGO_ENABLED=0 go build -trimpath -o $(BINARY) ./cmd/enron-service
+
+.PHONY: swagger-ui
+swagger-ui: ## Re-vendor Swagger UI at SWAGGER_UI_VERSION into internal/httpapi/swaggerui (needs network)
+	scripts/update-swagger-ui.sh $(SWAGGER_UI_VERSION)
 
 .PHONY: pre-commit
 pre-commit: ## Run all pre-commit hooks on all files

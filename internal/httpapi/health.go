@@ -67,13 +67,18 @@ func (r *Readiness) check(ctx context.Context) map[string]string {
 }
 
 type readyResponse struct {
-	Status string            `json:"status"`
-	Checks map[string]string `json:"checks,omitempty"`
+	Status string            `json:"status" required:"true" enum:"ready,not_ready,shutting_down"`
+	Checks map[string]string `json:"checks,omitempty" description:"Error of each failed check, by check name; only with not_ready."`
+}
+
+// healthResponse is the body of GET /healthz.
+type healthResponse struct {
+	Status string `json:"status" required:"true" enum:"ok"`
 }
 
 // handleHealthz is the liveness probe: it only proves the process serves HTTP.
 func handleHealthz(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeJSON(w, http.StatusOK, healthResponse{Status: "ok"})
 }
 
 // handleReadyz is the readiness probe.

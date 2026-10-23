@@ -24,15 +24,17 @@ type Fetcher interface {
 
 // datasetJSON is the dataset progress as served by POST /fetch and by the
 // dataset section of GET /status.
+//
+// The struct tags other than json only describe the OpenAPI schema (ADR 0016).
 type datasetJSON struct {
-	State           fetch.State `json:"state"`
-	Path            string      `json:"path"`
-	BytesDownloaded int64       `json:"bytes_downloaded"`
-	BytesTotal      int64       `json:"bytes_total"`
-	FilesExtracted  int64       `json:"files_extracted"`
-	Error           *string     `json:"error"`
-	StartedAt       *time.Time  `json:"started_at"`
-	FinishedAt      *time.Time  `json:"finished_at"`
+	State           fetch.State `json:"state" required:"true" enum:"absent,downloading,extracting,ready,failed" description:"Dataset lifecycle state."`
+	Path            string      `json:"path" required:"true" description:"Where the maildir is (or will be) on the server."`
+	BytesDownloaded int64       `json:"bytes_downloaded" required:"true" minimum:"0" description:"Archive bytes downloaded so far."`
+	BytesTotal      int64       `json:"bytes_total" required:"true" minimum:"-1" description:"Archive size from Content-Length; -1 until the server sends a length."`
+	FilesExtracted  int64       `json:"files_extracted" required:"true" minimum:"0" description:"Files extracted from the archive so far."`
+	Error           *string     `json:"error" required:"true" description:"Why the last fetch failed; null unless state is failed."`
+	StartedAt       *time.Time  `json:"started_at" required:"true" description:"When the current or last fetch started; null if none has."`
+	FinishedAt      *time.Time  `json:"finished_at" required:"true" description:"When the last fetch ended; null while running or if none has."`
 }
 
 func newDatasetJSON(p fetch.Progress) datasetJSON {

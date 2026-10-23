@@ -83,6 +83,16 @@ for path in /healthz /metrics /status; do
   code=$(http_code --max-time 5 "$BASE$path")
   if [ "$code" = 200 ]; then pass "GET $path returned 200"; else fail "GET $path returned $code (000: no response)"; fi
 done
+# API docs (#54): the spec and the embedded Swagger UI are served by the distroless image.
+for path in /openapi.json /docs/ /docs/swagger-ui-bundle.js; do
+  code=$(http_code --max-time 5 "$BASE$path")
+  if [ "$code" = 200 ]; then pass "GET $path returned 200"; else fail "GET $path returned $code (000: no response)"; fi
+done
+if http_body_code --max-time 5 "$BASE/openapi.json" | grep -q '"openapi": "3.1.0"'; then
+  pass "GET /openapi.json is an OpenAPI 3.1 document"
+else
+  fail "GET /openapi.json is not an OpenAPI 3.1 document"
+fi
 start_body=$(http_body_code --max-time 15 -X POST "$BASE/start")
 code=$(echo "$start_body" | tail -n1)
 if [ -d "$DATASET_DIR/maildir" ]; then
