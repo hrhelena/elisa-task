@@ -72,7 +72,7 @@ WHERE id = $1 AND state = 'running'`
 // with the pool's settings but outside the pool, so the pool never waits for
 // it and it is never handed back while it may hold the lock. Only this
 // connection cancels a canceled query on the server rather than closing (see
-// Open), so a canceled run write keeps the lock. The run writes go through
+// withServerCancel), so a canceled run write keeps the lock. The run writes go through
 // this connection, so they prove that this session holds the lock, and they
 // keep the connection busy during a run. A watcher goroutine checks the
 // connection every p.lockCheckInterval while no write is in flight.
@@ -80,9 +80,11 @@ type pgIngestLock struct {
 	p    *Postgres
 	conn *pgx.Conn
 
-	sem      chan struct{} // capacity 1: serializes use of conn, waitable with a context
-	released atomic.Bool
-	aborted  atomic.Bool // the store closed the connection
+	sem       chan struct{} // capacity 1: serializes use of conn, waitable with a context
+	released  atomic.Bool
+	aborted   atomic.Bool   // the store closed the connection
+	closing   chan struct{} // closed with aborted; cuts short a wait for a cancel request
+	closeOnce sync.Once
 
 	done          chan struct{} // closed by end
 	endOnce       sync.Once
@@ -90,8 +92,8 @@ type pgIngestLock struct {
 	watcherExited chan struct{} // closed when the watcher returns
 }
 
-func newIngestLock(p *Postgres, conn *pgx.Conn) *pgIngestLock {
-	return &pgIngestLock{p: p, conn: conn, sem: make(chan struct{}, 1),
+func newIngestLock(p *Postgres, conn *pgx.Conn, closing chan struct{}) *pgIngestLock {
+	return &pgIngestLock{p: p, conn: conn, sem: make(chan struct{}, 1), closing: closing,
 		done: make(chan struct{}), watcherExited: make(chan struct{})}
 }
 
@@ -221,7 +223,8 @@ func (p *Postgres) AcquireIngestLock(ctx context.Context) (IngestLock, error) {
 	if p.isClosed() {
 		return nil, fmt.Errorf("acquiring ingest lock: %w", ErrStoreClosed)
 	}
-	conn, err := pgx.ConnectConfig(ctx, p.lockConnConfig.Copy())
+	closing := make(chan struct{})
+	conn, err := pgx.ConnectConfig(ctx, withServerCancel(p.lockConnConfig.Copy(), closing, p.logger))
 	if err != nil {
 		return nil, fmt.Errorf("connecting for ingest lock: %w", err)
 	}
@@ -237,7 +240,7 @@ func (p *Postgres) AcquireIngestLock(ctx context.Context) (IngestLock, error) {
 		return nil, ErrLockHeld
 	}
 
-	l := newIngestLock(p, conn)
+	l := newIngestLock(p, conn, closing)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
@@ -304,8 +307,11 @@ func (l *pgIngestLock) abort() {
 
 // closeSocket closes the network connection without waiting for an in-flight
 // query (net.Conn.Close is safe during a read); the server ends the session.
+// A canceled query waiting for its cancel request to be acknowledged stops
+// waiting too (serverCancelHandler).
 func (l *pgIngestLock) closeSocket() {
 	l.aborted.Store(true)
+	l.closeOnce.Do(func() { close(l.closing) })
 	_ = l.conn.PgConn().Conn().Close()
 }
 

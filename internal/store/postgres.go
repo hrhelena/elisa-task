@@ -10,8 +10,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgconn/ctxwatch"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -68,7 +66,8 @@ type Postgres struct {
 	locks  map[*pgIngestLock]struct{} // outstanding ingest locks, dropped by Close
 	closed bool
 
-	// lockConnConfig dials ingest lock connections (see lockConnConfig).
+	// lockConnConfig is the base config of ingest lock connections (see
+	// lockConnConfig and withServerCancel).
 	lockConnConfig *pgx.ConnConfig
 
 	// lockCheckInterval is how often a held ingest lock checks its connection
@@ -120,20 +119,11 @@ func Open(ctx context.Context, databaseURL string, logger *slog.Logger) (*Postgr
 		lockConnConfig: lockConnConfig(cfg.ConnConfig), lockCheckInterval: lockCheckEvery}, nil
 }
 
-// lockConnConfig returns the settings for ingest lock connections: the
-// pool's, except that a canceled query is canceled on the server and the
-// connection kept. pgx's default closes the connection on cancellation,
-// which would drop the lock's session and so the cluster-wide lock (ADR
-// 0010) whenever a run write times out. If the server does not stop the
-// query within cancelDeadlineDelay, the connection is closed as before. Pool
-// connections keep the default, so their queries end at their own deadline
-// even when the server does not answer.
+// lockConnConfig returns the base settings for ingest lock connections:
+// the pool's. AcquireIngestLock adds server-side cancellation to a copy
+// (withServerCancel).
 func lockConnConfig(pool *pgx.ConnConfig) *pgx.ConnConfig {
-	cfg := pool.Copy()
-	cfg.BuildContextWatcherHandler = func(c *pgconn.PgConn) ctxwatch.Handler {
-		return &pgconn.CancelRequestContextWatcherHandler{Conn: c, DeadlineDelay: cancelDeadlineDelay}
-	}
-	return cfg
+	return pool.Copy()
 }
 
 func (p *Postgres) isClosed() bool {
