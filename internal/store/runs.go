@@ -68,10 +68,24 @@ func (r *Run) Finished() bool { return r.State == RunCompleted }
 // IngestLock is a held ingest lock. It is obtained from
 // IngestLocker.AcquireIngestLock and passed to the RunWriter methods, which
 // only act while it is held by its own session.
+//
+// A lock is safe for concurrent use. Its run writes are serialized on one
+// connection; canceling a write's context cancels the query on the server and
+// keeps the lock.
 type IngestLock interface {
 	// Release releases the lock. It is safe to call more than once and after
-	// the store is closed.
+	// the store is closed. It waits for an in-flight run write on the lock to
+	// finish (bound that write with a context); closing the store never
+	// waits and always ends the lock.
 	Release(ctx context.Context) error
+	// Done is closed when the lock is no longer held: after Release, after
+	// the store is closed, or when the lock's connection is found dead (it is
+	// checked periodically and on every run write). Workers should stop when
+	// it is closed.
+	Done() <-chan struct{}
+	// Err is nil while the lock is held. After Done is closed it returns an
+	// error wrapping ErrLockNotHeld that says why.
+	Err() error
 }
 
 // IngestLocker is the cluster-wide single-flight lock for ingestion (ADR 0010).

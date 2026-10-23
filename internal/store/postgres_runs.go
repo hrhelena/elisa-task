@@ -19,8 +19,17 @@ import (
 // objsubid = 1.
 const IngestLockKey int64 = 0x656E726F6E
 
-// closeTimeout bounds closing a lock connection.
-const closeTimeout = 5 * time.Second
+const (
+	// closeTimeout bounds closing a lock connection.
+	closeTimeout = 5 * time.Second
+	// txControlTimeout bounds BEGIN, COMMIT and ROLLBACK on the lock
+	// connection, which ignore the caller's cancellation.
+	txControlTimeout = 5 * time.Second
+	// lockCheckEvery is how often a held lock checks its connection while no
+	// run write is in flight, and lockCheckTimeout bounds one check.
+	lockCheckEvery   = 5 * time.Second
+	lockCheckTimeout = 5 * time.Second
+)
 
 // LatestRun test hook stages.
 const (
@@ -63,7 +72,8 @@ WHERE id = $1 AND state = 'running'`
 // is taken from the pool and hijacked, so the pool never waits for it and it
 // is never handed back while it may hold the lock. The run writes go through
 // this connection, so they prove that this session holds the lock, and they
-// keep the connection busy during a run.
+// keep the connection busy during a run. A watcher goroutine checks the
+// connection every p.lockCheckInterval while no write is in flight.
 type pgIngestLock struct {
 	p    *Postgres
 	conn *pgx.Conn
@@ -71,6 +81,83 @@ type pgIngestLock struct {
 	mu       sync.Mutex // serializes use of conn; guards released
 	released bool
 	aborted  atomic.Bool // the store closed the connection
+
+	done          chan struct{} // closed by end
+	endOnce       sync.Once
+	endErr        error         // written before done is closed
+	watcherExited chan struct{} // closed when the watcher returns
+}
+
+func newIngestLock(p *Postgres, conn *pgx.Conn) *pgIngestLock {
+	return &pgIngestLock{p: p, conn: conn, done: make(chan struct{}), watcherExited: make(chan struct{})}
+}
+
+// Done implements IngestLock.
+func (l *pgIngestLock) Done() <-chan struct{} { return l.done }
+
+// Err implements IngestLock.
+func (l *pgIngestLock) Err() error {
+	select {
+	case <-l.done:
+		return l.endErr
+	default:
+		return nil
+	}
+}
+
+// end records why the lock is no longer held (err wraps ErrLockNotHeld) and
+// closes Done. Only the first call has an effect.
+func (l *pgIngestLock) end(err error) {
+	l.endOnce.Do(func() {
+		l.endErr = err
+		close(l.done)
+	})
+}
+
+// lost ends the lock because its connection, and so its session, is gone.
+func (l *pgIngestLock) lost(cause error) error {
+	err := fmt.Errorf("%w: lock connection lost: %w", ErrLockNotHeld, cause)
+	l.end(err)
+	l.p.logger.Error("ingest lock lost", slog.Any("error", cause))
+	return err
+}
+
+// watch checks the lock's connection periodically until the lock ends.
+func (l *pgIngestLock) watch(ctx context.Context, every time.Duration) {
+	defer close(l.watcherExited)
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-l.done:
+			return
+		case <-t.C:
+			l.check(ctx)
+		}
+	}
+}
+
+// check asks the server whether this session still holds the lock. It skips
+// the round when a run write is in flight: that write checks the connection
+// itself. A slow answer is canceled on the server and is not a loss; only a
+// dead connection or a session without the lock ends the lock.
+func (l *pgIngestLock) check(ctx context.Context) {
+	if !l.mu.TryLock() {
+		return
+	}
+	defer l.mu.Unlock()
+	if l.Err() != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, lockCheckTimeout)
+	defer cancel()
+	held, err := queryLock(ctx, l.conn, lockHeldBySelfSQL)
+	switch {
+	case err != nil && l.conn.IsClosed():
+		_ = l.lost(err)
+	case err == nil && !held:
+		l.end(fmt.Errorf("%w: no longer held by its session", ErrLockNotHeld))
+	}
 }
 
 // AcquireIngestLock takes pg_try_advisory_lock(IngestLockKey) on a dedicated
@@ -99,7 +186,7 @@ func (p *Postgres) AcquireIngestLock(ctx context.Context) (IngestLock, error) {
 		return nil, ErrLockHeld
 	}
 
-	l := &pgIngestLock{p: p, conn: pc.Hijack()}
+	l := newIngestLock(p, pc.Hijack())
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
@@ -107,15 +194,23 @@ func (p *Postgres) AcquireIngestLock(ctx context.Context) (IngestLock, error) {
 		return nil, errors.New("acquiring ingest lock: store is closed")
 	}
 	p.locks[l] = struct{}{}
+	go l.watch(context.WithoutCancel(ctx), p.lockCheckInterval) // outlives the acquiring request
 	return l, nil
 }
 
-// Release unlocks and closes the lock's connection. Later calls return nil.
-// If unlocking fails (for example ctx is already canceled at shutdown), the
-// connection is closed anyway, which releases the lock too. It returns an
-// error wrapping ErrLockNotHeld only if the session turns out not to have
-// held the lock.
+// Release unlocks and closes the lock's connection, and closes Done. Later
+// calls return nil. It waits for an in-flight run write on the lock (Close
+// does not). If unlocking fails (for example ctx is already canceled at
+// shutdown), the connection is closed anyway, which releases the lock too.
+// It returns an error wrapping ErrLockNotHeld only if the session turns out
+// not to have held the lock.
 func (l *pgIngestLock) Release(ctx context.Context) error {
+	err := l.release(ctx)
+	<-l.watcherExited
+	return err
+}
+
+func (l *pgIngestLock) release(ctx context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.released {
@@ -123,6 +218,7 @@ func (l *pgIngestLock) Release(ctx context.Context) error {
 	}
 	l.released = true
 	l.p.forget(l)
+	l.end(fmt.Errorf("%w: released", ErrLockNotHeld))
 	if l.aborted.Load() {
 		closeConn(ctx, l.conn)
 		return nil
@@ -146,6 +242,7 @@ func (l *pgIngestLock) Release(ctx context.Context) error {
 // Close; a later Release only cleans up.
 func (l *pgIngestLock) abort() {
 	l.aborted.Store(true)
+	l.end(fmt.Errorf("%w: store closed", ErrLockNotHeld))
 	_ = l.conn.PgConn().Conn().Close() // net.Conn.Close is safe during a read
 }
 
@@ -162,24 +259,44 @@ func closeConn(ctx context.Context, conn *pgx.Conn) {
 	_ = conn.Close(closeCtx) // the server ends the session either way
 }
 
-// withLock runs fn on the lock's own connection. It returns ErrLockNotHeld
-// if lock is not a held lock of this store, and wraps ErrLockNotHeld into
-// fn's error if the connection, and with it the lock, was lost.
-func (p *Postgres) withLock(lock IngestLock, fn func(*pgx.Conn) error) error {
+// withLock runs fn on the lock's own connection. It returns an error
+// wrapping ErrLockNotHeld if lock is not a held lock of this store, and ends
+// the lock (closing Done) if fn finds the connection, and with it the lock,
+// lost. An already canceled ctx is returned as is, without touching the
+// connection; cancellation during fn cancels the query on the server and
+// keeps the session (see Open).
+func (p *Postgres) withLock(ctx context.Context, lock IngestLock, fn func(*pgx.Conn) error) error {
 	l, ok := lock.(*pgIngestLock)
 	if !ok || l == nil || l.p != p {
 		return fmt.Errorf("%w: not an ingest lock of this store", ErrLockNotHeld)
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.released || l.aborted.Load() {
-		return fmt.Errorf("%w: released", ErrLockNotHeld)
+	if err := l.Err(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	err := fn(l.conn)
-	if err != nil && (l.aborted.Load() || l.conn.IsClosed()) {
-		return fmt.Errorf("%w: lock connection lost: %w", ErrLockNotHeld, err)
+	switch {
+	case err == nil:
+		return nil
+	case l.aborted.Load():
+		return l.Err()
+	case l.conn.IsClosed():
+		return l.lost(err)
+	case errors.Is(err, ErrLockNotHeld):
+		l.end(err)
 	}
 	return err
+}
+
+// txControlContext bounds BEGIN, COMMIT and ROLLBACK on the lock connection
+// without the caller's cancellation: pgx closes the connection when one of
+// them fails for a non-server reason, which would drop the lock.
+func txControlContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), txControlTimeout)
 }
 
 // IngestLockHeld reports whether any session holds the ingest lock, by reading
@@ -210,27 +327,44 @@ func (p *Postgres) BeginRun(ctx context.Context, lock IngestLock) (Run, error) {
 		run         Run
 		interrupted []int64
 	)
-	err := p.withLock(lock, func(conn *pgx.Conn) error {
-		return pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
-			held, err := queryLock(ctx, tx, lockHeldBySelfSQL)
-			if err != nil {
-				return err
+	err := p.withLock(ctx, lock, func(conn *pgx.Conn) (err error) {
+		beginCtx, cancel := txControlContext(ctx)
+		defer cancel()
+		tx, err := conn.Begin(beginCtx)
+		if err != nil {
+			return fmt.Errorf("beginning run transaction: %w", err)
+		}
+		defer func() {
+			rbCtx, cancel := txControlContext(ctx)
+			defer cancel()
+			if rbErr := tx.Rollback(rbCtx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
+				err = errors.Join(err, fmt.Errorf("rolling back run transaction: %w", rbErr))
 			}
-			if !held {
-				return fmt.Errorf("beginning run: %w by this session", ErrLockNotHeld)
-			}
-			rows, err := tx.Query(ctx, interruptRunningSQL, ErrorInterrupted)
-			if err != nil {
-				return fmt.Errorf("marking interrupted runs: %w", err)
-			}
-			if interrupted, err = pgx.CollectRows(rows, pgx.RowTo[int64]); err != nil {
-				return fmt.Errorf("marking interrupted runs: %w", err)
-			}
-			if run, err = scanRun(tx.QueryRow(ctx, insertRunSQL)); err != nil {
-				return fmt.Errorf("inserting run: %w", err)
-			}
-			return nil
-		})
+		}()
+
+		held, err := queryLock(ctx, tx, lockHeldBySelfSQL)
+		if err != nil {
+			return err
+		}
+		if !held {
+			return fmt.Errorf("beginning run: %w by this session", ErrLockNotHeld)
+		}
+		rows, err := tx.Query(ctx, interruptRunningSQL, ErrorInterrupted)
+		if err != nil {
+			return fmt.Errorf("marking interrupted runs: %w", err)
+		}
+		if interrupted, err = pgx.CollectRows(rows, pgx.RowTo[int64]); err != nil {
+			return fmt.Errorf("marking interrupted runs: %w", err)
+		}
+		if run, err = scanRun(tx.QueryRow(ctx, insertRunSQL)); err != nil {
+			return fmt.Errorf("inserting run: %w", err)
+		}
+		commitCtx, cancelCommit := txControlContext(ctx)
+		defer cancelCommit()
+		if err := tx.Commit(commitCtx); err != nil {
+			return fmt.Errorf("committing run start: %w", err)
+		}
+		return nil
 	})
 	if err != nil {
 		return Run{}, err
@@ -250,7 +384,7 @@ func (p *Postgres) UpdateRunProgress(ctx context.Context, lock IngestLock, id in
 	if err != nil {
 		return err
 	}
-	return p.withLock(lock, func(conn *pgx.Conn) error {
+	return p.withLock(ctx, lock, func(conn *pgx.Conn) error {
 		tag, err := conn.Exec(ctx, updateRunSQL, args...)
 		if err != nil {
 			return fmt.Errorf("updating run %d progress: %w", id, err)
@@ -278,7 +412,7 @@ func (p *Postgres) FinishRun(ctx context.Context, lock IngestLock, id int64, sta
 		return err
 	}
 	args = append(args, string(state), sanitizeOptional(errMsg))
-	return p.withLock(lock, func(conn *pgx.Conn) error {
+	return p.withLock(ctx, lock, func(conn *pgx.Conn) error {
 		tag, err := conn.Exec(ctx, finishRunSQL, args...)
 		if err != nil {
 			return fmt.Errorf("finishing run %d: %w", id, err)

@@ -328,6 +328,7 @@ func TestBeginRunChecksThisSessionHoldsTheLock(t *testing.T) {
 	if _, err := s.BeginRun(t.Context(), lock); !errors.Is(err, ErrLockNotHeld) {
 		t.Errorf("BeginRun on a session that lost the lock error = %v, want ErrLockNotHeld", err)
 	}
+	requireDone(t, lock, time.Second)
 	if err := lock.Release(t.Context()); !errors.Is(err, ErrLockNotHeld) {
 		t.Errorf("Release of a session that lost the lock error = %v, want ErrLockNotHeld", err)
 	}
@@ -518,6 +519,7 @@ func TestCloseDropsAForgottenLock(t *testing.T) {
 	}
 
 	closeWithin(t, s, 10*time.Second) // Release was never called
+	requireDone(t, lock, time.Second)
 	waitFor(t, "the lock to be released", func() bool { return !mustLockHeld(t, observer) })
 	if err := lock.Release(t.Context()); err != nil {
 		t.Errorf("Release after Close: %v", err)
@@ -543,7 +545,7 @@ func TestCloseDoesNotWaitForAQueryOnTheLockConnection(t *testing.T) {
 	started := make(chan struct{})
 	queryErr := make(chan error, 1)
 	go func() {
-		queryErr <- s.withLock(lock, func(conn *pgx.Conn) error {
+		queryErr <- s.withLock(context.Background(), lock, func(conn *pgx.Conn) error {
 			close(started)
 			_, err := conn.Exec(context.Background(), "SELECT pg_sleep(60)")
 			return err

@@ -10,8 +10,15 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgconn/ctxwatch"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// cancelDeadlineDelay is how long a canceled query may take to stop after
+// the server-side cancel request before the connection is closed (the
+// server is then presumed unreachable).
+const cancelDeadlineDelay = 5 * time.Second
 
 // checkerName is the readiness check name reported by /readyz (#3).
 const checkerName = "postgres"
@@ -61,6 +68,10 @@ type Postgres struct {
 	locks  map[*pgIngestLock]struct{} // outstanding ingest locks, dropped by Close
 	closed bool
 
+	// lockCheckInterval is how often a held ingest lock checks its connection
+	// (lockCheckEvery; tests shorten it before acquiring).
+	lockCheckInterval time.Duration
+
 	// testHook, set only by tests, is called between LatestRun's queries.
 	testHook func(stage string)
 }
@@ -83,6 +94,15 @@ func Open(ctx context.Context, databaseURL string, logger *slog.Logger) (*Postgr
 	if cfg.MaxConns < minPoolConns {
 		return nil, fmt.Errorf("database URL: pool_max_conns is %d, must be at least %d", cfg.MaxConns, minPoolConns)
 	}
+	// On context cancellation, pgx by default closes the connection. Ask the
+	// server to cancel the query instead, so the session survives: this is
+	// required for the ingest lock's connection, whose session holds the
+	// cluster-wide lock (ADR 0010), and also spares pool connections when a
+	// request is canceled. If the server does not stop the query within
+	// cancelDeadlineDelay, the connection is closed as before.
+	cfg.ConnConfig.BuildContextWatcherHandler = func(c *pgconn.PgConn) ctxwatch.Handler {
+		return &pgconn.CancelRequestContextWatcherHandler{Conn: c, DeadlineDelay: cancelDeadlineDelay}
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("creating connection pool: %w", err)
@@ -101,7 +121,7 @@ func Open(ctx context.Context, databaseURL string, logger *slog.Logger) (*Postgr
 		pool.Close()
 		return nil, err
 	}
-	return &Postgres{pool: pool, logger: logger, locks: map[*pgIngestLock]struct{}{}}, nil
+	return &Postgres{pool: pool, logger: logger, locks: map[*pgIngestLock]struct{}{}, lockCheckInterval: lockCheckEvery}, nil
 }
 
 // Close closes the connection pool. Outstanding ingest locks are dropped by
