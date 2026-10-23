@@ -21,20 +21,20 @@ const lockCheckTimeout = 2 * time.Second
 
 // Every skip reason and field error the engine records (ADR 0007). A run's
 // status lists them all, with 0 for those that did not occur, like the ADR
-// 0011 example ("invalid_date": 0). Keys the engine adds later are still
-// served, just not pre-filled.
+// 0011 example ("invalid_date": 0). The lists come from the packages that
+// declare the constants, whose tests check that they are complete.
 var (
-	knownSkipReasons = []string{
-		string(mailparse.SkipEmptyFile), string(mailparse.SkipNotAnEmail), string(mailparse.SkipHeaderTooLarge),
-		string(mailparse.SkipReadError), ingest.SkipOutsideMailbox, ingest.SkipNotRegularFile,
-		ingest.SkipParsePanic, ingest.SkipParseError,
-	}
-	knownFieldErrors = []string{
-		string(mailparse.IssueInvalidSender), string(mailparse.IssueMissingSender),
-		string(mailparse.IssueInvalidDate), string(mailparse.IssueMissingDate),
-		string(mailparse.IssueInvalidEncoding), string(mailparse.IssueInvalidRecipient),
-	}
+	knownSkipReasons = ingest.AllSkipReasons()
+	knownFieldErrors = issueKeys(mailparse.AllIssues())
 )
+
+func issueKeys(issues []mailparse.Issue) []string {
+	out := make([]string, len(issues))
+	for i, is := range issues {
+		out[i] = string(is)
+	}
+	return out
+}
 
 // ingestService is the engine side of POST /start and GET /status (#7);
 // *ingest.Service implements it.

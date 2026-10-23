@@ -25,6 +25,17 @@ const (
 	SkipParseError     = "parse_error"      // the parser broke its contract (not a *SkipError)
 )
 
+// AllSkipReasons returns every skip reason a run can record: mailparse's,
+// then the engine's own Skip* constants above (a new slice on each call).
+// Add new constants here too; TestAllSkipReasonsIsComplete fails otherwise.
+func AllSkipReasons() []string {
+	var out []string
+	for _, r := range mailparse.AllSkipReasons() {
+		out = append(out, string(r))
+	}
+	return append(out, SkipOutsideMailbox, SkipNotRegularFile, SkipParsePanic, SkipParseError)
+}
+
 // job is one entry to parse.
 type job struct {
 	rel  string

@@ -59,6 +59,16 @@ const (
 	IssueInvalidRecipient Issue = "invalid_recipient"
 )
 
+// AllIssues returns every Issue constant, in declaration order (a new slice
+// on each call). Add new constants here too; TestAllListsAreComplete fails
+// otherwise.
+func AllIssues() []Issue {
+	return []Issue{
+		IssueInvalidSender, IssueMissingSender, IssueInvalidDate, IssueMissingDate,
+		IssueInvalidEncoding, IssueInvalidRecipient,
+	}
+}
+
 // SkipReason says why a file is not a message.
 type SkipReason string
 
@@ -69,6 +79,13 @@ const (
 	SkipHeaderTooLarge SkipReason = "header_too_large"
 	SkipReadError      SkipReason = "read_error"
 )
+
+// AllSkipReasons returns every SkipReason constant, in declaration order (a
+// new slice on each call). Add new constants here too;
+// TestAllListsAreComplete fails otherwise.
+func AllSkipReasons() []SkipReason {
+	return []SkipReason{SkipEmptyFile, SkipNotAnEmail, SkipHeaderTooLarge, SkipReadError}
+}
 
 // SkipError is returned by Parse when the input is not a message and must be skipped.
 type SkipError struct {
