@@ -155,6 +155,9 @@ func TestCloseIsNotDelayedByASlowStart(t *testing.T) {
 
 // A store closed under a run (for example if the closers ran in the wrong
 // order) is a shutdown, not a lost lock, and the lock is not taken again.
+// Like store.Postgres, the fake refuses every write once the lock's Done is
+// closed: the run only stops once the lock has ended, so its final write
+// always comes after the close and must be refused with ErrStoreClosed (#48).
 func TestStoreClosedMidRunIsRecordedAsShutdownWithoutReacquiring(t *testing.T) {
 	t.Parallel()
 	st := newFakeStore()

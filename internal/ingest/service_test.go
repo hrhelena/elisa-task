@@ -545,6 +545,18 @@ func TestLockLossStopsTheRunAndRecordsLockLost(t *testing.T) {
 	if st.heldLock() != nil {
 		t.Error("the lock taken again to record the outcome was not released")
 	}
+	// The outcome is recorded through the designed path: the write on the
+	// lost lock is refused, then the lock is taken again for one accepted
+	// write. Checking only the run state hid a fake-store race in which the
+	// lost lock's own write was accepted (#48).
+	if n := st.acquireCount(); n != 2 {
+		t.Errorf("successful lock acquisitions = %d, want 2 (the run's, then one to record the outcome)", n)
+	}
+	recs := st.finishRecords()
+	if len(recs) != 2 || !errors.Is(recs[0].err, store.ErrLockNotHeld) || recs[1].err != nil ||
+		recs[1].msg != ErrorLockLost {
+		t.Errorf("final writes = %+v; want one refused with ErrLockNotHeld, then one accepted %q", recs, ErrorLockLost)
+	}
 }
 
 func TestLostLockHeldByAnotherReplicaLeavesTheRunToIt(t *testing.T) {
