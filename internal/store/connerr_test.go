@@ -40,6 +40,7 @@ func TestIsTransientConnectError(t *testing.T) {
 		{"wrong password 28P01", []error{pgErr("28P01")}, false},
 		{"no pg_hba entry 28000", []error{pgErr("28000")}, false},
 		{"missing database 3D000", []error{pgErr("3D000")}, false},
+		{"no CONNECT privilege 42501", []error{pgErr("42501")}, false},
 		{"sslmode=require, server refused TLS", []error{errRefusedTLS}, false},
 		{"certificate does not verify", []error{&tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}}, false},
 		{"unknown authority", []error{x509.UnknownAuthorityError{}}, false},
@@ -64,8 +65,13 @@ func TestIsTransientConnectError(t *testing.T) {
 		{"prefer: TLS refused, then too many connections", []error{errRefusedTLS, pgErr("53300")}, true},
 		{"allow: too many connections, then TLS refused", []error{pgErr("53300"), errRefusedTLS}, true},
 		{"prefer: TLS refused, then connection refused", []error{errRefusedTLS, &net.OpError{Op: "dial", Err: errors.New("connection refused")}}, true},
+		// Not produced by pgx 5.11: connectPreferred stops at the first 28P01,
+		// 3D000 or 42501, so no later attempt follows. Kept to pin the "any
+		// transient attempt wins" rule should a later pgx try the next host.
 		{"two hosts: one wrong password, one down", []error{pgErr("28P01"), &net.OpError{Op: "dial", Err: errors.New("connection refused")}}, true},
 		{"prefer: TLS refused, then wrong password", []error{errRefusedTLS, pgErr("28P01")}, false},
+		// Not produced by pgx 5.11 either (it stops at the 3D000); kept to pin
+		// that a join of only permanent attempts is permanent.
 		{"allow: missing database, then TLS refused", []error{pgErr("3D000"), errRefusedTLS}, false},
 	}
 	for _, tt := range tests {
