@@ -532,6 +532,36 @@ Safety checks:
   with status 1 first (see [Shutdown](#shutdown)). Such leftovers, like those from a crash, are removed at the next
   startup.
 
+#### How long a fetch takes
+
+Measured on 2026-10-25 from a MacBook (Docker Desktop):
+
+| Step | Time | Notes |
+|---|---|---|
+| Download from `www.cs.cmu.edu`, one connection | about 40 min | The server limits each connection to about 160–210 KB/s, so the 443 MB archive takes about 40 minutes whatever the client. |
+| Download with 16 parallel `Range` requests | 174 s | The server sends `Accept-Ranges: bytes`, and the limit is per connection. |
+| `tar -xzf` of a downloaded archive, natively on macOS | about 35 s | Measured by hand on the same machine, for reference. |
+| `POST /fetch` from a local HTTP server, compose with the `./Dataset` bind mount | 4 min 2 s | All 517,401 files, about 2,100 files/s. Every file is created through Docker Desktop's file sharing. |
+| `POST /fetch` from CMU on kind (volume inside the node) | 43 min 40 s | All 517,401 files. Limited by the download, like compose. |
+
+Download and extraction run as one stream, so the progress in `/status` shows the state `downloading` for the
+whole time and `files_extracted` grows as fast as the bytes arrive. The extractor is not the bottleneck: shelling
+out to `tar` would not shorten a fetch from CMU, and the image (`distroless/static`) has no `tar` anyway.
+
+Ways to get the dataset faster, from cheapest:
+
+1. **Use a dataset that is already extracted.** If `Dataset/maildir` exists (compose), or the kind cluster mounts it
+   (`LOCAL_DATASET=1`, see [Local cluster with kind](#local-cluster-with-kind)), no fetch is needed.
+2. **Point `DATASET_URL` at a faster copy.** For example a mirror in S3 or GCS in the cluster's region, or a local
+   HTTP server during development (`python3 -m http.server` in the directory holding the archive, and
+   `DATASET_URL=http://host.docker.internal:8000/enron_mail_20150507.tar.gz` in compose). The fetch then takes about
+   as long as extraction.
+3. **Download in parallel inside the service.** Fetch the archive with several `Range` requests (16 brought the
+   download from about 40 min to 174 s) and extract it as before. This is not implemented: it needs the archive on
+   disk, or ordered reassembly of the parts, before the stream reaches the extractor.
+4. **On macOS, avoid the bind mount for the extraction.** A Docker named volume, or kind, keeps file creation inside
+   the Linux VM. This saves part of the 4 minutes, but not the download time.
+
 The fetch state is held in memory in the pod that runs it. After a restart, a completed dataset is found on disk
 again, and an interrupted fetch must be started again with `POST /fetch`.
 
@@ -985,7 +1015,9 @@ The full records are in [`Docs/ADR`](Docs/ADR/README.md). In short:
   not work behind a proxy that serves the service under a path prefix (see
   [API documentation](#api-documentation-openapi-and-swagger-ui)).
 - **Slow compose on macOS.** Through the Docker Desktop bind mount, an ingestion takes minutes instead of about
-  23 s.
+  23 s, and extracting a fetched archive takes about 4 minutes.
+- **A fetch from CMU takes about 40 minutes.** The server limits each connection to about 200 KB/s, and `/fetch`
+  downloads over one connection (see [How long a fetch takes](#how-long-a-fetch-takes) for the faster options).
 
 ## Possible extensions
 
